@@ -94,7 +94,7 @@ test("FocusPolicyGuard unifies Focus Steal reclamation, cross-app rapid attribut
     assert.equal(restores.length, 2, "Remaining sweep wave must still reclaim secondary delayed steal");
     assert.equal(preventedEvents.length, 1, "Same route steal must not be double-recorded");
 
-    // TextEdit must NOT be blamed; 剪映 (under both displayName & bundleId) switches to window_post / window_key!
+    // TextEdit must NOT be blamed; 剪映 (under both displayName & bundleId) isolates click vs keyboard steals!
     assert.deepEqual(guard.planClick({ app: "com.apple.TextEdit", x: 20, y: 20 }, ["com.apple.TextEdit"]), [
       "sky_click",
       "app_post",
@@ -104,8 +104,11 @@ test("FocusPolicyGuard unifies Focus Steal reclamation, cross-app rapid attribut
       "app_post",
     ]);
     assert.deepEqual(guard.planKey("press_key", { app: "剪映专业版", key: "space" }, ["剪映专业版"]), [
-      "window_key",
       "sky_key",
+    ]);
+    guard.tracker.record("剪映专业版", "press_key:sky_key");
+    assert.deepEqual(guard.planKey("press_key", { app: "剪映专业版", key: "space" }, ["剪映专业版"]), [
+      "window_key",
     ]);
 
     // 3. Window-Local Delivery Floor (ADR-0003): Focus Steal during click:window_post or bare window_post

@@ -259,6 +259,16 @@ test("Codex #4, #12, #21, #22: JXA worker enforces bound target on sky_bypass fo
     },
   };
   let cgPostCount = 0;
+  let cgWindows = [
+    {
+      kCGWindowNumber: 42,
+      kCGWindowOwnerPID: 1234,
+      kCGWindowLayer: 0,
+      kCGWindowAlpha: 1,
+      kCGWindowName: "Main",
+      kCGWindowBounds: { X: 100, Y: 100, Width: 400, Height: 300 },
+    },
+  ];
 
   const sandbox = {
     ObjC: {
@@ -271,12 +281,16 @@ test("Codex #4, #12, #21, #22: JXA worker enforces bound target on sky_bypass fo
       unwrap(v) {
         return v?.__val !== undefined ? v.__val : v;
       },
+      deepUnwrap(v) {
+        return v;
+      },
       castRefToObject(r) {
         return r;
       },
     },
     Ref: () => [null],
     $: Object.assign((s) => ({ __val: s }), {
+      CGWindowListCopyWindowInfo: () => cgWindows,
       AXUIElementCreateApplication: () => ({ role: "AXApplication", focused: fakeFocusedEl }),
       AXUIElementSetMessagingTimeout: () => 0,
       AXUIElementCopyAttributeValue: (el, attr, out) => {
@@ -375,6 +389,20 @@ test("Codex #4, #12, #21, #22: JXA worker enforces bound target on sky_bypass fo
   assert.equal(yesFallbackWin.delivered, true);
   assert.equal(yesFallbackWin.method, "app_post");
   assert.equal(cgPostCount > 0, true);
+
+  const postsBeforeMissing = cgPostCount;
+  const missingWidWin = sandbox.handleWindowClick({
+    pid: 1234,
+    screenCoords: true,
+    x: 150,
+    y: 150,
+    wid: 999,
+    windowBounds: { x: 100, y: 100, width: 400, height: 300 },
+    allowAppPostFallback: true,
+  });
+  assert.equal(missingWidWin.delivered, false);
+  assert.equal(missingWidWin.reason, "window_not_found");
+  assert.equal(cgPostCount, postsBeforeMissing);
 
   // #21: Clearing a nonempty field that stays nonempty MUST return verified: false!
   assert.equal(
@@ -476,6 +504,7 @@ test("Codex #5, #6, #7, #9, #13, #14, #19: Broker redacts outbound secrets, bloc
 
   // End-to-end Broker test for #5, #6, #7, #13, #14, #19
   const sock = path.join(tmpdir(), `cua-codex-broker-${process.pid}-${Date.now()}.sock`);
+  const vaultPid = 999999;
   let appRunning = true;
   let throwOnClick = false;
   let raiseDispatched = 0;
@@ -508,7 +537,7 @@ test("Codex #5, #6, #7, #9, #13, #14, #19: Broker redacts outbound secrets, bloc
             {
               type: "text",
               text: [
-                `App=com.example.Vault (pid ${process.pid})`,
+                `App=com.example.Vault (pid ${vaultPid})`,
                 'Window: "Vault", App: VaultApp.',
                 '\t1 button Unlock',
                 '\t2 secure text field Value: "SuperSecretCanary99" Help: SecretHint ID: vault_pwd',
@@ -546,7 +575,7 @@ test("Codex #5, #6, #7, #9, #13, #14, #19: Broker redacts outbound secrets, bloc
         raiseDispatched += 1;
       }
       if (name === "click" && throwOnClick) {
-        frontApp = { pid: process.pid, bundleId: "com.example.Vault", displayName: "VaultApp" };
+        frontApp = { pid: vaultPid, bundleId: "com.example.Vault", displayName: "VaultApp" };
         throw new Error("actionPeer pipe disconnected mid-click");
       }
       return { isError: false, content: [{ type: "text", text: "ok" }] };

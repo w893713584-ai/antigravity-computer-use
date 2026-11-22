@@ -145,6 +145,19 @@ export function computeSnapshotSignature(meta = {}) {
   };
 }
 
+function filterStructuralElements(elements) {
+  const filtered = new Map();
+  if (!(elements instanceof Map)) return filtered;
+  for (const [idx, el] of elements.entries()) {
+    const num = Number(idx);
+    if (el?.origin === "query" || (Number.isFinite(num) && num >= 1_000_000)) {
+      continue;
+    }
+    filtered.set(idx, el);
+  }
+  return filtered;
+}
+
 /**
  * Detect whether a UI transition occurred between two snapshots of the same app
  * strong enough that old `@sK:index` refs should fail closed with `STALE_REF`.
@@ -159,14 +172,20 @@ export function didUiStructurallyChange(prevSnap, nextSnap) {
   ) {
     return true;
   }
+  if (prevSnap.windowId && nextSnap.windowId && prevSnap.windowId !== nextSnap.windowId) {
+    return true;
+  }
   if ((prevSnap.windowTitle || "") !== (nextSnap.windowTitle || "")) {
     return true;
   }
 
-  const prevEls = prevSnap.elements;
-  const nextEls = nextSnap.elements;
-  if (!prevEls?.size || !nextEls?.size) {
-    return Boolean(prevEls?.size !== nextEls?.size && Math.max(prevEls?.size || 0, nextEls?.size || 0) >= 3);
+  const prevEls = filterStructuralElements(prevSnap.elements);
+  const nextEls = filterStructuralElements(nextSnap.elements);
+  if (prevSnap.source === "query" && prevEls.size === 0) {
+    return false;
+  }
+  if (!prevEls.size || !nextEls.size) {
+    return Boolean(prevEls.size !== nextEls.size && Math.max(prevEls.size, nextEls.size) >= 3);
   }
 
   const prevCount = prevEls.size;
@@ -1160,6 +1179,13 @@ export async function tryWindowPostClick(pid, options = {}) {
   if (axBridge && axBridge.enabled !== false && typeof axBridge.postWindowClick === "function") {
     try {
       const res = await axBridge.postWindowClick(pid, rest);
+      if (res?.deliveryState === "sent_unknown") {
+        const err = new Error(`Window click partial delivery (${res.reason || "partial_click_post"})`);
+        err.code = "WRITE_OUTCOME_UNKNOWN";
+        err.deliveryState = "sent_unknown";
+        err.dispatched = true;
+        throw err;
+      }
       if (res) return res;
     } catch (err) {
       if (err?.aborted || err?.deliveryState === "sent_unknown" || err?.code === "WRITE_OUTCOME_UNKNOWN") {

@@ -2457,9 +2457,21 @@ test("Adaptive sky_click / sky_key blacklist stops repeated click:sky_click focu
     assert.equal(windowClickCalls[0].opts.frameWidth, 1280);
     assert.equal(windowClickCalls[0].opts.frameHeight, 803);
     assert.match(extractResultText(c2), /Route: click:window_post/);
+    assert.match(extractResultText(c2), /Requested: click:sky_click/);
     assert.match(extractResultText(c2), /Delivery: delivered_verified/);
 
-    // 3. Subsequent press_key & type_text automatically switch to window_key (avoiding 0x0d sky_key flash too!)
+    // 3. click:sky_click MUST NOT cross-blacklist press_key / type_text;
+    //    once press_key:sky_key & type_text:sky_key themselves steal focus on this scope, subsequent calls switch to window_key!
+    peerCalls.length = 0;
+    const k0 = await client.request("tools/call", {
+      name: "press_key",
+      arguments: { app: "剪映专业版", key: "space" },
+      source: "ai",
+    });
+    assert.equal(Boolean(k0.isError), false);
+    assert.equal(focusSteals, 2, "First press_key tries sky_key because click steal does not cross-blacklist keyboard");
+    assert.match(extractResultText(k0), /Route: press_key:sky_key/);
+
     peerCalls.length = 0;
     const k1 = await client.request("tools/call", {
       name: "press_key",
@@ -2467,19 +2479,30 @@ test("Adaptive sky_click / sky_key blacklist stops repeated click:sky_click focu
       source: "ai",
     });
     assert.equal(Boolean(k1.isError), false);
-    assert.equal(focusSteals, 1, "press_key via window_key must cause ZERO focus steals");
+    assert.equal(focusSteals, 2, "press_key via window_key must cause ZERO focus steals");
     assert.equal(peerCalls.some((c) => c.name === "press_key"), false);
     assert.equal(windowKeyCalls.length, 1);
     assert.equal(windowKeyCalls[0].key, "space");
     assert.match(extractResultText(k1), /Route: press_key:window_key/);
 
+    peerCalls.length = 0;
+    const t0 = await client.request("tools/call", {
+      name: "type_text",
+      arguments: { app: "com.lemon.lvpro", text: "Hello 剪映" },
+      source: "ai",
+    });
+    assert.equal(Boolean(t0.isError), false);
+    assert.equal(focusSteals, 3, "First type_text tries sky_key before learning type_text steal");
+    assert.match(extractResultText(t0), /Route: type_text:sky_key/);
+
+    peerCalls.length = 0;
     const t1 = await client.request("tools/call", {
       name: "type_text",
       arguments: { app: "com.lemon.lvpro", text: "Hello 剪映" },
       source: "ai",
     });
     assert.equal(Boolean(t1.isError), false);
-    assert.equal(focusSteals, 1, "type_text via window_key must cause ZERO focus steals");
+    assert.equal(focusSteals, 3, "type_text via window_key must cause ZERO focus steals");
     assert.equal(peerCalls.some((c) => c.name === "type_text"), false);
     assert.equal(windowTextCalls.length, 1);
     assert.equal(windowTextCalls[0].text, "Hello 剪映");
@@ -2509,7 +2532,7 @@ test("Adaptive sky_click / sky_key blacklist stops repeated click:sky_click focu
       source: "ai",
     });
     assert.equal(Boolean(qmlDialogClick.isError), false);
-    assert.equal(focusSteals, 2, "focus_guard must pull focus back when QQuickWidget dialog self-activates");
+    assert.equal(focusSteals, 4, "focus_guard must pull focus back when QQuickWidget dialog self-activates");
     assert.match(extractResultText(qmlDialogClick), /Route: click:window_post/);
 
     // Subsequent auto click AND explicit click_method: "window_post" MUST stay on window_post (never app_post!)

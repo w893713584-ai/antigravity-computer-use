@@ -81,6 +81,36 @@ enum WindowInventory {
     return raw
   }
 
+  static func rawAllWindows() -> [[String: Any]] {
+    let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+    guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+      return []
+    }
+    return raw
+  }
+
+  private static func entries(_ raw: [[String: Any]], containPid pid: Int32, windowId: Int64) -> Bool {
+    guard pid > 0, windowId > 0 else { return false }
+    for entry in raw {
+      guard let entryPid = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+            let entryWid = (entry[kCGWindowNumber as String] as? NSNumber)?.int64Value else {
+        continue
+      }
+      if entryPid == pid && entryWid == windowId {
+        return true
+      }
+    }
+    return false
+  }
+
+  static func windowExists(pid: Int32, windowId: Int64) -> Bool {
+    return entries(rawAllWindows(), containPid: pid, windowId: windowId)
+  }
+
+  static func isWindowOnScreen(pid: Int32, windowId: Int64) -> Bool {
+    return entries(rawOnScreenWindows(), containPid: pid, windowId: windowId)
+  }
+
   static func parseBounds(_ dict: Any?) -> WindowRectPt? {
     guard let cfDict = dict as? NSDictionary else { return nil }
     var rect = CGRect.zero

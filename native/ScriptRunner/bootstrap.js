@@ -286,17 +286,38 @@
     return args;
   }
 
+  function resolveOptionAlias(options, camelKey, snakeKey, label) {
+    const hasCamel = options[camelKey] !== undefined;
+    const hasSnake = options[snakeKey] !== undefined;
+    if (hasCamel && hasSnake && options[camelKey] !== options[snakeKey]) {
+      throw new Error(`Conflicting ${label} options: ${camelKey} and ${snakeKey}`);
+    }
+    return hasCamel ? options[camelKey] : hasSnake ? options[snakeKey] : undefined;
+  }
+
   function optionsToClickArgs(options = {}) {
+    if (options !== undefined && options !== null && !isPlainObject(options)) {
+      throw new Error("click expects an options object");
+    }
+    const opts = options || {};
     const args = {};
-    if (options.mouseButton !== undefined) args.mouse_button = options.mouseButton;
-    if (options.clickCount !== undefined) args.click_count = options.clickCount;
-    if (options.clickMethod !== undefined) args.click_method = options.clickMethod;
+    const mouseButton = resolveOptionAlias(opts, "mouseButton", "mouse_button", "click");
+    const clickCount = resolveOptionAlias(opts, "clickCount", "click_count", "click");
+    const clickMethod = resolveOptionAlias(opts, "clickMethod", "click_method", "click");
+    if (mouseButton !== undefined) args.mouse_button = mouseButton;
+    if (clickCount !== undefined) args.click_count = clickCount;
+    if (clickMethod !== undefined) args.click_method = clickMethod;
     return args;
   }
 
   function optionsToKeyArgs(options = {}) {
+    if (options !== undefined && options !== null && !isPlainObject(options)) {
+      throw new Error("key operation expects an options object");
+    }
+    const opts = options || {};
     const args = {};
-    if (options.keyMethod !== undefined) args.key_method = options.keyMethod;
+    const keyMethod = resolveOptionAlias(opts, "keyMethod", "key_method", "key");
+    if (keyMethod !== undefined) args.key_method = keyMethod;
     return args;
   }
 
@@ -442,7 +463,7 @@
         const targetArgs = Array.isArray(target)
           ? { x: target[0], y: target[1] }
           : { element_index: target };
-        await callBroker("app.click", {
+        return await callBroker("app.click", {
           handleId,
           app: appName,
           ...targetArgs,
@@ -454,7 +475,7 @@
         if (!Array.isArray(from) || !Array.isArray(to)) {
           throw new Error("drag requires [fromX, fromY], [toX, toY]");
         }
-        await callBroker("app.drag", {
+        return await callBroker("app.drag", {
           handleId,
           app: appName,
           from_x: from[0],
@@ -465,7 +486,7 @@
       },
 
       async pressKey(key, options = {}) {
-        await callBroker("app.pressKey", {
+        return await callBroker("app.pressKey", {
           handleId,
           app: appName,
           key,
@@ -477,7 +498,7 @@
         if (Array.isArray(target)) {
           throw new Error("coordinate scroll is not supported by this Open Computer Use runtime");
         }
-        await callBroker("app.scroll", {
+        return await callBroker("app.scroll", {
           handleId,
           app: appName,
           element_index: target,
@@ -487,7 +508,7 @@
       },
 
       async setValue(elementIndex, value) {
-        await callBroker("app.setValue", {
+        return await callBroker("app.setValue", {
           handleId,
           app: appName,
           element_index: elementIndex,
@@ -537,7 +558,7 @@
       },
 
       async typeText(text, options = {}) {
-        await callBroker("app.typeText", {
+        return await callBroker("app.typeText", {
           handleId,
           app: appName,
           text,

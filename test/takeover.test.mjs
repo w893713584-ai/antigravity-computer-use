@@ -1142,7 +1142,7 @@ test("Codex 6.2 regressions: peer exit while mutating holds lock on reap failure
   });
   try {
     await assert.rejects(
-      () => timeoutAxBridge.request("post_window_click", { pid: 100, wid: 200 }, { timeoutMs: 25 }),
+      () => timeoutAxBridge.request("window_click", { pid: 100, wid: 200 }, { timeoutMs: 25 }),
       (err) => err?.code === "WRITE_OUTCOME_UNKNOWN" && err?.deliveryState === "sent_unknown" && err?.dispatched === true
     );
   } finally {

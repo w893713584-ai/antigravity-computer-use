@@ -403,10 +403,48 @@ export class BackgroundActionExecutor {
           content: [{ type: "text", text: "Window-local click bridge unavailable." }],
         };
       }
+      const isCoordClick =
+        !parsedRef?.hasElementRef &&
+        Number.isFinite(cleanArgs.x) &&
+        Number.isFinite(cleanArgs.y);
+      const hasPreMetaScreenshot =
+        preMeta?.actionHasScreenshot !== false &&
+        Number(preMeta?.actionFrameWidth) > 0 &&
+        Number(preMeta?.actionFrameHeight) > 0;
+      const canUseFallbackDims =
+        !isCoordClick ||
+        (preMeta?.actionHasScreenshot !== false && fallbackDims?.sameApp !== false);
+      const frameWidth = hasPreMetaScreenshot
+        ? preMeta.actionFrameWidth
+        : canUseFallbackDims
+          ? fallbackDims.width || 0
+          : 0;
+      const frameHeight = hasPreMetaScreenshot
+        ? preMeta.actionFrameHeight
+        : canUseFallbackDims
+          ? fallbackDims.height || 0
+          : 0;
+      if (isCoordClick && !(frameWidth > 0 && frameHeight > 0)) {
+        const isFatalNoGeometry =
+          cleanArgs.click_method === "window_post" ||
+          Boolean(preMeta?.windowId > 0) ||
+          Boolean(fallbackDims?.width > 0 && fallbackDims?.height > 0);
+        return {
+          isError: true,
+          fatal: isFatalNoGeometry,
+          content: [
+            {
+              type: "text",
+              text: "Current window has no matching screenshot geometry; run get_app_state before coordinate click.",
+            },
+          ],
+        };
+      }
       const beforeWriteCheck = () => this.#beforeWrite(operation, false);
       beforeWriteCheck();
-      const frameWidth = preMeta?.actionFrameWidth || fallbackDims.width || 0;
-      const frameHeight = preMeta?.actionFrameHeight || fallbackDims.height || 0;
+      const wid =
+        preMeta?.tinyWindowOverride?.wid || preSnapshot?.windowId || preMeta?.windowId || null;
+      const windowBounds = preMeta?.tinyWindowOverride?.bounds || preMeta?.windowBounds || null;
       const winRes = await this.#trackWrite(
         operation,
         this.windowClickFn(preMeta.pid, {
@@ -419,8 +457,8 @@ export class BackgroundActionExecutor {
           frameWidth,
           frameHeight,
           windowTitle: preMeta?.windowTitle || "",
-          wid: preMeta?.tinyWindowOverride?.wid || null,
-          windowBounds: preMeta?.tinyWindowOverride?.bounds || null,
+          wid,
+          windowBounds,
           button: cleanArgs.mouse_button || "left",
           clickCount: cleanArgs.click_count ?? 1,
           syntheticTag: this.takeoverController?.syntheticEventTag || 0,
@@ -458,7 +496,15 @@ export class BackgroundActionExecutor {
   }
 
   async #dispatchKeyMethod(toolName, method, ctx) {
-    const { app, cleanArgs, preMeta, shouldFollow, allowAutoRefresh, operation = null } = ctx;
+    const {
+      app,
+      cleanArgs,
+      preMeta,
+      preSnapshot,
+      shouldFollow,
+      allowAutoRefresh,
+      operation = null,
+    } = ctx;
     const hotkeyBlock = this.#buildReservedHotkeyErrorIfBlocked(toolName, cleanArgs.key, operation);
     if (hotkeyBlock) {
       return hotkeyBlock;
@@ -466,13 +512,15 @@ export class BackgroundActionExecutor {
     if (method === "window_key") {
       const beforeWriteCheck = () => this.#beforeWrite(operation, false);
       beforeWriteCheck();
+      const targetWid =
+        preMeta?.tinyWindowOverride?.wid || preSnapshot?.windowId || preMeta?.windowId || null;
       if (toolName === "press_key" && preMeta?.pid > 0 && typeof this.windowKeyFn === "function") {
         const keyRes = await this.#trackWrite(
           operation,
           this.windowKeyFn(preMeta.pid, cleanArgs.key, {
             axBridge: this.axBridge,
             windowTitle: preMeta?.windowTitle || "",
-            wid: preMeta?.tinyWindowOverride?.wid || null,
+            wid: targetWid,
             syntheticTag: this.takeoverController?.syntheticEventTag || 0,
             beforeWriteCheck,
           }),
@@ -503,7 +551,7 @@ export class BackgroundActionExecutor {
           this.windowTextFn(preMeta.pid, String(cleanArgs.text ?? ""), {
             axBridge: this.axBridge,
             windowTitle: preMeta?.windowTitle || "",
-            wid: preMeta?.tinyWindowOverride?.wid || null,
+            wid: targetWid,
             syntheticTag: this.takeoverController?.syntheticEventTag || 0,
             beforeWriteCheck,
           }),
@@ -544,10 +592,20 @@ export class BackgroundActionExecutor {
   }
 
   async #executeBackgroundSetValueBypass(ctx) {
-    const { app, cleanArgs, aliases, preAppKey, preMeta, preSnapshot, preElement } = ctx;
+    const {
+      app,
+      cleanArgs,
+      aliases,
+      preAppKey,
+      preMeta,
+      preSnapshot,
+      preElement,
+      routeScope = null,
+    } = ctx;
     const clickMethods = this.focusPolicyGuard.planClick(
       { app, element_index: cleanArgs.element_index },
-      aliases
+      aliases,
+      { routeScope }
     );
     const bypassClickCtx = {
       ...ctx,
@@ -584,7 +642,9 @@ export class BackgroundActionExecutor {
       return { ok: false };
     }
 
-    const pressKeyMethods = this.focusPolicyGuard.planKey("press_key", { app }, aliases);
+    const pressKeyMethods = this.focusPolicyGuard.planKey("press_key", { app }, aliases, {
+      routeScope,
+    });
     const runBypassPressKey = async (key) => {
       for (const method of pressKeyMethods) {
         const res = await this.#dispatchKeyMethod("press_key", method, {
@@ -617,7 +677,9 @@ export class BackgroundActionExecutor {
 
     if (
       preMeta?.pid > 0 &&
-      !this.focusPolicyGuard.isMethodBlocked(aliases, "type_text", "ax_selected_text") &&
+      !this.focusPolicyGuard.isMethodBlocked(aliases, "type_text", "ax_selected_text", {
+        routeScope,
+      }) &&
       typeof this.selectedTextInsertFn === "function" &&
       shouldAttemptSelectedTextFastPath(preAppKey, targetValue)
     ) {
@@ -649,7 +711,9 @@ export class BackgroundActionExecutor {
     const safeKeyText = focusCheck.singleLine
       ? targetValue.replace(/[\r\n]+/gu, " ")
       : targetValue;
-    const typeKeyMethods = this.focusPolicyGuard.planKey("type_text", { app }, aliases);
+    const typeKeyMethods = this.focusPolicyGuard.planKey("type_text", { app }, aliases, {
+      routeScope,
+    });
     let typeRes = null;
     for (const method of typeKeyMethods) {
       typeRes = await this.#dispatchKeyMethod("type_text", method, {
@@ -679,6 +743,7 @@ export class BackgroundActionExecutor {
     fallbackDims = { width: 0, height: 0 },
     operation = null,
     windowDelivery = null,
+    routeScope = null,
   }) {
     let result = null;
     let actionRouteKey = name;
@@ -701,6 +766,29 @@ export class BackgroundActionExecutor {
           null
         : null);
     const preFrameDigest = preMeta?.lastImageDigest || null;
+    const effectiveRouteScope =
+      routeScope ||
+      (preMeta
+        ? {
+            pid: preMeta.pid || null,
+            processToken: preMeta.processToken || null,
+            windowId: preSnapshot?.windowId || preMeta.windowId || null,
+          }
+        : null);
+    const rawExplicitMethod =
+      name === "click"
+        ? cleanArgs?.click_method
+        : name === "press_key" || name === "type_text"
+          ? cleanArgs?.key_method
+          : null;
+    const normalizedExplicitMethod =
+      typeof rawExplicitMethod === "string" ? rawExplicitMethod.trim().toLowerCase() : "";
+    const requestedRoute =
+      normalizedExplicitMethod &&
+      normalizedExplicitMethod !== "auto" &&
+      normalizedExplicitMethod !== "global"
+        ? formatDeliveryRoute(name, normalizedExplicitMethod)
+        : null;
     const ctx = {
       app,
       cleanArgs,
@@ -715,6 +803,7 @@ export class BackgroundActionExecutor {
       fallbackDims,
       operation,
       windowDelivery,
+      routeScope: effectiveRouteScope,
     };
 
     if (name === "click") {
@@ -807,7 +896,9 @@ export class BackgroundActionExecutor {
           const { screenX, screenY } = mapTinyOverridePoint(ov, cleanArgs.x, cleanArgs.y);
           const allowAppPostFallback =
             cleanArgs.click_method !== "window_post" &&
-            !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post");
+            !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post", {
+              routeScope: effectiveRouteScope,
+            });
           const rawClick = await this.#trackWrite(
             operation,
             this.pointClickFn(preMeta.pid, screenX, screenY, {
@@ -834,7 +925,9 @@ export class BackgroundActionExecutor {
             : { isError: true, content: [{ type: "text", text: "Background point click failed." }] };
         }
       } else {
-        const methods = this.focusPolicyGuard.planClick(cleanArgs, aliases);
+        const methods = this.focusPolicyGuard.planClick(cleanArgs, aliases, {
+          routeScope: effectiveRouteScope,
+        });
         let lastRes = null;
         for (const method of methods) {
           actionRouteKey = formatDeliveryRoute("click", method);
@@ -847,7 +940,9 @@ export class BackgroundActionExecutor {
           (cleanArgs.mouse_button || "left") === "right" &&
           parsedRef?.hasElementRef &&
           preMeta?.pid > 0 &&
-          !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "ax_show_menu") &&
+          !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "ax_show_menu", {
+            routeScope: effectiveRouteScope,
+          }) &&
           typeof this.contextMenuFallbackFn === "function"
         ) {
           const beforeWriteCheck = () => this.#beforeWrite(operation, false);
@@ -918,7 +1013,9 @@ export class BackgroundActionExecutor {
         name === "type_text" &&
         (!cleanArgs.key_method || cleanArgs.key_method === "auto") &&
         preMeta?.pid > 0 &&
-        !this.focusPolicyGuard.isMethodBlocked(aliases, "type_text", "ax_selected_text") &&
+        !this.focusPolicyGuard.isMethodBlocked(aliases, "type_text", "ax_selected_text", {
+          routeScope: effectiveRouteScope,
+        }) &&
         typeof this.selectedTextInsertFn === "function" &&
         shouldAttemptSelectedTextFastPath(preAppKey, cleanArgs.text)
       ) {
@@ -946,7 +1043,9 @@ export class BackgroundActionExecutor {
       }
 
       if (!lastRes) {
-        const methods = this.focusPolicyGuard.planKey(name, cleanArgs, aliases);
+        const methods = this.focusPolicyGuard.planKey(name, cleanArgs, aliases, {
+          routeScope: effectiveRouteScope,
+        });
         for (const method of methods) {
           actionRouteKey = formatDeliveryRoute(name, method);
           lastRes = await this.#dispatchKeyMethod(name, method, ctx);
@@ -1073,7 +1172,8 @@ export class BackgroundActionExecutor {
           const hasPriorNativeSteal = this.focusPolicyGuard.hasPriorSteal(
             aliases,
             "set_value:native",
-            "set_value"
+            "set_value",
+            { routeScope: effectiveRouteScope }
           );
           if (parsedRef?.hasElementRef && !preElement?.isSecure && hasPriorNativeSteal) {
             const bypass = await this.#executeBackgroundSetValueBypass(ctx);
@@ -1099,7 +1199,9 @@ export class BackgroundActionExecutor {
           result?.isError &&
           preMeta?.pid > 0 &&
           (!windowDelivery || windowDelivery.allowAppPostFallback !== false) &&
-          !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "ax_scrollbar") &&
+          !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "ax_scrollbar", {
+            routeScope: effectiveRouteScope,
+          }) &&
           typeof this.axScrollFallbackFn === "function"
         ) {
           const beforeWriteCheck = () => this.#beforeWrite(operation, false);
@@ -1187,6 +1289,7 @@ export class BackgroundActionExecutor {
           currentSnapshotId: latestNow?.id || null,
         }),
         actionRouteKey,
+        requestedRoute,
         directDeliveryVerified,
         actionEvent,
         isStalePinnedRef: true,
@@ -1200,6 +1303,7 @@ export class BackgroundActionExecutor {
     return {
       result,
       actionRouteKey,
+      requestedRoute,
       directDeliveryVerified,
       actionEvent,
       isStalePinnedRef: false,
@@ -1216,6 +1320,7 @@ export class BackgroundActionExecutor {
     parsedRef,
     result,
     actionRouteKey,
+    requestedRoute = null,
     directDeliveryVerified = false,
     preAppKey,
     preSnapshot,
@@ -1249,7 +1354,13 @@ export class BackgroundActionExecutor {
     }
 
     if (readBack?.isError) {
-      return { result, deliveryStatus: "delivered_unverified", verified: false };
+      return {
+        result,
+        deliveryStatus: "delivered_unverified",
+        verified: false,
+        actionRouteKey,
+        requestedRoute,
+      };
     }
 
     const postSnapshot = this.registry.getLatestSnapshot(preAppKey);
@@ -1257,17 +1368,52 @@ export class BackgroundActionExecutor {
     const postFrameDigest = readBackImg?.data
       ? computeFrameDigest(Buffer.from(readBackImg.data, "base64"))
       : null;
-    const uiChanged =
-      preSnapshot && postSnapshot && postSnapshot.id !== preSnapshot.id
-        ? Boolean(
-            postSnapshot.uiChangedSinceCapture ||
-              preSnapshot.stale ||
-              (postSnapshot.windowTitle || "") !== (preSnapshot.windowTitle || "")
+    const preHasStructuralEls =
+      preSnapshot?.elements instanceof Map
+        ? Array.from(preSnapshot.elements.values()).some(
+            (el) => el?.origin !== "query" && !(Number(el?.index) >= 1_000_000)
           )
         : false;
+    const isColdQueryPre = preSnapshot?.source === "query" && !preHasStructuralEls;
+    const sameWindowId = Boolean(
+      preSnapshot?.windowId &&
+        postSnapshot?.windowId &&
+        preSnapshot.windowId === postSnapshot.windowId
+    );
+    const sameWindowTitle =
+      (postSnapshot?.windowTitle || "") === (preSnapshot?.windowTitle || "");
+    const windowIdChanged = Boolean(
+      preSnapshot?.windowId &&
+        postSnapshot?.windowId &&
+        preSnapshot.windowId !== postSnapshot.windowId
+    );
+    const windowTitleChanged = Boolean(
+      preSnapshot &&
+        postSnapshot &&
+        (postSnapshot.windowTitle || "") !== (preSnapshot.windowTitle || "")
+    );
     const frameChanged = Boolean(
       preFrameDigest && postFrameDigest && preFrameDigest !== postFrameDigest
     );
+    const sameFrame = Boolean(
+      preFrameDigest && postFrameDigest && preFrameDigest === postFrameDigest
+    );
+    const structuralUiChanged = Boolean(
+      postSnapshot?.uiChangedSinceCapture ||
+        (preSnapshot?.stale && !isColdQueryPre) ||
+        windowIdChanged ||
+        windowTitleChanged
+    );
+    const identicalUnchangedWindow = Boolean(
+      sameWindowId &&
+        sameWindowTitle &&
+        sameFrame &&
+        !postSnapshot?.uiChangedSinceCapture
+    );
+    const uiChanged =
+      preSnapshot && postSnapshot && postSnapshot.id !== preSnapshot.id
+        ? structuralUiChanged && !identicalUnchangedWindow
+        : false;
 
     let deliveryStatus = "delivered_unverified";
     let verificationNote = "";
@@ -1298,7 +1444,11 @@ export class BackgroundActionExecutor {
     }
 
     const verified = deliveryStatus === "delivered_verified";
-    const deliveryFooter = `[Delivery: ${deliveryStatus} | Route: ${actionRouteKey}${verificationNote ? ` | ${verificationNote}` : ""}]`;
+    const requestedNote =
+      requestedRoute && requestedRoute !== actionRouteKey
+        ? ` | Requested: ${requestedRoute}`
+        : "";
+    const deliveryFooter = `[Delivery: ${deliveryStatus} | Route: ${actionRouteKey}${verificationNote ? ` | ${verificationNote}` : ""}${requestedNote}]`;
     const mergedResult =
       actionNote && Array.isArray(readBack.content)
         ? {
@@ -1311,6 +1461,8 @@ export class BackgroundActionExecutor {
       result: appendResultFooter(mergedResult, deliveryFooter),
       deliveryStatus,
       verified,
+      actionRouteKey,
+      requestedRoute,
     };
   }
 
@@ -1337,12 +1489,19 @@ export class BackgroundActionExecutor {
       Number(windowId) > 0
         ? Number(windowId)
         : meta?.tinyWindowOverride?.wid || meta?.windowId || null;
+    const routeScope = meta
+      ? {
+          pid: pid || meta.pid || null,
+          processToken: meta.processToken || null,
+          windowId: wid || meta.windowId || null,
+        }
+      : null;
     const beforeWriteCheck = () => this.#beforeWrite(operation, false);
 
     if (
       pid > 0 &&
       typeof this.axScrollFallbackFn === "function" &&
-      !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "ax_scrollbar")
+      !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "ax_scrollbar", { routeScope })
     ) {
       beforeWriteCheck();
       const axRes = await this.#trackWrite(
@@ -1366,7 +1525,12 @@ export class BackgroundActionExecutor {
     const jxaTrusted = await this.#isJxaPostTrusted();
     if (jxaTrusted && pid > 0 && typeof this.windowScrollFn === "function") {
       beforeWriteCheck();
-      const allowAppPostFallback = !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post");
+      const allowAppPostFallback = !this.focusPolicyGuard.isMethodBlocked(
+        aliases,
+        "click",
+        "app_post",
+        { routeScope }
+      );
       const winBounds =
         meta?.windowBounds || meta?.tinyWindowOverride?.bounds || null;
       const winRes = await this.#trackWrite(
@@ -1405,7 +1569,9 @@ export class BackgroundActionExecutor {
 
     if (
       !(Number(windowId) > 0) &&
-      !this.focusPolicyGuard.hasPriorSteal(aliases, "scroll:native", "click:sky_click")
+      !this.focusPolicyGuard.hasPriorSteal(aliases, "scroll:native", "click:sky_click", {
+        routeScope,
+      })
     ) {
       beforeWriteCheck();
       const callTimeout = Number(timeoutMs) > 0 ? Math.max(50, Math.min(8000, timeoutMs)) : undefined;
@@ -1472,10 +1638,26 @@ export class BackgroundActionExecutor {
       Number(explicitWindowId) > 0
         ? Number(explicitWindowId)
         : resolvedTarget?.wid || meta?.tinyWindowOverride?.wid || meta?.windowId || null;
+    const routeScope = meta
+      ? {
+          pid: pid || meta.pid || null,
+          processToken: meta.processToken || null,
+          windowId: effectiveWid || meta.windowId || null,
+        }
+      : null;
 
-    const methods = this.focusPolicyGuard.planClick({ click_method: "auto" }, aliases);
-    const allowWindowPost = !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "window_post");
-    const allowAppPostFallback = !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post");
+    const methods = this.focusPolicyGuard.planClick({ click_method: "auto" }, aliases, {
+      routeScope,
+    });
+    const allowWindowPost = !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "window_post", {
+      routeScope,
+    });
+    const allowAppPostFallback = !this.focusPolicyGuard.isMethodBlocked(
+      aliases,
+      "click",
+      "app_post",
+      { routeScope }
+    );
 
     const jxaTrusted = await this.#isJxaPostTrusted();
     let routeKey = formatDeliveryRoute("click", "window_post");
@@ -1546,7 +1728,10 @@ export class BackgroundActionExecutor {
       return { delivered: false, clicksSent: 0, aborted: true, routeKey, failureReason: "cancelled" };
     }
 
-    if (methods.includes("sky_click") && !this.focusPolicyGuard.hasPriorSteal(aliases, "click:sky_click")) {
+    if (
+      methods.includes("sky_click") &&
+      !this.focusPolicyGuard.hasPriorSteal(aliases, "click:sky_click", { routeScope })
+    ) {
       const canMapPx =
         !(Number(explicitWindowId) > 0) &&
         finalLocalPoint &&

@@ -1466,6 +1466,7 @@ export class ComputerUseBrokerServer {
     let focusFinalized = false;
     let touchedTargetOs = false;
     let lastRouteKey = `${name}:aborted`;
+    let routeScope = null;
 
     if (isAiSource) {
       this.state.aiStatus = isMutating ? "acting" : "observing";
@@ -1860,6 +1861,57 @@ export class ComputerUseBrokerServer {
       }
       this.takeoverController.assertMayDispatch(operation, { isRead: !isMutating });
 
+      const preMeta = app ? this.registry.getMeta(app) : null;
+      const preSnap =
+        validatedSnapshot ||
+        (parsedRef.snapshotId ? this.registry.ledger.getSnapshot(parsedRef.snapshotId) : null) ||
+        (app ? this.registry.getLatestSnapshot(preMeta?.bundleId || app) : null);
+      let preWindowId =
+        Number(
+          windowDelivery?.windowId ||
+            preMeta?.tinyWindowOverride?.wid ||
+            preSnap?.windowId ||
+            preMeta?.windowId ||
+            0
+        ) || null;
+      if (
+        !preWindowId &&
+        preMeta?.pid > 0 &&
+        typeof this.axBridge?.getFocusedWindowInfo === "function"
+      ) {
+        const preWinInfo = await this.axBridge
+          .getFocusedWindowInfo(preMeta.pid, { windowTitle: preMeta.windowTitle || "" })
+          .catch(() => null);
+        if (Number(preWinInfo?.wid) > 0) {
+          preWindowId = Number(preWinInfo.wid);
+          this.registry.recordMeta(
+            app,
+            {
+              pid: preMeta.pid,
+              bundleId: preMeta.bundleId,
+              appDisplayName: preMeta.appDisplayName,
+              windowId: preWindowId,
+              windowTitle: preWinInfo.title || undefined,
+              windowBounds: preWinInfo.windowBounds || undefined,
+            },
+            {
+              fromActionPeer: false,
+              includeAx: false,
+              includeScreenshot: false,
+              preserveScreenshotState: true,
+            }
+          );
+        }
+      }
+      routeScope =
+        preMeta || preWindowId
+          ? {
+              pid: preMeta?.pid || null,
+              processToken: preMeta?.processToken || null,
+              windowId: preWindowId || null,
+            }
+          : null;
+
       touchedTargetOs = true;
       const dispatched = await this.actionExecutor.dispatch({
         name,
@@ -1870,9 +1922,14 @@ export class ComputerUseBrokerServer {
         validatedSnapshot,
         shouldFollow,
         eventSource: isAiSource ? "ai" : "ui",
-        fallbackDims: { width: this.state.frameWidth, height: this.state.frameHeight },
+        fallbackDims: {
+          width: this.state.frameWidth,
+          height: this.state.frameHeight,
+          sameApp: this.#isSameActiveApp(app),
+        },
         operation,
         windowDelivery,
+        routeScope,
       });
       lastRouteKey = dispatched.actionRouteKey || lastRouteKey;
 
@@ -1886,9 +1943,50 @@ export class ComputerUseBrokerServer {
       }
 
       let result = dispatched.result;
+      let businessWindowTransition = false;
+      if (
+        name === "click" &&
+        result &&
+        !result.isError &&
+        preWindowId > 0 &&
+        preMeta?.pid > 0 &&
+        typeof this.axBridge?.getFocusedWindowInfo === "function"
+      ) {
+        const postWinInfo = await this.axBridge
+          .getFocusedWindowInfo(preMeta.pid, { windowTitle: "" })
+          .catch(() => null);
+        const postWindowId = Number(postWinInfo?.wid || 0);
+        if (postWindowId > 0 && postWindowId !== preWindowId) {
+          businessWindowTransition = true;
+          this.registry.recordMeta(
+            app,
+            {
+              pid: preMeta.pid,
+              bundleId: preMeta.bundleId,
+              appDisplayName: preMeta.appDisplayName,
+              windowId: postWindowId,
+              windowTitle: postWinInfo.title || undefined,
+              windowBounds: postWinInfo.windowBounds || undefined,
+            },
+            {
+              fromActionPeer: false,
+              includeAx: false,
+              includeScreenshot: false,
+              preserveScreenshotState: false,
+            }
+          );
+        }
+      }
       if (app && focusScope) {
-        const stolen = await focusScope.enforce(dispatched.actionRouteKey);
-        focusScope.finish(dispatched.actionRouteKey, { alreadyRecorded: stolen });
+        const stolen = await focusScope.enforce(dispatched.actionRouteKey, {
+          recordRoutePenalty: !businessWindowTransition,
+          routeScope,
+        });
+        focusScope.finish(dispatched.actionRouteKey, {
+          alreadyRecorded: Boolean(stolen),
+          recordRoutePenalty: !businessWindowTransition,
+          routeScope,
+        });
         focusFinalized = true;
       }
 
@@ -1923,7 +2021,8 @@ export class ComputerUseBrokerServer {
                 { app },
                 { updateActiveApp: shouldFollow, allowLaunch: false }
               ),
-            onReclaimFocusFn: () => focusScope?.enforce(dispatched.actionRouteKey),
+            onReclaimFocusFn: () =>
+              focusScope?.enforce("read_back", { recordRoutePenalty: false }),
           });
           if (verifiedOut.verified) {
             this.state.headlessStats.verifiedMutations += 1;
@@ -1952,8 +2051,8 @@ export class ComputerUseBrokerServer {
     } finally {
       if (!focusFinalized && touchedTargetOs && app && focusScope) {
         try {
-          const stolen = await focusScope.enforce(lastRouteKey);
-          focusScope.finish(lastRouteKey, { alreadyRecorded: Boolean(stolen) });
+          const stolen = await focusScope.enforce(lastRouteKey, { routeScope });
+          focusScope.finish(lastRouteKey, { alreadyRecorded: Boolean(stolen), routeScope });
           focusFinalized = true;
         } catch {}
       }

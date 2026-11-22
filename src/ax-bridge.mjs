@@ -461,7 +461,9 @@ function handleFrontmostApp() {
   if (!pid || pid <= 0) return null;
   var bid = front.bundleIdentifier && !front.bundleIdentifier.isNil() ? String(ObjC.unwrap(front.bundleIdentifier)) : null;
   var name = front.localizedName && !front.localizedName.isNil() ? String(ObjC.unwrap(front.localizedName)) : null;
-  return { pid: pid, bundleId: bid, displayName: name };
+  var launchTs = front.launchDate && !front.launchDate.isNil() ? Number(front.launchDate.timeIntervalSince1970) : null;
+  var token = launchTs !== null ? (pid + ":" + launchTs.toFixed(6)) : null;
+  return { pid: pid, bundleId: bid, displayName: name, processToken: token };
 }
 
 function handleRestoreFrontmost(params) {
@@ -1071,7 +1073,7 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
   }
 
   var reqWid = explicitWid && Number(explicitWid) > 0 ? Number(explicitWid) : 0;
-  if (reqWid > 0 && cgList.length > 0) {
+  if (reqWid > 0) {
     for (var j = 0; j < cgList.length; j++) {
       var cw = cgList[j];
       if (Number(cw.kCGWindowNumber) !== reqWid) continue;
@@ -1092,21 +1094,6 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
       };
     }
     return null;
-  }
-
-  if (!targetAxBounds && reqWid > 0 && explicitBounds) {
-    var ew = Number(explicitBounds.width || explicitBounds.w || 0);
-    var eh = Number(explicitBounds.height || explicitBounds.h || 0);
-    if (ew > 0 && eh > 0) {
-      return {
-        wid: reqWid,
-        title: preferredTitle ? String(preferredTitle) : "",
-        x: Number(explicitBounds.x || 0),
-        y: Number(explicitBounds.y || 0),
-        w: ew,
-        h: eh
-      };
-    }
   }
 
   var axBounds = targetAxBounds || null;
@@ -1174,6 +1161,35 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
     return { wid: 0, title: axTitle || "", x: axBounds.x, y: axBounds.y, w: axBounds.w, h: axBounds.h };
   }
   return null;
+}
+
+function handleFocusedWindow(params) {
+  var pid = Number(params.pid || 0);
+  if (!pid || pid <= 0) return { wid: null, title: null, windowBounds: null };
+  var prefTitle = params.windowTitle ? String(params.windowTitle) : "";
+  var axBounds = null;
+  var axTitle = prefTitle;
+  try {
+    var appEl = createAppElement(pid, 0.45);
+    var axWin = selectTargetWindow(appEl, prefTitle);
+    if (axWin) {
+      var b = readBounds(axWin);
+      if (b && b.w >= 120 && b.h >= 80) {
+        axBounds = b;
+      }
+      var t = readStr(axWin, "AXTitle");
+      if (t) axTitle = t;
+    }
+  } catch (e) {}
+  var win = resolveTargetCgWindow(pid, axTitle, null, null, axBounds);
+  if (!win) {
+    return { wid: null, title: axTitle || null, windowBounds: null };
+  }
+  return {
+    wid: win.wid > 0 ? win.wid : null,
+    title: win.title || axTitle || null,
+    windowBounds: win.w > 0 && win.h > 0 ? { x: win.x, y: win.y, w: win.w, h: win.h } : null
+  };
 }
 
 function postSkyLightOrPidEvent(ev, pid, wid, localX, localY, useSkyLight, clickState, cgBtn, syntheticTag) {
@@ -1587,7 +1603,7 @@ function handleWindowClick(params) {
     try {
       src = $.CGEventSourceCreate(0);
       ev = $.CGEventCreateMouseEvent(src, evType, { x: screenX, y: screenY }, cgBtn);
-      if (!src || !ev) return;
+      if (!src || !ev) return false;
       var ns = Math.floor($.NSProcessInfo.processInfo.systemUptime * 1e9);
       $.CGEventSetTimestamp(ev, ns);
       $.CGEventSetIntegerValueField(ev, $.kCGMouseEventClickState, clickState);
@@ -1596,6 +1612,7 @@ function handleWindowClick(params) {
         $.CGEventSetDoubleValueField(ev, 38, pressure);
       }
       postSkyLightOrPidEvent(ev, pid, win.wid, localX, localY, useSkyLight, clickState, cgBtn, params.syntheticTag);
+      return true;
     } finally {
       if (ev) { try { $.CFRelease(ev); } catch (e1) {} }
       if (src) { try { $.CFRelease(src); } catch (e2) {} }
@@ -1604,13 +1621,33 @@ function handleWindowClick(params) {
 
   postStep(5, 0, 0.0);
   $.NSThread.sleepForTimeInterval(0.012);
+  var downsPosted = 0;
+  var upsPosted = 0;
   for (var c = 1; c <= clickCount; c++) {
-    postStep(downType, c, 1.0);
+    if (postStep(downType, c, 1.0)) downsPosted += 1;
     $.NSThread.sleepForTimeInterval(0.022);
-    postStep(upType, c, 0.0);
+    if (postStep(upType, c, 0.0)) upsPosted += 1;
     if (c < clickCount) {
       $.NSThread.sleepForTimeInterval(0.028);
     }
+  }
+
+  if (downsPosted === 0 && upsPosted === 0) {
+    return {
+      delivered: false,
+      method: null,
+      reason: "event_post_failed",
+      wid: win.wid
+    };
+  }
+  if (downsPosted > 0 && upsPosted < downsPosted) {
+    return {
+      delivered: false,
+      deliveryState: "sent_unknown",
+      method: useSkyLight ? "window_post" : "app_post",
+      reason: "partial_click_post",
+      wid: win.wid
+    };
   }
 
   return {
@@ -1959,6 +1996,7 @@ while (true) {
       else if (method === "window_click") res = handleWindowClick(p);
       else if (method === "window_scroll") res = handleWindowScroll(p);
       else if (method === "resolve_action_target") res = handleResolveActionTarget(p);
+      else if (method === "focused_window") res = handleFocusedWindow(p);
       else if (method === "window_key") res = handleWindowKey(p);
       else if (method === "window_text") res = handleWindowText(p);
       else if (method === "drop_snapshots") res = handleDropAppSnapshots(p);
@@ -1976,15 +2014,13 @@ while (true) {
 `;
 
 const MUTATING_AX_BRIDGE_METHODS = new Set([
-  "post_window_click",
-  "post_window_key",
-  "post_window_text",
-  "post_window_scroll",
-  "click_element",
-  "press_menu_item",
-  "set_focused_value",
+  "window_click",
+  "window_key",
+  "window_text",
+  "window_scroll",
+  "scroll",
+  "context_menu",
   "insert_selected_text",
-  "scroll_element",
   "ensure_manual_ax",
   "restore_frontmost",
 ]);
@@ -2468,7 +2504,7 @@ export class PersistentAxBridge {
       beforeWriteCheck = null,
     } = {}
   ) {
-    return this.request(
+    const res = await this.request(
       "window_click",
       {
         pid,
@@ -2492,6 +2528,19 @@ export class PersistentAxBridge {
       },
       { timeoutMs: 2200, beforeWriteCheck }
     );
+    if (res?.deliveryState === "sent_unknown") {
+      const err = new Error(`PersistentAxBridge partial click delivery (${res.reason || "partial_click_post"})`);
+      err.code = "WRITE_OUTCOME_UNKNOWN";
+      err.deliveryState = "sent_unknown";
+      err.dispatched = true;
+      throw err;
+    }
+    return res;
+  }
+
+  async getFocusedWindowInfo(pid, { windowTitle = "" } = {}) {
+    if (!Number.isInteger(pid) || pid <= 0 || !this.enabled) return null;
+    return this.request("focused_window", { pid, windowTitle }, { timeoutMs: 800 }).catch(() => null);
   }
 
   async postWindowScroll(

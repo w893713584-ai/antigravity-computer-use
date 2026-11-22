@@ -64,71 +64,136 @@ export function formatDeliveryRoute(tool, method = "") {
   return m ? `${t}:${m}` : t;
 }
 
+function normalizeScopeToken(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function resolveScopeProc(routeScope) {
+  if (!routeScope || typeof routeScope !== "object") return "";
+  const token = normalizeScopeToken(routeScope.processToken);
+  if (token) return token;
+  const pid = Number(routeScope.pid);
+  if (Number.isInteger(pid) && pid > 0) return String(pid);
+  return "";
+}
+
+function recordScopeKeyFor(routeScope = null) {
+  if (!routeScope || typeof routeScope !== "object") return "*";
+  const wid = Number(routeScope.windowId);
+  const proc = resolveScopeProc(routeScope);
+  if (Number.isInteger(wid) && wid > 0) {
+    return `w:${proc || "*"}:${wid}`;
+  }
+  if (proc) {
+    return `p:${proc}`;
+  }
+  return "*";
+}
+
+function lookupScopeKeysFor(routeScope = null) {
+  if (!routeScope || typeof routeScope !== "object") {
+    return ["*"];
+  }
+  const wid = Number(routeScope.windowId);
+  const proc = resolveScopeProc(routeScope);
+  if (Number.isInteger(wid) && wid > 0) {
+    return proc ? [`w:${proc}:${wid}`, `w:*:${wid}`, "*"] : [`w:*:${wid}`, "*"];
+  }
+  if (proc) {
+    return [`p:${proc}`, "*"];
+  }
+  return ["*"];
+}
+
 /**
- * Adaptive tracker recording `(appAlias, DeliveryRoute)` pairs that caused Focus Steals,
+ * Adaptive tracker recording `(appAlias, scope, DeliveryRoute)` tuples that caused Focus Steals,
  * while strictly preserving the Window-Local Delivery Floor (`window_post`, `window_key`).
  */
 export class SelfActivationTracker {
   #routes = new Map();
 
-  record(appKey, routeKey) {
+  record(appKey, routeKey, { routeScope = null } = {}) {
     const app = typeof appKey === "string" ? appKey.trim().toLowerCase() : "";
     const parsed = parseDeliveryRoute(routeKey);
     if (!app || !parsed.normalized) return;
     if (WINDOW_LOCAL_DELIVERY_FLOOR.has(parsed.method)) return;
-    let set = this.#routes.get(app);
+    const scopeKey = recordScopeKeyFor(routeScope);
+    let scopes = this.#routes.get(app);
+    if (!scopes) {
+      scopes = new Map();
+      this.#routes.set(app, scopes);
+    }
+    let set = scopes.get(scopeKey);
     if (!set) {
       set = new Set();
-      this.#routes.set(app, set);
+      scopes.set(scopeKey, set);
     }
     set.add(parsed.normalized);
   }
 
-  getBlockedMethods(appKey, toolName = "click") {
-    return this.getBlockedMethodsForAliases([appKey], toolName);
+  getBlockedMethods(appKey, toolName = "click", opts = {}) {
+    return this.getBlockedMethodsForAliases([appKey], toolName, opts);
   }
 
-  getBlockedMethodsForAliases(appKeys = [], toolName = "click") {
+  getBlockedMethodsForAliases(appKeys = [], toolName = "click", { routeScope = null } = {}) {
     const targetTool = String(toolName || "click").trim().toLowerCase();
     const blocked = new Set();
+    const scopeKeys = lookupScopeKeysFor(routeScope);
     for (const rawKey of appKeys) {
       const app = typeof rawKey === "string" ? rawKey.trim().toLowerCase() : "";
       if (!app) continue;
-      const set = this.#routes.get(app);
-      if (!set) continue;
-      for (const entry of set) {
-        const parsed = parseDeliveryRoute(entry);
-        if (
-          parsed.tool === targetTool &&
-          parsed.method &&
-          !WINDOW_LOCAL_DELIVERY_FLOOR.has(parsed.method)
-        ) {
-          blocked.add(parsed.method);
+      const scopes = this.#routes.get(app);
+      if (!scopes) continue;
+      for (const scopeKey of scopeKeys) {
+        const set = scopes.get(scopeKey);
+        if (!set) continue;
+        for (const entry of set) {
+          const parsed = parseDeliveryRoute(entry);
+          if (
+            parsed.tool === targetTool &&
+            parsed.method &&
+            !WINDOW_LOCAL_DELIVERY_FLOOR.has(parsed.method)
+          ) {
+            blocked.add(parsed.method);
+          } else if (
+            parsed.normalized === "set_value:sky_bypass" &&
+            (targetTool === "press_key" || targetTool === "type_text")
+          ) {
+            blocked.add("sky_key");
+          }
         }
       }
     }
     return Array.from(blocked);
   }
 
-  hasRouteSteal(appKey, routeKey) {
+  hasRouteSteal(appKey, routeKey, { routeScope = null } = {}) {
     const app = typeof appKey === "string" ? appKey.trim().toLowerCase() : "";
     const parsed = parseDeliveryRoute(routeKey);
-    return Boolean(app && parsed.normalized && this.#routes.get(app)?.has(parsed.normalized));
+    if (!app || !parsed.normalized) return false;
+    const scopes = this.#routes.get(app);
+    if (!scopes) return false;
+    for (const scopeKey of lookupScopeKeysFor(routeScope)) {
+      if (scopes.get(scopeKey)?.has(parsed.normalized)) return true;
+    }
+    return false;
   }
 
   hasSkyFocusSteal(...appKeys) {
     for (const rawKey of appKeys) {
       const app = typeof rawKey === "string" ? rawKey.trim().toLowerCase() : "";
       if (!app) continue;
-      const set = this.#routes.get(app);
-      if (
-        set &&
-        (set.has("click:sky_click") ||
+      const scopes = this.#routes.get(app);
+      if (!scopes) continue;
+      for (const set of scopes.values()) {
+        if (
+          set.has("click:sky_click") ||
           set.has("press_key:sky_key") ||
           set.has("type_text:sky_key") ||
-          set.has("set_value:sky_bypass"))
-      ) {
-        return true;
+          set.has("set_value:sky_bypass")
+        ) {
+          return true;
+        }
       }
     }
     return false;
@@ -314,10 +379,10 @@ export class FocusPolicyGuard {
     return uniqueAliases([info.bundleId, info.appDisplayName, info.appQuery, app]);
   }
 
-  recordSteal(app, routeKey) {
+  recordSteal(app, routeKey, { routeScope = null } = {}) {
     const info = this.#resolveTargetInfo(app) || {};
     for (const alias of uniqueAliases([info.bundleId, info.appDisplayName, info.appQuery, app])) {
-      this.#tracker.record(alias, routeKey);
+      this.#tracker.record(alias, routeKey, { routeScope });
     }
     this.#onFocusStealPrevented?.({
       app: info.appDisplayName || app,
@@ -339,15 +404,22 @@ export class FocusPolicyGuard {
         if (this.#isHumanTakeoverActive(guard, targetInfo, frontNow)) {
           continue;
         }
-        await this.#focusController.restoreFrontmostApp(guard.frontBefore.pid, {
+        const restored = await this.#focusController.restoreFrontmostApp(guard.frontBefore.pid, {
           expectedFrontmostPid: frontNow.pid,
           expectedFrontmostProcessToken: frontNow.processToken || null,
           expectedRestoreProcessToken: guard.frontBefore.processToken || null,
         });
-        const key = guard.routeKey || "__default__";
-        if (!guard.scopeState.recordedRoutes.has(key)) {
-          guard.scopeState.recordedRoutes.add(key);
-          this.recordSteal(guardedApp, guard.routeKey);
+        if (restored === false) {
+          return frontNow;
+        }
+        if (guard.recordRoutePenalty !== false && guard.scopeState?.recordRoutePenalty !== false) {
+          const key = guard.routeKey || "__default__";
+          if (!guard.scopeState.recordedRoutes.has(key)) {
+            guard.scopeState.recordedRoutes.add(key);
+            this.recordSteal(guardedApp, guard.routeKey, {
+              routeScope: guard.routeScope ?? guard.scopeState?.routeScope ?? null,
+            });
+          }
         }
         return guard.frontBefore;
       }
@@ -376,7 +448,19 @@ export class FocusPolicyGuard {
     return false;
   }
 
-  async #enforce(frontBefore, app, epoch, _scopeId, scopeState, routeKey = null) {
+  async #enforce(
+    frontBefore,
+    app,
+    epoch,
+    _scopeId,
+    scopeState,
+    routeKey = null,
+    { recordRoutePenalty = true, routeScope = undefined } = {}
+  ) {
+    const effectivePenalty =
+      recordRoutePenalty !== false && scopeState.recordRoutePenalty !== false;
+    const effectiveScope =
+      routeScope !== undefined ? routeScope : (scopeState.routeScope ?? null);
     if (!frontBefore?.pid || !app || epoch !== this.#epoch || !this.#focusController) return false;
     if (scopeState.humanIntentVersion !== undefined && scopeState.humanIntentVersion !== this.#humanFocusIntentVersion) {
       const targetInfoPre = this.#resolveTargetInfo(app);
@@ -391,24 +475,43 @@ export class FocusPolicyGuard {
       if (this.#isHumanTakeoverActive(scopeState, targetInfo, frontNow)) {
         return false;
       }
-      await this.#focusController.restoreFrontmostApp(frontBefore.pid, {
+      const restored = await this.#focusController.restoreFrontmostApp(frontBefore.pid, {
         expectedFrontmostPid: frontNow.pid,
         expectedFrontmostProcessToken: frontNow.processToken || null,
         expectedRestoreProcessToken: frontBefore.processToken || null,
       });
-      const effectiveRoute = routeKey || scopeState.routeKey || null;
-      const key = effectiveRoute || "__default__";
-      if (!scopeState.recordedRoutes.has(key)) {
-        scopeState.recordedRoutes.add(key);
-        this.recordSteal(app, effectiveRoute);
+      if (restored === false) {
+        return false;
+      }
+      if (effectivePenalty) {
+        const effectiveRoute = routeKey || scopeState.routeKey || null;
+        const key = effectiveRoute || "__default__";
+        if (!scopeState.recordedRoutes.has(key)) {
+          scopeState.recordedRoutes.add(key);
+          this.recordSteal(app, effectiveRoute, { routeScope: effectiveScope });
+        }
       }
       return true;
     }
     return false;
   }
 
-  #scheduleSweep(frontBefore, app, epoch, scopeId, scopeState, { routeKey = null, alreadyRecorded = false } = {}) {
+  #scheduleSweep(
+    frontBefore,
+    app,
+    epoch,
+    scopeId,
+    scopeState,
+    {
+      routeKey = null,
+      alreadyRecorded = false,
+      recordRoutePenalty = undefined,
+      routeScope = undefined,
+    } = {}
+  ) {
     if (routeKey) scopeState.routeKey = routeKey;
+    if (recordRoutePenalty === false) scopeState.recordRoutePenalty = false;
+    if (routeScope !== undefined) scopeState.routeScope = routeScope;
     if (alreadyRecorded) {
       scopeState.recordedRoutes.add(scopeState.routeKey || "__default__");
     }
@@ -442,6 +545,8 @@ export class FocusPolicyGuard {
       app,
       epoch,
       routeKey: scopeState.routeKey,
+      routeScope: scopeState.routeScope ?? null,
+      recordRoutePenalty: scopeState.recordRoutePenalty !== false,
       expiresAt: Date.now() + maxDelay + 120,
     });
 
@@ -453,35 +558,46 @@ export class FocusPolicyGuard {
         if (scopeTimers.size === 0) {
           this.#sweepTimers.delete(scopeId);
         }
-        void this.#enforce(frontBefore, app, epoch, scopeId, scopeState, scopeState.routeKey);
+        void this.#enforce(frontBefore, app, epoch, scopeId, scopeState, scopeState.routeKey, {
+          recordRoutePenalty: scopeState.recordRoutePenalty !== false,
+          routeScope: scopeState.routeScope ?? null,
+        });
       }, delayMs);
       timer.unref?.();
       scopeTimers.add(timer);
     }
   }
 
-  createScope(app, frontBefore, epoch = this.#epoch) {
+  createScope(app, frontBefore, epoch = this.#epoch, { routeScope = null } = {}) {
     const scopeId = ++this.#nextScopeId;
     const scopeState = {
       routeKey: null,
       recordedRoutes: new Set(),
       humanIntentVersion: this.#humanFocusIntentVersion,
+      routeScope,
+      recordRoutePenalty: true,
     };
     return {
       scopeId,
       app,
       frontBefore,
       epoch,
-      enforce: (routeKey = null) => this.#enforce(frontBefore, app, epoch, scopeId, scopeState, routeKey),
-      finish: (routeKey = null, { alreadyRecorded = false } = {}) =>
-        this.#scheduleSweep(frontBefore, app, epoch, scopeId, scopeState, { routeKey, alreadyRecorded }),
+      enforce: (routeKey = null, opts = {}) =>
+        this.#enforce(frontBefore, app, epoch, scopeId, scopeState, routeKey, opts),
+      finish: (routeKey = null, { alreadyRecorded = false, recordRoutePenalty = undefined, routeScope: finishScope = undefined } = {}) =>
+        this.#scheduleSweep(frontBefore, app, epoch, scopeId, scopeState, {
+          routeKey,
+          alreadyRecorded,
+          recordRoutePenalty,
+          routeScope: finishScope,
+        }),
     };
   }
 
-  async beginGuard(app) {
+  async beginGuard(app, { routeScope = null } = {}) {
     const epoch = this.#epoch;
     const frontBefore = app ? await this.#captureProtectedFrontmost(app) : null;
-    return this.createScope(app, frontBefore, epoch);
+    return this.createScope(app, frontBefore, epoch, { routeScope });
   }
 
   cancelForExplicitRaise() {
@@ -520,33 +636,46 @@ export class FocusPolicyGuard {
     this.cancelForExplicitRaise();
   }
 
-  planClick(args = {}, aliases = [], { allowAccessibilityFallback = false } = {}) {
+  planClick(
+    args = {},
+    aliases = [],
+    { allowAccessibilityFallback = false, routeScope = null } = {}
+  ) {
     const list = uniqueAliases(aliases.length ? aliases : this.#aliasesFor(args?.app));
     return planBackgroundClickMethods(args, {
       allowAccessibilityFallback,
-      blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, "click"),
-      avoidSkyFocus: this.#tracker.hasSkyFocusSteal(...list),
+      blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, "click", { routeScope }),
+      avoidSkyFocus: false,
     });
   }
 
-  planKey(toolName, args = {}, aliases = []) {
+  planKey(toolName, args = {}, aliases = [], { routeScope = null } = {}) {
     const list = uniqueAliases(aliases.length ? aliases : this.#aliasesFor(args?.app));
     return planBackgroundKeyMethods(args, {
-      blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, toolName),
-      avoidSkyFocus: this.#tracker.hasSkyFocusSteal(...list),
+      blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, toolName, { routeScope }),
+      avoidSkyFocus: false,
     });
   }
 
-  isMethodBlocked(aliases = [], toolName = "click", method = "") {
+  isMethodBlocked(aliases = [], toolName = "click", method = "", { routeScope = null } = {}) {
     return this.#tracker
-      .getBlockedMethodsForAliases(uniqueAliases(aliases), toolName)
+      .getBlockedMethodsForAliases(uniqueAliases(aliases), toolName, { routeScope })
       .includes(String(method || "").trim().toLowerCase());
   }
 
   hasPriorSteal(aliases = [], ...routeKeys) {
+    let routeScope = null;
+    let keys = routeKeys;
+    if (keys.length > 0) {
+      const last = keys[keys.length - 1];
+      if (last && typeof last === "object" && !Array.isArray(last)) {
+        routeScope = last.routeScope ?? null;
+        keys = keys.slice(0, -1);
+      }
+    }
     const list = uniqueAliases(aliases);
     return list.some((alias) =>
-      routeKeys.some((routeKey) => this.#tracker.hasRouteSteal(alias, routeKey))
+      keys.some((routeKey) => this.#tracker.hasRouteSteal(alias, routeKey, { routeScope }))
     );
   }
 }

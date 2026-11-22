@@ -186,17 +186,33 @@ export class AppSnapshotRegistry {
     let actionHasScreenshot = Boolean(prev.actionHasScreenshot);
     let actionFrameWidth = prev.actionFrameWidth || 0;
     let actionFrameHeight = prev.actionFrameHeight || 0;
-    const lastImageDigest = imageDigest !== undefined ? imageDigest : prev.lastImageDigest || null;
     let nextTinyOverride = prev.tinyWindowOverride || null;
     const nextProcessToken = processToken !== undefined ? processToken : prev.processToken || null;
     let snapshotId = prev.snapshotId || null;
-
     const rawWinId = Number(meta.windowId);
     const parsedWinId = Number.isInteger(rawWinId) && rawWinId > 0 ? rawWinId : null;
+    const pidChanged = Boolean(meta.pid && prev.pid && meta.pid !== prev.pid);
+    const processChanged = Boolean(
+      nextProcessToken && prev.processToken && nextProcessToken !== prev.processToken
+    );
     const windowChanged = Boolean(
       (meta.windowTitle && prev.windowTitle && meta.windowTitle !== prev.windowTitle) ||
         (parsedWinId && prev.windowId && parsedWinId !== prev.windowId)
     );
+    const identityChanged = windowChanged || pidChanged || processChanged;
+
+    let lastImageDigest =
+      imageDigest !== undefined ? imageDigest : identityChanged ? null : prev.lastImageDigest || null;
+    if (identityChanged) {
+      elements = new Map();
+      elementsPartial = false;
+      actionHasAx = false;
+      actionHasScreenshot = false;
+      actionFrameWidth = 0;
+      actionFrameHeight = 0;
+      nextTinyOverride = null;
+      snapshotId = null;
+    }
 
     if (fromActionPeer) {
       if (!includeAx) {
@@ -204,7 +220,7 @@ export class AppSnapshotRegistry {
         elementsPartial = false;
         actionHasAx = false;
       } else if (meta.elementsPartial || source === "query") {
-        if (windowChanged) {
+        if (identityChanged) {
           elements = meta.elements instanceof Map ? meta.elements : new Map();
         } else if (meta.elements?.size) {
           elements = meta.elements;
@@ -218,6 +234,9 @@ export class AppSnapshotRegistry {
       }
       if (!includeScreenshot && !preserveScreenshotState) {
         actionHasScreenshot = false;
+        actionFrameWidth = 0;
+        actionFrameHeight = 0;
+        lastImageDigest = imageDigest !== undefined ? imageDigest : null;
       } else if (actionDims) {
         actionHasScreenshot = true;
         actionFrameWidth = actionDims.width;
@@ -228,7 +247,7 @@ export class AppSnapshotRegistry {
       }
     } else if (includeAx) {
       if (meta.elementsPartial) {
-        elements = meta.elements?.size ? meta.elements : windowChanged ? new Map() : elements;
+        elements = meta.elements?.size ? meta.elements : identityChanged ? new Map() : elements;
         elementsPartial = true;
       } else {
         elements = meta.elements instanceof Map ? meta.elements : new Map();
@@ -241,21 +260,21 @@ export class AppSnapshotRegistry {
     const windowId =
       parsedWinId !== null
         ? parsedWinId
-        : windowChanged
+        : identityChanged
           ? null
           : prev.windowId || null;
-    const windowTitle = meta.windowTitle || prev.windowTitle || null;
+    const windowTitle = meta.windowTitle || (identityChanged ? null : prev.windowTitle || null);
     const appDisplayName = meta.appDisplayName || prev.appDisplayName || null;
     const explicitWinBounds = normalizeElementBounds(meta.windowBounds);
     const overrideWinBounds = normalizeElementBounds(nextTinyOverride?.bounds);
     const windowBounds =
       overrideWinBounds ||
       explicitWinBounds ||
-      (windowChanged ? null : prev.windowBounds || null);
+      (identityChanged ? null : prev.windowBounds || null);
 
     if (fromActionPeer && includeAx) {
-      if (windowChanged) {
-        this.#ledger.markAppStale(bundleId || appQuery, "window_changed");
+      if (identityChanged) {
+        this.#ledger.markAppStale(bundleId || appQuery, pidChanged || processChanged ? "process_restarted" : "window_changed");
       }
       const snap = this.#ledger.issueSnapshot({
         appKey: bundleId || appQuery,
@@ -278,7 +297,7 @@ export class AppSnapshotRegistry {
       this.#ledger.markAppStale(bundleId || appQuery, "ax_cache_invalidated");
     }
 
-    let nextActionScreenshotMeta = windowChanged ? null : prev.actionScreenshotMeta || null;
+    let nextActionScreenshotMeta = identityChanged ? null : prev.actionScreenshotMeta || null;
     if (fromActionPeer && !includeScreenshot && !preserveScreenshotState) {
       nextActionScreenshotMeta = null;
     } else if (fromActionPeer && includeScreenshot && actionDims) {
@@ -470,6 +489,7 @@ export class AppSnapshotRegistry {
         fromActionPeer: true,
         includeAx: true,
         includeScreenshot: false,
+        preserveScreenshotState: true,
         processToken: procIdentity?.processToken || queryToken,
         source: "query",
       }
