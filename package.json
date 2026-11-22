@@ -1,6 +1,6 @@
 {
   "name": "codex-style-computer-use",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Codex-style non-intrusive background Computer Use broker, MCP servers, and Antigravity Aux Pane live mini-window sidecar.",
   "type": "module",
   "license": "MIT",

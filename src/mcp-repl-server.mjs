@@ -16,7 +16,7 @@ export async function runReplMcpServer() {
   const broker = new BrokerRpcClient({ enableFallback: false });
 
   runJsonRpcStdioServer({
-    serverInfo: { name: "codex-style-computer-use-repl", version: "1.0.0" },
+    serverInfo: { name: "codex-style-computer-use-repl", version: "1.0.1" },
     instructions: REPL_SERVER_INSTRUCTIONS,
     onListTools: async () => {
       try {
