@@ -1,16 +1,23 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import test from "node:test";
-import { BROKER_INFO_PATH, PROJECT_ROOT, SIDECAR_PILL_MARKDOWN, UI_HTML_PATH } from "../src/constants.mjs";
+import { BROKER_INFO_PATH, OPEN_COMPUTER_USE_BIN, PROJECT_ROOT, SIDECAR_PILL_MARKDOWN, UI_HTML_PATH } from "../src/constants.mjs";
 import { ComputerUseBrokerServer } from "../src/broker-sidecar.mjs";
 import { BrokerRpcClient } from "../src/broker-client.mjs";
 import { NativeComputerUsePeer } from "../src/native-peer.mjs";
 import { parseAppsList, extractResultText } from "../src/background-policy.mjs";
 
-test("Broker HTTP token auth, pause brake, Raise interception, and live non-activating frame capture", async () => {
+const HAS_LIVE_OCU_BIN =
+  path.isAbsolute(OPEN_COMPUTER_USE_BIN) && existsSync(OPEN_COMPUTER_USE_BIN);
+
+test("Broker HTTP token auth, pause brake, Raise interception, and live non-activating frame capture", async (t) => {
+  if (!HAS_LIVE_OCU_BIN) {
+    t.skip("Live desktop E2E requires an installed open-computer-use binary");
+    return;
+  }
   const sock = `/tmp/agy-cua-test-${process.pid}.sock`;
   const token = "test-secret-token";
   const broker = new ComputerUseBrokerServer({
@@ -112,7 +119,31 @@ test("Broker HTTP token auth, pause brake, Raise interception, and live non-acti
 
 test("Both stdio MCP servers (mcp-server.mjs & mcp-repl-server.mjs) initialize and execute against broker", async () => {
   const sock = `/tmp/agy-cua-mcp-${process.pid}.sock`;
-  const broker = new ComputerUseBrokerServer({ webPort: 0, socketPath: sock });
+  const ciFallbackPeer = {
+    async listTools() {
+      return {
+        tools: [
+          { name: "list_apps", description: "List desktop apps", inputSchema: { type: "object", properties: {} } },
+          { name: "get_app_state", description: "Get app state", inputSchema: { type: "object", properties: { app: { type: "string" } } } },
+        ],
+      };
+    },
+    async callTool(name) {
+      if (name === "list_apps") {
+        return {
+          isError: false,
+          content: [{ type: "text", text: "Finder — com.apple.finder [running, frontmost]\nTextEdit — com.apple.TextEdit [running]" }],
+        };
+      }
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+    close() {},
+  };
+  const broker = new ComputerUseBrokerServer({
+    webPort: 0,
+    socketPath: sock,
+    ...(HAS_LIVE_OCU_BIN ? {} : { actionPeer: ciFallbackPeer, streamPeer: ciFallbackPeer }),
+  });
   await broker.start();
 
   async function runMcpRoundtrip(scriptRelPath, toolCallParams) {
