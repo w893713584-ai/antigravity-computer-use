@@ -900,7 +900,7 @@ export class PreviewStreamManager {
       return;
     }
 
-    if (["blank", "suspended", "stalled", "window_minimized", "encoder_error", "stopped"].includes(st)) {
+    if (["blank", "suspended", "stalled", "window_minimized", "offscreen", "encoder_error", "stopped"].includes(st)) {
       // Try verifiable same-WID JPEG before freezing to paused read-only state.
       let jpegRes = null;
       if (this.desktopHelperClient?.available && target.pid > 0 && target.windowId > 0) {

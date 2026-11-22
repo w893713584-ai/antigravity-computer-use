@@ -23,8 +23,16 @@ Unsolicited foreground activation by a background target application during auto
 _Avoid_: Window pop, focus glitch, activation flash
 
 **Delivery Route**:
-A named non-activating input channel for sending mouse, keyboard, scroll, or value mutations to a background application, adaptively ranked per application based on prior Focus Steals.
+A named non-activating input channel for sending mouse, keyboard, scroll, or value mutations to a background application, adaptively ranked per **Route Scope** with isolated click and keyboard risk based on prior **Focus Steals**.
 _Avoid_: Click mode, fallback handler, input driver
+
+**Route Scope**:
+The execution identity (`pid`, process instance token, and targeted window ID when known) within which adaptive **Delivery Route** penalties apply, preventing self-activation on one window or process generation from penalizing unrelated windows or keyboard input.
+_Avoid_: Penalty key, app blacklist, focus context
+
+**Delivery Receipt**:
+The structured outcome record (`delivery` verification status, `route` executed, and optional `requestedRoute`) returned natively across internal and scripted automation interfaces rather than parsed from display text.
+_Avoid_: Footer tag, status string, log badge
 
 **Window-Local Delivery Floor**:
 The lowest-focus-footprint window-targeted Delivery Routes that never emit synthetic activation signals and are never permanently blacklisted even when a clicked application control self-activates.

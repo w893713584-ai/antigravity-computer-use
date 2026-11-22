@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
+import { throwIfSentUnknown } from "./ax-bridge.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -145,12 +146,16 @@ export function computeSnapshotSignature(meta = {}) {
   };
 }
 
+export function isStructuralElement(idx, el) {
+  const num = Number(idx);
+  return !(el?.origin === "query" || (Number.isFinite(num) && num >= 1_000_000));
+}
+
 function filterStructuralElements(elements) {
   const filtered = new Map();
   if (!(elements instanceof Map)) return filtered;
   for (const [idx, el] of elements.entries()) {
-    const num = Number(idx);
-    if (el?.origin === "query" || (Number.isFinite(num) && num >= 1_000_000)) {
+    if (!isStructuralElement(idx, el)) {
       continue;
     }
     filtered.set(idx, el);
@@ -1179,13 +1184,7 @@ export async function tryWindowPostClick(pid, options = {}) {
   if (axBridge && axBridge.enabled !== false && typeof axBridge.postWindowClick === "function") {
     try {
       const res = await axBridge.postWindowClick(pid, rest);
-      if (res?.deliveryState === "sent_unknown") {
-        const err = new Error(`Window click partial delivery (${res.reason || "partial_click_post"})`);
-        err.code = "WRITE_OUTCOME_UNKNOWN";
-        err.deliveryState = "sent_unknown";
-        err.dispatched = true;
-        throw err;
-      }
+      throwIfSentUnknown(res, "Window click partial delivery");
       if (res) return res;
     } catch (err) {
       if (err?.aborted || err?.deliveryState === "sent_unknown" || err?.code === "WRITE_OUTCOME_UNKNOWN") {

@@ -1083,10 +1083,22 @@ export class AtomicActExecutor {
 
     const clickRoute = clickRes.routeKey;
     const clicksSent = clickRes.clicksSent;
+    const actWid = selectedWindowId || curMeta?.windowId || null;
+    const actRouteScope =
+      typeof this.registry?.buildRouteScope === "function"
+        ? this.registry.buildRouteScope(curMeta, { windowId: actWid })
+        : curMeta?.pid || actWid
+          ? {
+              pid: Number(curMeta?.pid) > 0 ? Number(curMeta.pid) : null,
+              processToken: curMeta?.processToken || null,
+              windowId: Number(actWid) > 0 ? Number(actWid) : null,
+            }
+          : null;
 
-    const stolenOnClick = await focusScope?.enforce(clickRoute);
+    const stolenOnClick = await focusScope?.enforce(clickRoute, { routeScope: actRouteScope });
     focusScope?.finish(clickRoute, {
       alreadyRecorded: Boolean(stolenOnClick),
+      routeScope: actRouteScope,
     });
     markFocusFinalized();
 

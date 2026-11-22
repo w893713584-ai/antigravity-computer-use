@@ -606,6 +606,16 @@ export class DesktopHelperClient {
     return Array.isArray(res?.windows) ? res.windows : [];
   }
 
+  async getFocusedWindow(pid) {
+    if (!this.available || !Number.isInteger(pid) || pid <= 0) return null;
+    try {
+      const res = await this.request("focusedWindow", { pid }, 800);
+      return res && typeof res === "object" ? res : null;
+    } catch {
+      return null;
+    }
+  }
+
   async requestPermission(kind) {
     if (!this.available) {
       throw new Error(`DesktopHelper unavailable (${this.#unavailableReason})`);

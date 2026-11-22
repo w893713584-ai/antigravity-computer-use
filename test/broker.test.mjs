@@ -2276,7 +2276,16 @@ test("set_value sky_bypass aborts before cmd+a/BackSpace when focus misses edita
       -1,
       "Must NOT overwrite actionPeer query index table with pre-warm get_app_state before click"
     );
-    // And post-action readback retried rendererAccessibilityFn because the 1st wake was transient (`definitive: false`)!
+    // Post-action read_back runs in strict observationalOnly mode (no AX write during read-back).
+    assert.equal(wakeAttempts, 1);
+
+    // Explicit non-observational get_app_state retries rendererAccessibilityFn because the 1st wake was transient (`definitive: false`).
+    const explicitStateRes = await client.request("tools/call", {
+      name: "get_app_state",
+      arguments: { app: "剪映专业版", include_ax: true, include_screenshot: false },
+      source: "ai",
+    });
+    assert.equal(Boolean(explicitStateRes.isError), false);
     assert.equal(wakeAttempts, 2);
 
     // 3. First set_value triggers route steal recording (`set_value:native`)

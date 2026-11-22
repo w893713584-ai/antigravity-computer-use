@@ -6,6 +6,17 @@ import { MAX_LINE_BUFFER_BYTES } from "./constants.mjs";
 const execFileAsync = promisify(execFile);
 const DEFAULT_CALL_TIMEOUT_MS = 2500;
 
+export function throwIfSentUnknown(res, label = "AX bridge write") {
+  if (res?.deliveryState === "sent_unknown") {
+    const err = new Error(`${label} (${res.reason || "sent_unknown"})`);
+    err.code = "WRITE_OUTCOME_UNKNOWN";
+    err.deliveryState = "sent_unknown";
+    err.dispatched = true;
+    throw err;
+  }
+  return res;
+}
+
 /**
  * Persistent warm JXA (`osascript -l JavaScript`) bridge to macOS ApplicationServices / AppKit / CoreGraphics.
  *
@@ -1165,13 +1176,53 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
 
 function handleFocusedWindow(params) {
   var pid = Number(params.pid || 0);
-  if (!pid || pid <= 0) return { wid: null, title: null, windowBounds: null };
-  var prefTitle = params.windowTitle ? String(params.windowTitle) : "";
+  if (!pid || pid <= 0) return { wid: null, title: null, windowBounds: null, windowIds: [] };
+  var cgRef = null;
+  var cgList = [];
+  try {
+    cgRef = $.CGWindowListCopyWindowInfo(0, 0);
+    if (cgRef) {
+      cgList = ObjC.deepUnwrap(ObjC.castRefToObject(cgRef)) || [];
+    }
+  } catch (e) {
+    cgList = [];
+  } finally {
+    if (cgRef) {
+      try { $.CFRelease(cgRef); } catch (e2) {}
+    }
+  }
+
+  var windowIds = [];
+  var pidWindows = [];
+  for (var i = 0; i < cgList.length; i++) {
+    var w = cgList[i];
+    if (Number(w.kCGWindowOwnerPID) !== pid) continue;
+    if (Number(w.kCGWindowLayer || 0) !== 0) continue;
+    var alpha = w.kCGWindowAlpha === undefined ? 1 : Number(w.kCGWindowAlpha);
+    if (alpha <= 0.01) continue;
+    var wb = w.kCGWindowBounds || {};
+    var bx = Number(wb.X || 0);
+    var by = Number(wb.Y || 0);
+    var bw = Number(wb.Width || 0);
+    var bh = Number(wb.Height || 0);
+    if (bw < 120 || bh < 80) continue;
+    var widNum = Number(w.kCGWindowNumber || 0);
+    if (widNum > 0) windowIds.push(widNum);
+    pidWindows.push({
+      wid: widNum,
+      title: String(w.kCGWindowName || ""),
+      x: bx,
+      y: by,
+      w: bw,
+      h: bh
+    });
+  }
+
   var axBounds = null;
-  var axTitle = prefTitle;
+  var axTitle = "";
   try {
     var appEl = createAppElement(pid, 0.45);
-    var axWin = selectTargetWindow(appEl, prefTitle);
+    var axWin = readAttr(appEl, "AXFocusedWindow") || readAttr(appEl, "AXMainWindow");
     if (axWin) {
       var b = readBounds(axWin);
       if (b && b.w >= 120 && b.h >= 80) {
@@ -1181,15 +1232,30 @@ function handleFocusedWindow(params) {
       if (t) axTitle = t;
     }
   } catch (e) {}
-  var win = resolveTargetCgWindow(pid, axTitle, null, null, axBounds);
-  if (!win) {
-    return { wid: null, title: axTitle || null, windowBounds: null };
+
+  if (!axBounds) {
+    return { wid: null, title: axTitle || null, windowBounds: null, windowIds: windowIds };
   }
-  return {
-    wid: win.wid > 0 ? win.wid : null,
-    title: win.title || axTitle || null,
-    windowBounds: win.w > 0 && win.h > 0 ? { x: win.x, y: win.y, w: win.w, h: win.h } : null
-  };
+
+  for (var j = 0; j < pidWindows.length; j++) {
+    var cand = pidWindows[j];
+    if (
+      cand.wid > 0 &&
+      Math.abs(cand.x - axBounds.x) <= 4 &&
+      Math.abs(cand.y - axBounds.y) <= 4 &&
+      Math.abs(cand.w - axBounds.w) <= 4 &&
+      Math.abs(cand.h - axBounds.h) <= 4
+    ) {
+      return {
+        wid: cand.wid,
+        title: cand.title || axTitle || null,
+        windowBounds: { x: cand.x, y: cand.y, w: cand.w, h: cand.h },
+        windowIds: windowIds
+      };
+    }
+  }
+
+  return { wid: null, title: axTitle || null, windowBounds: null, windowIds: windowIds };
 }
 
 function postSkyLightOrPidEvent(ev, pid, wid, localX, localY, useSkyLight, clickState, cgBtn, syntheticTag) {
@@ -1529,17 +1595,18 @@ function handleWindowClick(params) {
   var screenX = 0;
   var screenY = 0;
 
-  if (hasLocalPoint) {
-    if (params.expectedWindowSize && typeof params.expectedWindowSize === "object") {
-      var expW = Number(params.expectedWindowSize.width || params.expectedWindowSize.w || 0);
-      var expH = Number(params.expectedWindowSize.height || params.expectedWindowSize.h || 0);
-      if (
-        (expW > 0 && Math.abs(win.w - expW) > 4) ||
-        (expH > 0 && Math.abs(win.h - expH) > 4)
-      ) {
-        return { delivered: false, reason: "window_resized" };
-      }
+  if ((hasLocalPoint || hasXY) && params.screenCoords !== true && params.expectedWindowSize && typeof params.expectedWindowSize === "object") {
+    var expW = Number(params.expectedWindowSize.width || params.expectedWindowSize.w || 0);
+    var expH = Number(params.expectedWindowSize.height || params.expectedWindowSize.h || 0);
+    if (
+      (expW > 0 && Math.abs(win.w - expW) > 4) ||
+      (expH > 0 && Math.abs(win.h - expH) > 4)
+    ) {
+      return { delivered: false, reason: "window_resized" };
     }
+  }
+
+  if (hasLocalPoint) {
     var lpx = Number(params.localPoint.x);
     var lpy = Number(params.localPoint.y);
     if (lpx < 0 || lpy < 0 || lpx > win.w + 1 || lpy > win.h + 1) {
@@ -1619,20 +1686,36 @@ function handleWindowClick(params) {
     }
   }
 
-  postStep(5, 0, 0.0);
-  $.NSThread.sleepForTimeInterval(0.012);
-  var downsPosted = 0;
-  var upsPosted = 0;
-  for (var c = 1; c <= clickCount; c++) {
-    if (postStep(downType, c, 1.0)) downsPosted += 1;
-    $.NSThread.sleepForTimeInterval(0.022);
-    if (postStep(upType, c, 0.0)) upsPosted += 1;
-    if (c < clickCount) {
-      $.NSThread.sleepForTimeInterval(0.028);
+  var anyPosted = false;
+  var completedPairs = 0;
+  try {
+    if (postStep(5, 0, 0.0)) anyPosted = true;
+    $.NSThread.sleepForTimeInterval(0.012);
+    for (var c = 1; c <= clickCount; c++) {
+      var dOk = postStep(downType, c, 1.0);
+      if (dOk) anyPosted = true;
+      $.NSThread.sleepForTimeInterval(0.022);
+      var uOk = postStep(upType, c, 0.0);
+      if (uOk) anyPosted = true;
+      if (dOk && uOk) completedPairs += 1;
+      if (c < clickCount) {
+        $.NSThread.sleepForTimeInterval(0.028);
+      }
     }
+  } catch (postErr) {
+    if (anyPosted) {
+      return {
+        delivered: false,
+        deliveryState: "sent_unknown",
+        method: useSkyLight ? "window_post" : "app_post",
+        reason: "click_post_exception",
+        wid: win.wid
+      };
+    }
+    throw postErr;
   }
 
-  if (downsPosted === 0 && upsPosted === 0) {
+  if (!anyPosted) {
     return {
       delivered: false,
       method: null,
@@ -1640,7 +1723,7 @@ function handleWindowClick(params) {
       wid: win.wid
     };
   }
-  if (downsPosted > 0 && upsPosted < downsPosted) {
+  if (completedPairs !== clickCount) {
     return {
       delivered: false,
       deliveryState: "sent_unknown",
@@ -1809,7 +1892,11 @@ function handleWindowKey(params) {
     parsedChords.push(parsed);
   }
 
-  var win = resolveTargetCgWindow(pid, params.windowTitle || "", params.wid || null, null, null);
+  var reqWid = Number(params.wid || 0);
+  var win = resolveTargetCgWindow(pid, params.windowTitle || "", reqWid > 0 ? reqWid : null, null, null);
+  if (reqWid > 0 && (!win || !(win.wid > 0))) {
+    return { delivered: false, reason: "window_not_found" };
+  }
   var wid = win && win.wid > 0 ? win.wid : 0;
 
   for (var j = 0; j < parsedChords.length; j++) {
@@ -1867,7 +1954,11 @@ function handleWindowText(params) {
   var text = String(params.text === undefined || params.text === null ? "" : params.text);
   if (!text.length) return { delivered: true, wid: 0 };
 
-  var win = resolveTargetCgWindow(pid, params.windowTitle || "", params.wid || null, null, null);
+  var reqWid = Number(params.wid || 0);
+  var win = resolveTargetCgWindow(pid, params.windowTitle || "", reqWid > 0 ? reqWid : null, null, null);
+  if (reqWid > 0 && (!win || !(win.wid > 0))) {
+    return { delivered: false, reason: "window_not_found" };
+  }
   var wid = win && win.wid > 0 ? win.wid : 0;
 
   var CR = String.fromCharCode(13);
@@ -2140,7 +2231,15 @@ export class PersistentAxBridge {
             if (entry.gen !== gen) continue;
             this.#pending.delete(reqId);
             clearTimeout(entry.timer);
-            entry.reject(reason);
+            if (entry.mutating && entry.dispatched) {
+              const exitErr = new Error(reason.message);
+              exitErr.code = "WRITE_OUTCOME_UNKNOWN";
+              exitErr.deliveryState = "sent_unknown";
+              exitErr.dispatched = true;
+              entry.reject(exitErr);
+            } else {
+              entry.reject(reason);
+            }
           }
           if (isCurrent) {
             this.#syncRefState();
@@ -2528,14 +2627,7 @@ export class PersistentAxBridge {
       },
       { timeoutMs: 2200, beforeWriteCheck }
     );
-    if (res?.deliveryState === "sent_unknown") {
-      const err = new Error(`PersistentAxBridge partial click delivery (${res.reason || "partial_click_post"})`);
-      err.code = "WRITE_OUTCOME_UNKNOWN";
-      err.deliveryState = "sent_unknown";
-      err.dispatched = true;
-      throw err;
-    }
-    return res;
+    return throwIfSentUnknown(res, "PersistentAxBridge partial click delivery");
   }
 
   async getFocusedWindowInfo(pid, { windowTitle = "" } = {}) {

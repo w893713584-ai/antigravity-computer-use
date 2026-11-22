@@ -295,6 +295,31 @@
     return hasCamel ? options[camelKey] : hasSnake ? options[snakeKey] : undefined;
   }
 
+  const ALLOWED_MOUSE_BUTTONS = new Set(["left", "right", "middle"]);
+  const ALLOWED_CLICK_METHODS = new Set([
+    "auto",
+    "sky_click",
+    "window_post",
+    "app_post",
+    "accessibility",
+    "global",
+  ]);
+  const ALLOWED_KEY_METHODS = new Set(["auto", "sky_key", "window_key", "global"]);
+
+  function validateMouseButton(value, label = "click") {
+    if (typeof value !== "string" || !ALLOWED_MOUSE_BUTTONS.has(value)) {
+      throw new Error(`${label} mouseButton must be one of left, right, middle`);
+    }
+    return value;
+  }
+
+  function validateClickCount(value, label = "click") {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 3) {
+      throw new Error(`${label} clickCount must be an integer between 1 and 3`);
+    }
+    return value;
+  }
+
   function optionsToClickArgs(options = {}) {
     if (options !== undefined && options !== null && !isPlainObject(options)) {
       throw new Error("click expects an options object");
@@ -304,9 +329,16 @@
     const mouseButton = resolveOptionAlias(opts, "mouseButton", "mouse_button", "click");
     const clickCount = resolveOptionAlias(opts, "clickCount", "click_count", "click");
     const clickMethod = resolveOptionAlias(opts, "clickMethod", "click_method", "click");
-    if (mouseButton !== undefined) args.mouse_button = mouseButton;
-    if (clickCount !== undefined) args.click_count = clickCount;
-    if (clickMethod !== undefined) args.click_method = clickMethod;
+    if (mouseButton !== undefined) args.mouse_button = validateMouseButton(mouseButton, "click");
+    if (clickCount !== undefined) args.click_count = validateClickCount(clickCount, "click");
+    if (clickMethod !== undefined) {
+      if (typeof clickMethod !== "string" || !ALLOWED_CLICK_METHODS.has(clickMethod)) {
+        throw new Error(
+          `Invalid clickMethod: ${String(clickMethod)} (expected auto, sky_click, window_post, app_post, accessibility, or global)`
+        );
+      }
+      args.click_method = clickMethod;
+    }
     return args;
   }
 
@@ -317,7 +349,14 @@
     const opts = options || {};
     const args = {};
     const keyMethod = resolveOptionAlias(opts, "keyMethod", "key_method", "key");
-    if (keyMethod !== undefined) args.key_method = keyMethod;
+    if (keyMethod !== undefined) {
+      if (typeof keyMethod !== "string" || !ALLOWED_KEY_METHODS.has(keyMethod)) {
+        throw new Error(
+          `Invalid keyMethod: ${String(keyMethod)} (expected auto, sky_key, window_key, or global)`
+        );
+      }
+      args.key_method = keyMethod;
+    }
     return args;
   }
 
@@ -374,21 +413,17 @@
           target: options.target,
           expect: options.expect,
         };
-        if (options.windowId !== undefined || options.window_id !== undefined) {
-          actArgs.window_id = options.windowId ?? options.window_id;
-        }
-        if (options.clickCount !== undefined || options.click_count !== undefined) {
-          actArgs.click_count = options.clickCount ?? options.click_count;
-        }
-        if (options.mouseButton !== undefined || options.mouse_button !== undefined) {
-          actArgs.mouse_button = options.mouseButton ?? options.mouse_button;
-        }
+        const windowId = resolveOptionAlias(options, "windowId", "window_id", "act");
+        if (windowId !== undefined) actArgs.window_id = windowId;
+        const clickCount = resolveOptionAlias(options, "clickCount", "click_count", "act");
+        if (clickCount !== undefined) actArgs.click_count = validateClickCount(clickCount, "act");
+        const mouseButton = resolveOptionAlias(options, "mouseButton", "mouse_button", "act");
+        if (mouseButton !== undefined) actArgs.mouse_button = validateMouseButton(mouseButton, "act");
         if (options.reveal !== undefined) {
           actArgs.reveal = options.reveal;
         }
-        if (options.timeoutMs !== undefined || options.timeout_ms !== undefined) {
-          actArgs.timeout_ms = options.timeoutMs ?? options.timeout_ms;
-        }
+        const timeoutMs = resolveOptionAlias(options, "timeoutMs", "timeout_ms", "act");
+        if (timeoutMs !== undefined) actArgs.timeout_ms = timeoutMs;
         const reply = await callBroker("app.act", actArgs);
         if (options.emit === true && reply && typeof reply.imageBase64 === "string") {
           emitImageItem({
@@ -546,7 +581,7 @@
         ) {
           throw new Error("selection must be text, cursor_before or cursor_after");
         }
-        await callBroker("app.selectText", {
+        return await callBroker("app.selectText", {
           handleId,
           app: appName,
           element_index: elementIndex,
@@ -567,7 +602,7 @@
       },
 
       async performSecondaryAction(elementIndex, action) {
-        await callBroker("app.performSecondaryAction", {
+        return await callBroker("app.performSecondaryAction", {
           handleId,
           app: appName,
           element_index: elementIndex,

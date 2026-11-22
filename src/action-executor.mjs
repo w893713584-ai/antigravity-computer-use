@@ -11,6 +11,7 @@ import { TakeoverAbortedError } from "./takeover-controller.mjs";
 import {
   buildStaleRefToolResult,
   computeFrameDigest,
+  didUiStructurallyChange,
   shouldAttemptSelectedTextFastPath,
   tryHeadlessBackgroundScroll,
   tryHeadlessContextMenu,
@@ -22,6 +23,19 @@ import {
   verifyEditableTextFocus,
   verifySetValueObservation,
 } from "./headless-engine.mjs";
+
+export function attachDeliveryReceipt(result, receipt) {
+  if (!result || typeof result !== "object" || !receipt || typeof receipt !== "object") {
+    return result;
+  }
+  Object.defineProperty(result, "_deliveryReceipt", {
+    value: receipt,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  return result;
+}
 
 export const STALE_SNAPSHOT_RE =
   /requires a current.*target window|no longer exists|stale window|No window bounds|coordinate input requires a delivered screenshot|Screenshot omitted|No app state|Run get_app_state|previous element indexes invalidated|Read AX before element-targeted actions/iu;
@@ -290,6 +304,20 @@ export class BackgroundActionExecutor {
     this.takeoverController?.assertMayDispatch(operation, { isRead });
   }
 
+  #resolveRouteScope(meta, opts = {}) {
+    if (typeof this.registry?.buildRouteScope === "function") {
+      return this.registry.buildRouteScope(meta, opts);
+    }
+    const pid = Number(meta?.pid || 0);
+    const wid = Number(opts?.windowId ?? opts?.snapshot?.windowId ?? meta?.windowId ?? 0);
+    if (!(pid > 0) && !(wid > 0)) return null;
+    return {
+      pid: pid > 0 ? pid : null,
+      processToken: meta?.processToken || null,
+      windowId: wid > 0 ? wid : null,
+    };
+  }
+
   #trackWrite(operation, promise, routeKey = null) {
     if (!this.takeoverController) return promise;
     return this.takeoverController.trackNativeWrite(operation, promise, { routeKey });
@@ -411,19 +439,8 @@ export class BackgroundActionExecutor {
         preMeta?.actionHasScreenshot !== false &&
         Number(preMeta?.actionFrameWidth) > 0 &&
         Number(preMeta?.actionFrameHeight) > 0;
-      const canUseFallbackDims =
-        !isCoordClick ||
-        (preMeta?.actionHasScreenshot !== false && fallbackDims?.sameApp !== false);
-      const frameWidth = hasPreMetaScreenshot
-        ? preMeta.actionFrameWidth
-        : canUseFallbackDims
-          ? fallbackDims.width || 0
-          : 0;
-      const frameHeight = hasPreMetaScreenshot
-        ? preMeta.actionFrameHeight
-        : canUseFallbackDims
-          ? fallbackDims.height || 0
-          : 0;
+      const frameWidth = hasPreMetaScreenshot ? preMeta.actionFrameWidth : 0;
+      const frameHeight = hasPreMetaScreenshot ? preMeta.actionFrameHeight : 0;
       if (isCoordClick && !(frameWidth > 0 && frameHeight > 0)) {
         const isFatalNoGeometry =
           cleanArgs.click_method === "window_post" ||
@@ -442,9 +459,25 @@ export class BackgroundActionExecutor {
       }
       const beforeWriteCheck = () => this.#beforeWrite(operation, false);
       beforeWriteCheck();
-      const wid =
-        preMeta?.tinyWindowOverride?.wid || preSnapshot?.windowId || preMeta?.windowId || null;
-      const windowBounds = preMeta?.tinyWindowOverride?.bounds || preMeta?.windowBounds || null;
+      const rawOv = preMeta?.tinyWindowOverride || null;
+      const matchingOverride =
+        rawOv &&
+        (!preMeta?.windowId ||
+          !rawOv.wid ||
+          rawOv.wid === preMeta.windowId ||
+          preMeta?.actionScreenshotMeta?.source === "tiny_window_override")
+          ? rawOv
+          : null;
+      const wid = matchingOverride?.wid || preSnapshot?.windowId || preMeta?.windowId || null;
+      const windowBounds =
+        matchingOverride?.bounds ||
+        preMeta?.actionScreenshotMeta?.windowBounds ||
+        preMeta?.windowBounds ||
+        null;
+      const captureBounds = preMeta?.actionScreenshotMeta?.windowBounds || windowBounds;
+      const expW = Number(captureBounds?.width ?? captureBounds?.w ?? 0);
+      const expH = Number(captureBounds?.height ?? captureBounds?.h ?? 0);
+      const expectedWindowSize = expW > 0 && expH > 0 ? { width: expW, height: expH } : null;
       const winRes = await this.#trackWrite(
         operation,
         this.windowClickFn(preMeta.pid, {
@@ -456,6 +489,7 @@ export class BackgroundActionExecutor {
           y: cleanArgs.y ?? null,
           frameWidth,
           frameHeight,
+          expectedWindowSize,
           windowTitle: preMeta?.windowTitle || "",
           wid,
           windowBounds,
@@ -474,14 +508,16 @@ export class BackgroundActionExecutor {
       }
       return {
         isError: true,
-        fatal: winRes?.reason === "out_of_bounds",
+        fatal: winRes?.reason === "out_of_bounds" || winRes?.reason === "window_resized",
         content: [
           {
             type: "text",
             text:
               winRes?.reason === "out_of_bounds"
                 ? "Click coordinates are outside the current window screenshot bounds."
-                : `Window-local click unavailable (${winRes?.reason || "unavailable"}).`,
+                : winRes?.reason === "window_resized"
+                  ? "Target window size changed since screenshot; run get_app_state before retrying."
+                  : `Window-local click unavailable (${winRes?.reason || "unavailable"}).`,
           },
         ],
       };
@@ -619,15 +655,20 @@ export class BackgroundActionExecutor {
     };
 
     let focusedOk = false;
+    let focusedClickMethod = null;
     for (const method of clickMethods) {
       const clickRes = await this.#dispatchClickMethod(method, bypassClickCtx);
       if (!clickRes?.isError) {
         focusedOk = true;
+        focusedClickMethod = method;
         break;
       }
       if (clickRes?.fatal) break;
     }
     if (!focusedOk) return { ok: false };
+    if (ctx.focusScope && focusedClickMethod) {
+      await ctx.focusScope.enforce(formatDeliveryRoute("click", focusedClickMethod), { routeScope });
+    }
 
     const focusCheck =
       typeof this.editableFocusFn === "function"
@@ -652,6 +693,9 @@ export class BackgroundActionExecutor {
           cleanArgs: { app, key },
           allowAutoRefresh: false,
         });
+        if (!res?.isError && ctx.focusScope) {
+          await ctx.focusScope.enforce(formatDeliveryRoute("press_key", method), { routeScope });
+        }
         if (!res?.isError || res?.fatal) return res;
       }
       return { isError: true };
@@ -721,6 +765,9 @@ export class BackgroundActionExecutor {
         cleanArgs: { app, text: safeKeyText },
         allowAutoRefresh: false,
       });
+      if (!typeRes?.isError && ctx.focusScope) {
+        await ctx.focusScope.enforce(formatDeliveryRoute("type_text", method), { routeScope });
+      }
       if (!typeRes?.isError || typeRes?.fatal) break;
     }
     if (!typeRes || typeRes.isError) return { ok: false };
@@ -744,6 +791,7 @@ export class BackgroundActionExecutor {
     operation = null,
     windowDelivery = null,
     routeScope = null,
+    focusScope = null,
   }) {
     let result = null;
     let actionRouteKey = name;
@@ -767,14 +815,7 @@ export class BackgroundActionExecutor {
         : null);
     const preFrameDigest = preMeta?.lastImageDigest || null;
     const effectiveRouteScope =
-      routeScope ||
-      (preMeta
-        ? {
-            pid: preMeta.pid || null,
-            processToken: preMeta.processToken || null,
-            windowId: preSnapshot?.windowId || preMeta.windowId || null,
-          }
-        : null);
+      routeScope || this.#resolveRouteScope(preMeta, { snapshot: preSnapshot });
     const rawExplicitMethod =
       name === "click"
         ? cleanArgs?.click_method
@@ -804,6 +845,7 @@ export class BackgroundActionExecutor {
       operation,
       windowDelivery,
       routeScope: effectiveRouteScope,
+      focusScope,
     };
 
     if (name === "click") {
@@ -813,7 +855,19 @@ export class BackgroundActionExecutor {
         : windowDelivery?.localPoint
           ? `坐标 (${Math.round(windowDelivery.localPoint.x)}, ${Math.round(windowDelivery.localPoint.y)} pt)`
           : `坐标 (${Math.round(cleanArgs.x)}, ${Math.round(cleanArgs.y)})`;
-      const ov = preMeta?.tinyWindowOverride;
+      const rawOv = preMeta?.tinyWindowOverride || null;
+      const ov =
+        rawOv &&
+        (!preMeta?.windowId ||
+          !rawOv.wid ||
+          rawOv.wid === preMeta.windowId ||
+          preMeta?.actionScreenshotMeta?.source === "tiny_window_override")
+          ? rawOv
+          : null;
+      const isCoordClickDispatch =
+        !parsedRef?.hasElementRef &&
+        Number.isFinite(cleanArgs.x) &&
+        Number.isFinite(cleanArgs.y);
 
       if (windowDelivery?.route === "window_post") {
         const targetPid = Number(windowDelivery.pid || preMeta?.pid || 0);
@@ -870,9 +924,22 @@ export class BackgroundActionExecutor {
               };
         }
       } else if (
-        !parsedRef?.hasElementRef &&
-        Number.isFinite(cleanArgs.x) &&
-        Number.isFinite(cleanArgs.y) &&
+        isCoordClickDispatch &&
+        preMeta?.windowId > 0 &&
+        preMeta?.actionHasScreenshot === false
+      ) {
+        actionRouteKey = requestedRoute || formatDeliveryRoute("click", "window_post");
+        result = {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "Current window has no matching screenshot geometry; run get_app_state before coordinate click.",
+            },
+          ],
+        };
+      } else if (
+        isCoordClickDispatch &&
         isValidTinyOverrideGeometry(ov) &&
         preMeta?.pid > 0 &&
         typeof this.pointClickFn === "function"
@@ -892,7 +959,8 @@ export class BackgroundActionExecutor {
             ],
           };
         } else {
-          this.#beforeWrite(operation, false);
+          const beforeWriteCheck = () => this.#beforeWrite(operation, false);
+          beforeWriteCheck();
           const { screenX, screenY } = mapTinyOverridePoint(ov, cleanArgs.x, cleanArgs.y);
           const allowAppPostFallback =
             cleanArgs.click_method !== "window_post" &&
@@ -909,6 +977,7 @@ export class BackgroundActionExecutor {
               bounds: ov.bounds,
               allowAppPostFallback,
               syntheticTag: this.takeoverController?.syntheticEventTag || 0,
+              beforeWriteCheck,
             }),
             "click:point_override"
           );
@@ -1169,11 +1238,10 @@ export class BackgroundActionExecutor {
         }
         if (!handledViaBypass && name === "set_value") {
           actionRouteKey = formatDeliveryRoute("set_value", "native");
-          const hasPriorNativeSteal = this.focusPolicyGuard.hasPriorSteal(
+          const hasPriorNativeSteal = this.focusPolicyGuard.hasPriorStealForScope(
             aliases,
-            "set_value:native",
-            "set_value",
-            { routeScope: effectiveRouteScope }
+            ["set_value:native", "set_value"],
+            effectiveRouteScope
           );
           if (parsedRef?.hasElementRef && !preElement?.isSecure && hasPriorNativeSteal) {
             const bypass = await this.#executeBackgroundSetValueBypass(ctx);
@@ -1328,7 +1396,9 @@ export class BackgroundActionExecutor {
     preFrameDigest,
     checkAppRunningFn,
     readBackStateFn,
+    onBeforeReadBackFn = null,
     onReclaimFocusFn = null,
+    onAfterReadBackFn = null,
   }) {
     const actionNote = extractResultText(result)
       .replace(/^ok\s*/iu, "")
@@ -1338,28 +1408,48 @@ export class BackgroundActionExecutor {
       await new Promise((r) => setTimeout(r, this.postActionDelayMs));
     }
 
-    let readBack = await readBackStateFn();
-    if (readBack?.isError && typeof checkAppRunningFn === "function") {
-      const stillRunning = await checkAppRunningFn();
-      if (stillRunning?.running) {
-        if (this.windowTransitionRetryDelayMs > 0) {
-          await new Promise((r) => setTimeout(r, this.windowTransitionRetryDelayMs));
+    let readBack = null;
+    try {
+      if (typeof onBeforeReadBackFn === "function") {
+        await onBeforeReadBackFn();
+      }
+
+      readBack = await readBackStateFn();
+      if (readBack?.isError && typeof checkAppRunningFn === "function") {
+        const stillRunning = await checkAppRunningFn();
+        if (stillRunning?.running) {
+          if (this.windowTransitionRetryDelayMs > 0) {
+            await new Promise((r) => setTimeout(r, this.windowTransitionRetryDelayMs));
+          }
+          readBack = await readBackStateFn();
         }
-        readBack = await readBackStateFn();
+      }
+
+      if (typeof onReclaimFocusFn === "function") {
+        await onReclaimFocusFn();
+      }
+    } finally {
+      if (typeof onAfterReadBackFn === "function") {
+        await onAfterReadBackFn();
       }
     }
 
-    if (typeof onReclaimFocusFn === "function") {
-      await onReclaimFocusFn();
-    }
+    const buildReceipt = (delivery) => ({
+      delivery,
+      route: actionRouteKey,
+      executedRoute: actionRouteKey,
+      ...(requestedRoute ? { requestedRoute } : {}),
+    });
 
     if (readBack?.isError) {
+      const errReceipt = buildReceipt("delivered_unverified");
       return {
-        result,
+        result: attachDeliveryReceipt(result, errReceipt),
         deliveryStatus: "delivered_unverified",
         verified: false,
         actionRouteKey,
         requestedRoute,
+        deliveryReceipt: errReceipt,
       };
     }
 
@@ -1368,52 +1458,15 @@ export class BackgroundActionExecutor {
     const postFrameDigest = readBackImg?.data
       ? computeFrameDigest(Buffer.from(readBackImg.data, "base64"))
       : null;
-    const preHasStructuralEls =
-      preSnapshot?.elements instanceof Map
-        ? Array.from(preSnapshot.elements.values()).some(
-            (el) => el?.origin !== "query" && !(Number(el?.index) >= 1_000_000)
-          )
-        : false;
-    const isColdQueryPre = preSnapshot?.source === "query" && !preHasStructuralEls;
-    const sameWindowId = Boolean(
-      preSnapshot?.windowId &&
-        postSnapshot?.windowId &&
-        preSnapshot.windowId === postSnapshot.windowId
-    );
-    const sameWindowTitle =
-      (postSnapshot?.windowTitle || "") === (preSnapshot?.windowTitle || "");
-    const windowIdChanged = Boolean(
-      preSnapshot?.windowId &&
-        postSnapshot?.windowId &&
-        preSnapshot.windowId !== postSnapshot.windowId
-    );
-    const windowTitleChanged = Boolean(
+    const axChanged = Boolean(
       preSnapshot &&
         postSnapshot &&
-        (postSnapshot.windowTitle || "") !== (preSnapshot.windowTitle || "")
+        postSnapshot.id !== preSnapshot.id &&
+        didUiStructurallyChange(preSnapshot, postSnapshot)
     );
     const frameChanged = Boolean(
       preFrameDigest && postFrameDigest && preFrameDigest !== postFrameDigest
     );
-    const sameFrame = Boolean(
-      preFrameDigest && postFrameDigest && preFrameDigest === postFrameDigest
-    );
-    const structuralUiChanged = Boolean(
-      postSnapshot?.uiChangedSinceCapture ||
-        (preSnapshot?.stale && !isColdQueryPre) ||
-        windowIdChanged ||
-        windowTitleChanged
-    );
-    const identicalUnchangedWindow = Boolean(
-      sameWindowId &&
-        sameWindowTitle &&
-        sameFrame &&
-        !postSnapshot?.uiChangedSinceCapture
-    );
-    const uiChanged =
-      preSnapshot && postSnapshot && postSnapshot.id !== preSnapshot.id
-        ? structuralUiChanged && !identicalUnchangedWindow
-        : false;
 
     let deliveryStatus = "delivered_unverified";
     let verificationNote = "";
@@ -1439,8 +1492,10 @@ export class BackgroundActionExecutor {
       } else if (check.verified === false) {
         verificationNote = `set_value readback still observed '${String(check.observed || "").slice(0, 40)}'`;
       }
-    } else if (directDeliveryVerified || uiChanged || frameChanged) {
+    } else if (directDeliveryVerified || axChanged) {
       deliveryStatus = "delivered_verified";
+    } else if (frameChanged) {
+      verificationNote = "visual frame changed (unverified)";
     }
 
     const verified = deliveryStatus === "delivered_verified";
@@ -1456,13 +1511,15 @@ export class BackgroundActionExecutor {
             content: [{ type: "text", text: actionNote }, ...readBack.content],
           }
         : readBack;
+    const deliveryReceipt = buildReceipt(deliveryStatus);
 
     return {
-      result: appendResultFooter(mergedResult, deliveryFooter),
+      result: attachDeliveryReceipt(appendResultFooter(mergedResult, deliveryFooter), deliveryReceipt),
       deliveryStatus,
       verified,
       actionRouteKey,
       requestedRoute,
+      deliveryReceipt,
     };
   }
 
@@ -1489,13 +1546,7 @@ export class BackgroundActionExecutor {
       Number(windowId) > 0
         ? Number(windowId)
         : meta?.tinyWindowOverride?.wid || meta?.windowId || null;
-    const routeScope = meta
-      ? {
-          pid: pid || meta.pid || null,
-          processToken: meta.processToken || null,
-          windowId: wid || meta.windowId || null,
-        }
-      : null;
+    const routeScope = this.#resolveRouteScope(meta, { windowId: wid });
     const beforeWriteCheck = () => this.#beforeWrite(operation, false);
 
     if (
@@ -1569,9 +1620,11 @@ export class BackgroundActionExecutor {
 
     if (
       !(Number(windowId) > 0) &&
-      !this.focusPolicyGuard.hasPriorSteal(aliases, "scroll:native", "click:sky_click", {
-        routeScope,
-      })
+      !this.focusPolicyGuard.hasPriorStealForScope(
+        aliases,
+        ["scroll:native", "click:sky_click"],
+        routeScope
+      )
     ) {
       beforeWriteCheck();
       const callTimeout = Number(timeoutMs) > 0 ? Math.max(50, Math.min(8000, timeoutMs)) : undefined;
@@ -1638,13 +1691,7 @@ export class BackgroundActionExecutor {
       Number(explicitWindowId) > 0
         ? Number(explicitWindowId)
         : resolvedTarget?.wid || meta?.tinyWindowOverride?.wid || meta?.windowId || null;
-    const routeScope = meta
-      ? {
-          pid: pid || meta.pid || null,
-          processToken: meta.processToken || null,
-          windowId: effectiveWid || meta.windowId || null,
-        }
-      : null;
+    const routeScope = this.#resolveRouteScope(meta, { windowId: effectiveWid });
 
     const methods = this.focusPolicyGuard.planClick({ click_method: "auto" }, aliases, {
       routeScope,
@@ -1730,7 +1777,7 @@ export class BackgroundActionExecutor {
 
     if (
       methods.includes("sky_click") &&
-      !this.focusPolicyGuard.hasPriorSteal(aliases, "click:sky_click", { routeScope })
+      !this.focusPolicyGuard.hasPriorStealForScope(aliases, ["click:sky_click"], routeScope)
     ) {
       const canMapPx =
         !(Number(explicitWindowId) > 0) &&

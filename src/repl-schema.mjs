@@ -98,6 +98,30 @@ export function normalizeReplSnapshotArgs(args = {}) {
   return out;
 }
 
+function validateMouseButton(value) {
+  const mb = String(value);
+  if (!["left", "right", "middle"].includes(mb)) {
+    throw new Error(`Invalid mouse_button: ${mb}`);
+  }
+  return mb;
+}
+
+function validateClickCount(value) {
+  const cc = Number(value);
+  if (!Number.isSafeInteger(cc) || cc < 1 || cc > 3) {
+    throw new Error(`Invalid click_count: ${String(value)}`);
+  }
+  return cc;
+}
+
+function validateKeyMethod(value) {
+  const km = String(value);
+  if (!["auto", "sky_key", "window_key", "global"].includes(km)) {
+    throw new Error(`Invalid key_method: ${km}`);
+  }
+  return km;
+}
+
 export function buildBrokerToolCallForReplOp(op, args = {}, boundApp = null) {
   if (!REPL_ALLOWED_OPS.has(op)) {
     throw new Error(`FORBIDDEN_REPL_OP: ${op}`);
@@ -133,8 +157,12 @@ export function buildBrokerToolCallForReplOp(op, args = {}, boundApp = null) {
           target: args.target,
           expect: args.expect,
           ...(args.window_id !== undefined ? { window_id: Number(args.window_id) } : {}),
-          ...(args.click_count !== undefined ? { click_count: Number(args.click_count) } : {}),
-          ...(args.mouse_button !== undefined ? { mouse_button: String(args.mouse_button) } : {}),
+          ...(args.click_count !== undefined
+            ? { click_count: validateClickCount(args.click_count) }
+            : {}),
+          ...(args.mouse_button !== undefined
+            ? { mouse_button: validateMouseButton(args.mouse_button) }
+            : {}),
           ...(args.reveal !== undefined ? { reveal: args.reveal } : {}),
           ...(args.timeout_ms !== undefined ? { timeout_ms: Number(args.timeout_ms) } : {}),
         },
@@ -154,19 +182,29 @@ export function buildBrokerToolCallForReplOp(op, args = {}, boundApp = null) {
         toolName: "get_app_state",
         toolArgs: { app, ...normalizeReplSnapshotArgs(args) },
       };
-    case "app.click":
+    case "app.click": {
+      const clickArgs = { app };
+      if (args.element_index !== undefined) clickArgs.element_index = String(args.element_index);
+      if (args.x !== undefined) clickArgs.x = Number(args.x);
+      if (args.y !== undefined) clickArgs.y = Number(args.y);
+      if (args.mouse_button !== undefined) {
+        clickArgs.mouse_button = validateMouseButton(args.mouse_button);
+      }
+      if (args.click_count !== undefined) {
+        clickArgs.click_count = validateClickCount(args.click_count);
+      }
+      if (args.click_method !== undefined) {
+        const cm = String(args.click_method);
+        if (!["auto", "sky_click", "window_post", "app_post", "accessibility", "global"].includes(cm)) {
+          throw new Error(`Invalid click_method: ${cm}`);
+        }
+        clickArgs.click_method = cm;
+      }
       return {
         toolName: "click",
-        toolArgs: {
-          app,
-          ...(args.element_index !== undefined ? { element_index: String(args.element_index) } : {}),
-          ...(args.x !== undefined ? { x: Number(args.x) } : {}),
-          ...(args.y !== undefined ? { y: Number(args.y) } : {}),
-          ...(args.mouse_button !== undefined ? { mouse_button: String(args.mouse_button) } : {}),
-          ...(args.click_count !== undefined ? { click_count: Number(args.click_count) } : {}),
-          ...(args.click_method !== undefined ? { click_method: String(args.click_method) } : {}),
-        },
+        toolArgs: clickArgs,
       };
+    }
     case "app.drag":
       return {
         toolName: "drag",
@@ -178,15 +216,17 @@ export function buildBrokerToolCallForReplOp(op, args = {}, boundApp = null) {
           to_y: Number(args.to_y),
         },
       };
-    case "app.pressKey":
+    case "app.pressKey": {
+      const keyMethod = args.key_method !== undefined ? validateKeyMethod(args.key_method) : undefined;
       return {
         toolName: "press_key",
         toolArgs: {
           app,
           key: String(args.key ?? ""),
-          ...(args.key_method !== undefined ? { key_method: String(args.key_method) } : {}),
+          ...(keyMethod !== undefined ? { key_method: keyMethod } : {}),
         },
       };
+    }
     case "app.scroll":
       return {
         toolName: "scroll",
@@ -218,15 +258,17 @@ export function buildBrokerToolCallForReplOp(op, args = {}, boundApp = null) {
           ...(args.selection !== undefined ? { selection: String(args.selection) } : {}),
         },
       };
-    case "app.typeText":
+    case "app.typeText": {
+      const keyMethod = args.key_method !== undefined ? validateKeyMethod(args.key_method) : undefined;
       return {
         toolName: "type_text",
         toolArgs: {
           app,
           text: String(args.text ?? ""),
-          ...(args.key_method !== undefined ? { key_method: String(args.key_method) } : {}),
+          ...(keyMethod !== undefined ? { key_method: keyMethod } : {}),
         },
       };
+    }
     case "app.performSecondaryAction":
       return {
         toolName: "perform_secondary_action",

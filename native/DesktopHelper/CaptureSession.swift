@@ -656,17 +656,19 @@ final class ManagedCaptureStream: NSObject, SCStreamOutput, SCStreamDelegate {
         (nowNs &- self.lastSampleAtNs, self.lastStatusState, self.currentWindow, self.stallProbeInFlight)
       }
       guard elapsedNs > 2_000_000_000 && state != "idle" && state != "stalled" && state != "window_closed" else { return }
-      let stillExists = WindowInventory.windowExists(pid: self.targetPid, windowId: Int64(self.targetWindowId))
+      guard let stillExists = WindowInventory.windowExists(pid: self.targetPid, windowId: Int64(self.targetWindowId)) else {
+        return
+      }
       if !stillExists {
         self.lock.withLock { self.lastStatusState = "window_closed" }
         self.emitStreamStatus(state: "window_closed", reason: "window_missing")
         return
       }
-      let onScreen = WindowInventory.isWindowOnScreen(pid: self.targetPid, windowId: Int64(self.targetWindowId))
-      if !onScreen {
+      if let onScreen = WindowInventory.isWindowOnScreen(pid: self.targetPid, windowId: Int64(self.targetWindowId)),
+         !onScreen {
         if state != "offscreen" {
           self.lock.withLock { self.lastStatusState = "offscreen" }
-          self.emitStreamStatus(state: "offscreen", reason: "window_offscreen_or_other_space")
+          self.emitStreamStatus(state: "offscreen", reason: "window_alive_not_onscreen")
         }
         return
       }

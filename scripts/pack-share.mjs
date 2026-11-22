@@ -177,6 +177,7 @@ export function buildShareZip({
     "双击卸载.command",
     "使用说明.txt",
     "README.md",
+    "README.en.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "package.json",

@@ -9,6 +9,7 @@ import {
   isSecureTextRole,
   buildElementDescriptor,
 } from "./app-snapshot-registry.mjs";
+import { throwIfSentUnknown } from "./ax-bridge.mjs";
 
 export { SECURE_ROLE_RE, isSecureTextRole };
 
@@ -670,6 +671,7 @@ export async function dispatchBackgroundPointClickDetailed(
     bounds = null,
     allowAppPostFallback = true,
     syntheticTag = 0,
+    beforeWriteCheck = null,
   } = {}
 ) {
   if (process.platform !== "darwin") return { delivered: false, method: null };
@@ -692,19 +694,29 @@ export async function dispatchBackgroundPointClickDetailed(
         clickCount,
         allowAppPostFallback,
         syntheticTag,
+        beforeWriteCheck,
       });
+      throwIfSentUnknown(res, "point_click");
       if (res?.delivered) {
         return {
           delivered: true,
           method: res.method === "app_post" ? "app_post" : "window_post",
         };
       }
-    } catch {}
+      if (Number(wid) > 0 && res?.reason === "window_not_found") {
+        return { delivered: false, method: "window_post", reason: "window_not_found" };
+      }
+    } catch (err) {
+      if (err?.aborted || err?.code === "WRITE_OUTCOME_UNKNOWN" || err?.deliveryState === "sent_unknown") {
+        throw err;
+      }
+    }
   }
 
   if (!allowAppPostFallback) {
     return { delivered: false, method: "window_post" };
   }
+  beforeWriteCheck?.();
 
   const btn = String(button || "left").toLowerCase();
   const count = Math.max(1, Math.min(3, Number.parseInt(String(clickCount ?? 1), 10) || 1));

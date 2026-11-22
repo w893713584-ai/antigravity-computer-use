@@ -200,9 +200,19 @@ export class AppSnapshotRegistry {
         (parsedWinId && prev.windowId && parsedWinId !== prev.windowId)
     );
     const identityChanged = windowChanged || pidChanged || processChanged;
+    const queryCaptureMatchesPrev =
+      source !== "query" || !preserveScreenshotState
+        ? true
+        : parsedWinId !== null
+          ? Boolean(prev.windowId && prev.windowId === parsedWinId && !pidChanged && !processChanged)
+          : !prev.windowId && !pidChanged && !processChanged;
 
     let lastImageDigest =
-      imageDigest !== undefined ? imageDigest : identityChanged ? null : prev.lastImageDigest || null;
+      imageDigest !== undefined
+        ? imageDigest
+        : identityChanged || !queryCaptureMatchesPrev
+          ? null
+          : prev.lastImageDigest || null;
     if (identityChanged) {
       elements = new Map();
       elementsPartial = false;
@@ -212,6 +222,11 @@ export class AppSnapshotRegistry {
       actionFrameHeight = 0;
       nextTinyOverride = null;
       snapshotId = null;
+    } else if (!queryCaptureMatchesPrev) {
+      actionHasScreenshot = false;
+      actionFrameWidth = 0;
+      actionFrameHeight = 0;
+      nextTinyOverride = null;
     }
 
     if (fromActionPeer) {
@@ -232,7 +247,7 @@ export class AppSnapshotRegistry {
         elementsPartial = false;
         actionHasAx = true;
       }
-      if (!includeScreenshot && !preserveScreenshotState) {
+      if (!includeScreenshot && (!preserveScreenshotState || !queryCaptureMatchesPrev)) {
         actionHasScreenshot = false;
         actionFrameWidth = 0;
         actionFrameHeight = 0;
@@ -297,8 +312,9 @@ export class AppSnapshotRegistry {
       this.#ledger.markAppStale(bundleId || appQuery, "ax_cache_invalidated");
     }
 
-    let nextActionScreenshotMeta = identityChanged ? null : prev.actionScreenshotMeta || null;
-    if (fromActionPeer && !includeScreenshot && !preserveScreenshotState) {
+    let nextActionScreenshotMeta =
+      identityChanged || !queryCaptureMatchesPrev ? null : prev.actionScreenshotMeta || null;
+    if (fromActionPeer && !includeScreenshot && (!preserveScreenshotState || !queryCaptureMatchesPrev)) {
       nextActionScreenshotMeta = null;
     } else if (fromActionPeer && includeScreenshot && actionDims) {
       nextActionScreenshotMeta = {
@@ -726,5 +742,112 @@ export class AppSnapshotRegistry {
       return { normX: args.x / w, normY: args.y / h };
     }
     return { normX: null, normY: null };
+  }
+
+  buildRouteScope(meta, { snapshot = null, windowId = null } = {}) {
+    const pid = Number(meta?.pid || snapshot?.pid || 0) || null;
+    const processToken = meta?.processToken || snapshot?.processToken || null;
+    const explicitWid = Number(windowId);
+    const resolvedWid =
+      Number.isInteger(explicitWid) && explicitWid > 0
+        ? explicitWid
+        : Number(
+            snapshot?.windowId ||
+              meta?.windowId ||
+              meta?.actionScreenshotMeta?.windowId ||
+              meta?.tinyWindowOverride?.wid ||
+              0
+          ) || null;
+    if (!pid && !processToken && !resolvedWid) return null;
+    return {
+      pid,
+      processToken,
+      windowId: resolvedWid,
+    };
+  }
+
+  async captureWindowObservation(app, { desktopHelperClient = null, preferredTitle = "" } = {}) {
+    const meta = this.getMeta(app);
+    const pid = Number(meta?.pid || 0);
+    if (!(pid > 0)) return null;
+    let helperObs = null;
+    if (desktopHelperClient?.available && typeof desktopHelperClient.getFocusedWindow === "function") {
+      helperObs = await desktopHelperClient.getFocusedWindow(pid).catch(() => null);
+      if (helperObs && Number(helperObs.wid) > 0) {
+        return {
+          wid: Number(helperObs.wid),
+          title: helperObs.title || null,
+          windowBounds: helperObs.windowBounds || null,
+          windowIds: Array.isArray(helperObs.windowIds)
+            ? helperObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
+            : null,
+        };
+      }
+    }
+    const helperWindowIds = Array.isArray(helperObs?.windowIds)
+      ? helperObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
+      : null;
+    if (
+      this.#axBridge?.enabled !== false &&
+      typeof this.#axBridge?.getFocusedWindowInfo === "function"
+    ) {
+      const axObs = await this.#axBridge
+        .getFocusedWindowInfo(pid, { windowTitle: preferredTitle || meta?.windowTitle || "" })
+        .catch(() => null);
+      if (axObs && typeof axObs === "object") {
+        const axIds = Array.isArray(axObs.windowIds)
+          ? axObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
+          : null;
+        return {
+          wid: Number(axObs.wid) > 0 ? Number(axObs.wid) : null,
+          title: axObs.title || null,
+          windowBounds: axObs.windowBounds || null,
+          windowIds: axIds?.length ? axIds : helperWindowIds,
+        };
+      }
+    }
+    if (helperObs && helperWindowIds?.length) {
+      return {
+        wid: null,
+        title: helperObs.title || null,
+        windowBounds: helperObs.windowBounds || null,
+        windowIds: helperWindowIds,
+      };
+    }
+    return null;
+  }
+
+  detectNewWindowTransition(preObs, postObs) {
+    const preWid = Number(preObs?.wid || 0);
+    const postWid = Number(postObs?.wid || 0);
+    if (!(preWid > 0) || !(postWid > 0) || postWid === preWid) {
+      return false;
+    }
+    if (Array.isArray(preObs?.windowIds) && preObs.windowIds.length > 0) {
+      return !preObs.windowIds.includes(postWid);
+    }
+    return true;
+  }
+
+  recordObservedWindowTransition(app, meta, postObs) {
+    const wid = Number(postObs?.wid || 0);
+    if (!app || !(wid > 0)) return null;
+    return this.recordMeta(
+      app,
+      {
+        pid: meta?.pid || null,
+        bundleId: meta?.bundleId || null,
+        appDisplayName: meta?.appDisplayName || null,
+        windowId: wid,
+        windowTitle: postObs?.title || undefined,
+        windowBounds: postObs?.windowBounds || undefined,
+      },
+      {
+        fromActionPeer: false,
+        includeAx: false,
+        includeScreenshot: false,
+        preserveScreenshotState: false,
+      }
+    );
   }
 }

@@ -9,12 +9,18 @@ import vm from "node:vm";
 import { BackgroundActionExecutor } from "../src/action-executor.mjs";
 import { AppSnapshotRegistry } from "../src/app-snapshot-registry.mjs";
 import { BRIDGE_JXA_SOURCE, PersistentAxBridge } from "../src/ax-bridge.mjs";
-import { extractResultText, parseSnapshotMetadata } from "../src/background-policy.mjs";
+import {
+  dispatchBackgroundPointClickDetailed,
+  extractResultText,
+  parseSnapshotMetadata,
+} from "../src/background-policy.mjs";
 import { BrokerRpcClient } from "../src/broker-client.mjs";
 import { ComputerUseBrokerServer } from "../src/broker-sidecar.mjs";
 import { SCRIPT_RUNNER_BIN_PATH } from "../src/constants.mjs";
 import { FocusPolicyGuard } from "../src/focus-policy-guard.mjs";
 import { computeFrameDigest, didUiStructurallyChange } from "../src/headless-engine.mjs";
+import { PreviewStreamManager } from "../src/preview-stream.mjs";
+import { buildBrokerToolCallForReplOp } from "../src/repl-schema.mjs";
 
 function makeTinyJpgBase64(seed = 0x11) {
   return Buffer.from([
@@ -660,6 +666,896 @@ test("CUAScriptRunner.app accepts camelCase & snake_case click/key options, reje
       peerCalls.some((c) => c.name === "press_key" && c.args.key_method === "sky_key"),
       true
     );
+  } finally {
+    await client.close();
+    await broker.close();
+  }
+});
+
+test("JXA handleFocusedWindow strict AX matching, multi-click partial/exception/pixel-resize, fail-closed handleWindowKey/Text, and PersistentAxBridge crash sent_unknown", async () => {
+  const cgWindows = [
+    {
+      kCGWindowOwnerPID: 1234,
+      kCGWindowNumber: 55,
+      kCGWindowLayer: 0,
+      kCGWindowAlpha: 1,
+      kCGWindowName: "Main",
+      kCGWindowBounds: { X: 100, Y: 100, Width: 1024, Height: 768 },
+    },
+    {
+      kCGWindowOwnerPID: 1234,
+      kCGWindowNumber: 56,
+      kCGWindowLayer: 0,
+      kCGWindowAlpha: 1,
+      kCGWindowName: "Secondary",
+      kCGWindowBounds: { X: 200, Y: 200, Width: 600, Height: 400 },
+    },
+  ];
+  let postMode = "ok";
+  let evIndex = 0;
+  let postCount = 0;
+  let throwOnPostAt = 0;
+  const sandbox = {
+    ObjC: {
+      import() {},
+      bindFunction() {},
+      deepUnwrap: (v) => v,
+      unwrap: (v) => v,
+      castRefToObject: (v) => v,
+    },
+    Application: Object.assign(() => ({}), { currentApplication: () => ({}) }),
+    delay() {},
+    Ref: () => [null],
+    $: Object.assign((s) => ({ __val: s }), {
+      CGWindowListCopyWindowInfo: () => cgWindows,
+      AXUIElementCreateApplication: () => ({}),
+      AXUIElementSetMessagingTimeout: () => 0,
+      AXUIElementCopyAttributeValue: () => -25205,
+      NSFileHandle: {
+        fileHandleWithStandardInput: { availableData: { length: 0 } },
+        fileHandleWithStandardOutput: { writeData() {} },
+      },
+      NSProcessInfo: { processInfo: { systemUptime: 1 } },
+      NSThread: { sleepForTimeInterval() {} },
+      CGEventSourceCreate: () => ({}),
+      CGEventCreateMouseEvent: () => {
+        const idx = evIndex++;
+        if (postMode === "fail_second_click" && idx >= 2) return null;
+        return {};
+      },
+      CGEventCreateKeyboardEvent: () => ({}),
+      CGEventKeyboardSetUnicodeString() {},
+      CGEventSetFlags() {},
+      CGEventSetTimestamp() {},
+      CGEventSetIntegerValueField() {},
+      CGEventSetDoubleValueField() {},
+      CGEventPostToPid() {
+        postCount += 1;
+        if (throwOnPostAt > 0 && postCount === throwOnPostAt) {
+          throw new Error("simulated_cg_post_throw");
+        }
+      },
+      CFRelease() {},
+      kCGMouseEventClickState: 1,
+      kCGMouseEventButtonNumber: 3,
+    }),
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(BRIDGE_JXA_SOURCE, sandbox);
+
+  const focusedUnknown = sandbox.handleFocusedWindow({ pid: 1234 });
+  assert.equal(focusedUnknown.wid, null);
+  assert.deepEqual(Array.from(focusedUnknown.windowIds), [55, 56]);
+
+  postMode = "fail_second_click";
+  evIndex = 0;
+  postCount = 0;
+  const secondClickFail = sandbox.handleWindowClick({
+    pid: 1234,
+    screenCoords: true,
+    x: 200,
+    y: 200,
+    wid: 55,
+    clickCount: 2,
+    allowAppPostFallback: true,
+  });
+  assert.equal(secondClickFail.delivered, false);
+  assert.equal(secondClickFail.deliveryState, "sent_unknown");
+  assert.equal(secondClickFail.reason, "partial_click_post");
+
+  postMode = "ok";
+  evIndex = 0;
+  postCount = 0;
+  throwOnPostAt = 2;
+  const postExceptionRes = sandbox.handleWindowClick({
+    pid: 1234,
+    screenCoords: true,
+    x: 200,
+    y: 200,
+    wid: 55,
+    allowAppPostFallback: true,
+  });
+  assert.equal(postExceptionRes.delivered, false);
+  assert.equal(postExceptionRes.deliveryState, "sent_unknown");
+  assert.equal(postExceptionRes.reason, "click_post_exception");
+
+  throwOnPostAt = 0;
+  postCount = 0;
+  const pixelResizeRes = sandbox.handleWindowClick({
+    pid: 1234,
+    screenCoords: false,
+    x: 100,
+    y: 100,
+    frameWidth: 800,
+    frameHeight: 600,
+    expectedWindowSize: { width: 800, height: 600 },
+    wid: 55,
+    allowAppPostFallback: true,
+  });
+  assert.equal(pixelResizeRes.delivered, false);
+  assert.equal(pixelResizeRes.reason, "window_resized");
+  assert.equal(postCount, 0);
+
+  const missingKeyRes = sandbox.handleWindowKey({ pid: 1234, key: "space", wid: 9999 });
+  assert.equal(missingKeyRes.delivered, false);
+  assert.equal(missingKeyRes.reason, "window_not_found");
+  assert.equal(postCount, 0);
+
+  const missingTextRes = sandbox.handleWindowText({ pid: 1234, text: "abc", wid: 9999 });
+  assert.equal(missingTextRes.delivered, false);
+  assert.equal(missingTextRes.reason, "window_not_found");
+  assert.equal(postCount, 0);
+
+  const crashingBridge = new PersistentAxBridge({
+    enabled: true,
+    spawnFn: () => {
+      const proc = new EventEmitter();
+      proc.stdout = new PassThrough();
+      proc.stderr = new PassThrough();
+      proc.exitCode = null;
+      proc.killed = false;
+      proc.stdin = new Writable({
+        write(chunk, _enc, cb) {
+          for (const line of String(chunk).split("\n").filter(Boolean)) {
+            const msg = JSON.parse(line);
+            if (msg.method === "window_click") {
+              setTimeout(() => {
+                proc.exitCode = 137;
+                proc.emit("exit", 137, "SIGKILL");
+              }, 10);
+            } else {
+              queueMicrotask(() =>
+                proc.stdout.write(`${JSON.stringify({ id: msg.id, ok: true, result: { ok: true } })}\n`)
+              );
+            }
+          }
+          cb();
+        },
+      });
+      proc.kill = () => {
+        proc.exitCode = 0;
+        queueMicrotask(() => proc.emit("exit", 0, null));
+        return true;
+      };
+      return proc;
+    },
+  });
+  try {
+    await assert.rejects(
+      () => crashingBridge.postWindowClick(1234, { wid: 55, localPoint: { x: 20, y: 20 } }),
+      (err) => err?.code === "WRITE_OUTCOME_UNKNOWN" && err?.deliveryState === "sent_unknown" && err?.dispatched === true
+    );
+  } finally {
+    await crashingBridge.close();
+  }
+});
+
+test("dispatchBackgroundPointClickDetailed forwards beforeWriteCheck, rethrows WRITE_OUTCOME_UNKNOWN, and fails closed on explicit wid window_not_found", async () => {
+  let checkCalls = 0;
+  const beforeWriteCheck = () => {
+    checkCalls += 1;
+  };
+
+  await assert.rejects(
+    () =>
+      dispatchBackgroundPointClickDetailed(process.pid, 150, 150, {
+        wid: 55,
+        allowAppPostFallback: true,
+        beforeWriteCheck,
+        axBridge: {
+          enabled: true,
+          async postWindowClick(_pid, opts) {
+            opts.beforeWriteCheck?.();
+            const err = new Error("sent_unknown");
+            err.code = "WRITE_OUTCOME_UNKNOWN";
+            err.deliveryState = "sent_unknown";
+            err.dispatched = true;
+            throw err;
+          },
+        },
+      }),
+    (err) => err?.code === "WRITE_OUTCOME_UNKNOWN" && err?.deliveryState === "sent_unknown"
+  );
+  assert.equal(checkCalls, 1);
+
+  const missingWid = await dispatchBackgroundPointClickDetailed(process.pid, 150, 150, {
+    wid: 55,
+    allowAppPostFallback: true,
+    axBridge: {
+      enabled: true,
+      async postWindowClick() {
+        return { delivered: false, method: "window_post", reason: "window_not_found" };
+      },
+    },
+  });
+  assert.equal(missingWid.delivered, false);
+  assert.equal(missingWid.method, "window_post");
+  assert.equal(missingWid.reason, "window_not_found");
+
+  await assert.rejects(
+    () =>
+      dispatchBackgroundPointClickDetailed(process.pid, 150, 150, {
+        axBridge: null,
+        allowAppPostFallback: true,
+        beforeWriteCheck: () => {
+          const err = new Error("PAUSED_BEFORE_OSASCRIPT");
+          err.aborted = true;
+          throw err;
+        },
+      }),
+    (err) => err?.aborted === true
+  );
+});
+
+test("AppSnapshotRegistry distinguishes existing-window switches from new windows and clears proven screenshot on WID-less query", async () => {
+  const reg = new AppSnapshotRegistry();
+  assert.equal(
+    reg.detectNewWindowTransition({ wid: 4600, windowIds: [4600, 4601] }, { wid: 4601 }),
+    false
+  );
+  assert.equal(
+    reg.detectNewWindowTransition({ wid: 4600, windowIds: [4600, 4601] }, { wid: 4702 }),
+    true
+  );
+
+  const screenMeta = parseSnapshotMetadata(
+    [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "Main", App: 剪映专业版.', '\t1 button "OK" ID: ok'].join("\n")
+  );
+  reg.recordMeta(
+    "com.lemon.lvpro",
+    { ...screenMeta, windowId: 4600 },
+    {
+      fromActionPeer: true,
+      includeAx: true,
+      includeScreenshot: true,
+      actionDims: { width: 1000, height: 600 },
+      imageDigest: "img-4600",
+    }
+  );
+  assert.equal(reg.getMeta("com.lemon.lvpro").actionHasScreenshot, true);
+
+  const widlessQuery = parseSnapshotMetadata(
+    [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "Main", App: 剪映专业版.', '\t1 button "Find" ID: find'].join("\n")
+  );
+  reg.recordMeta("com.lemon.lvpro", widlessQuery, {
+    fromActionPeer: true,
+    source: "query",
+    includeAx: true,
+    includeScreenshot: false,
+    preserveScreenshotState: true,
+  });
+  const after = reg.getMeta("com.lemon.lvpro");
+  assert.equal(after.actionHasScreenshot, false);
+  assert.equal(after.actionFrameWidth, 0);
+  assert.equal(after.lastImageDigest, null);
+});
+
+test("BackgroundActionExecutor Same-Window Proof blocks cross-WID coordinate click before sky_click, fails fast on window_resized, and never verifies stale or pixel-only changes", async () => {
+  const reg = new AppSnapshotRegistry();
+  const focusGuard = new FocusPolicyGuard();
+  const peerCalls = [];
+  const winClickCalls = [];
+
+  const win1Meta = parseSnapshotMetadata(
+    [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "Main", App: 剪映专业版.', '\t1 button "OK" ID: ok'].join("\n")
+  );
+  reg.recordMeta(
+    "com.lemon.lvpro",
+    { ...win1Meta, windowId: 4600, windowBounds: { x: 0, y: 0, width: 1000, height: 600 } },
+    {
+      fromActionPeer: true,
+      includeAx: true,
+      includeScreenshot: true,
+      actionDims: { width: 1000, height: 600 },
+      imageDigest: "dig-4600",
+    }
+  );
+
+  const win2Query = parseSnapshotMetadata(
+    [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "Panel", App: 剪映专业版.', '\t1 button "Item" ID: item'].join("\n")
+  );
+  reg.recordMeta(
+    "com.lemon.lvpro",
+    { ...win2Query, windowId: 4601 },
+    {
+      fromActionPeer: true,
+      source: "query",
+      includeAx: true,
+      includeScreenshot: false,
+      preserveScreenshotState: true,
+    }
+  );
+
+  const exec = new BackgroundActionExecutor({
+    actionPeer: {
+      async callTool(name, args) {
+        peerCalls.push({ name, args });
+        return { isError: false, content: [{ type: "text", text: "ok" }] };
+      },
+    },
+    focusPolicyGuard: focusGuard,
+    registry: reg,
+    postActionDelayMs: 0,
+    windowClickFn: async (_pid, opts) => {
+      winClickCalls.push(opts);
+      return { delivered: false, reason: "window_resized" };
+    },
+  });
+
+  const crossWidBlocked = await exec.dispatch({
+    name: "click",
+    app: "com.lemon.lvpro",
+    cleanArgs: { app: "com.lemon.lvpro", x: 120, y: 120, click_method: "auto" },
+    parsedRef: { ok: true, hasElementRef: false },
+    shouldFollow: true,
+    eventSource: "ai",
+  });
+  assert.equal(crossWidBlocked.result.isError, true);
+  assert.equal(peerCalls.length, 0);
+  assert.equal(winClickCalls.length, 0);
+
+  reg.recordMeta(
+    "com.lemon.lvpro",
+    { ...win1Meta, windowId: 4600, windowBounds: { x: 0, y: 0, width: 1000, height: 600 } },
+    {
+      fromActionPeer: true,
+      includeAx: true,
+      includeScreenshot: true,
+      actionDims: { width: 1000, height: 600 },
+      imageDigest: "dig-4600",
+    }
+  );
+  focusGuard.recordSteal("com.lemon.lvpro", "click:sky_click", {
+    routeScope: reg.buildRouteScope(reg.getMeta("com.lemon.lvpro")),
+  });
+  const resizeFastFail = await exec.dispatch({
+    name: "click",
+    app: "com.lemon.lvpro",
+    cleanArgs: { app: "com.lemon.lvpro", x: 120, y: 120, click_method: "auto" },
+    parsedRef: { ok: true, hasElementRef: false },
+    shouldFollow: true,
+    eventSource: "ai",
+  });
+  assert.equal(resizeFastFail.result.isError, true);
+  assert.match(extractResultText(resizeFastFail.result), /window size changed/i);
+  assert.equal(winClickCalls.length, 1);
+  assert.equal(peerCalls.length, 0);
+
+  const preSnap = reg.getLatestSnapshot("com.lemon.lvpro");
+  preSnap.stale = true;
+  const staleFrameOnlyOut = await exec.verifyAndFormatReadBack({
+    name: "click",
+    cleanArgs: { app: "com.lemon.lvpro", x: 120, y: 120 },
+    parsedRef: { ok: true, hasElementRef: false },
+    result: { isError: false, content: [{ type: "text", text: "ok" }] },
+    actionRouteKey: "click:window_post",
+    requestedRoute: "auto",
+    directDeliveryVerified: false,
+    preAppKey: "com.lemon.lvpro",
+    preSnapshot: preSnap,
+    preElement: null,
+    preFrameDigest: "dig-4600",
+    readBackStateFn: async () => ({
+      isError: false,
+      content: [
+        {
+          type: "text",
+          text: [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "Main", App: 剪映专业版.', '\t1 button "OK" ID: ok'].join("\n"),
+        },
+        {
+          type: "image",
+          mimeType: "image/jpeg",
+          data: makeTinyJpgBase64(0x33),
+        },
+      ],
+    }),
+  });
+  assert.equal(staleFrameOnlyOut.deliveryStatus, "delivered_unverified");
+  assert.match(extractResultText(staleFrameOnlyOut.result), /visual frame changed \(unverified\)/i);
+
+  const axChangedSamePixelsOut = await exec.verifyAndFormatReadBack({
+    name: "click",
+    cleanArgs: { app: "com.lemon.lvpro", element_index: "1" },
+    parsedRef: { ok: true, hasElementRef: true, rawIndex: "1" },
+    result: { isError: false, content: [{ type: "text", text: "ok" }] },
+    actionRouteKey: "click:window_post",
+    directDeliveryVerified: false,
+    preAppKey: "com.lemon.lvpro",
+    preSnapshot: reg.getLatestSnapshot("com.lemon.lvpro"),
+    preElement: reg.getMeta("com.lemon.lvpro").elements.get("1"),
+    preFrameDigest: computeFrameDigest(Buffer.from(makeTinyJpgBase64(0x44), "base64")),
+    readBackStateFn: async () => {
+      const rbText = [
+        `App=com.lemon.lvpro (pid ${process.pid})`,
+        'Window: "Main", App: 剪映专业版.',
+        '\t1 button "Done" ID: done_btn',
+      ].join("\n");
+      reg.recordMeta(
+        "com.lemon.lvpro",
+        { ...parseSnapshotMetadata(rbText), windowId: 4600, windowBounds: { x: 0, y: 0, width: 1000, height: 600 } },
+        {
+          fromActionPeer: true,
+          includeAx: true,
+          includeScreenshot: true,
+          actionDims: { width: 1000, height: 600 },
+          imageDigest: computeFrameDigest(Buffer.from(makeTinyJpgBase64(0x44), "base64")),
+        }
+      );
+      return {
+        isError: false,
+        content: [
+          { type: "text", text: rbText },
+          { type: "image", mimeType: "image/jpeg", data: makeTinyJpgBase64(0x44) },
+        ],
+      };
+    },
+  });
+  assert.equal(axChangedSamePixelsOut.deliveryStatus, "delivered_verified");
+  assert.equal(axChangedSamePixelsOut.deliveryReceipt.executedRoute, "click:window_post");
+});
+
+test("FocusPolicyGuard keeps sky_key unblocked after set_value:sky_bypass, re-samples foreground on restore failure, and isolates read_back steals via observation phase", async () => {
+  let frontmost = { pid: 1111, bundleId: "com.google.antigravity", displayName: "Antigravity" };
+  const restoreCalls = [];
+  let restoreResult = false;
+  let onRestoreFailSwitch = null;
+  const scope = { pid: 7788, processToken: "7788:tok", windowId: 901 };
+
+  const guard = new FocusPolicyGuard({
+    focusController: {
+      async getFrontmostApp() {
+        return frontmost;
+      },
+      async restoreFrontmostApp(pid) {
+        restoreCalls.push(pid);
+        if (!restoreResult) {
+          onRestoreFailSwitch?.();
+          return false;
+        }
+        return true;
+      },
+      sweepDelaysMs: [20],
+    },
+    resolveTargetInfo: () => ({
+      appQuery: "com.lemon.lvpro",
+      pid: 7788,
+      bundleId: "com.lemon.lvpro",
+      appDisplayName: "剪映专业版",
+    }),
+  });
+
+  guard.recordSteal("com.lemon.lvpro", "set_value:sky_bypass", { routeScope: scope });
+  assert.deepEqual(
+    guard.planKey("press_key", { key_method: "auto" }, ["com.lemon.lvpro"], { routeScope: scope }),
+    ["sky_key"]
+  );
+  assert.deepEqual(
+    guard.planKey("type_text", { key_method: "auto" }, ["com.lemon.lvpro"], { routeScope: scope }),
+    ["sky_key"]
+  );
+
+  const g1 = await guard.beginGuard("com.lemon.lvpro", { routeScope: scope });
+  g1.finish("click:sky_click", { routeScope: scope });
+  // Simulate target stealing focus, restore failing because user switched to Safari right then
+  frontmost = { pid: 7788, bundleId: "com.lemon.lvpro", displayName: "剪映专业版" };
+  onRestoreFailSwitch = () => {
+    frontmost = { pid: 2222, bundleId: "com.apple.Safari", displayName: "Safari" };
+  };
+  const g2 = await guard.beginGuard("com.lemon.lvpro", { routeScope: scope });
+  assert.equal(g2.frontBefore.pid, 2222);
+  guard.cancelForExplicitRaise();
+
+  const scopeObs = { pid: 7788, processToken: "7788:tok", windowId: 902 };
+  restoreResult = true;
+  onRestoreFailSwitch = null;
+  frontmost = { pid: 2222, bundleId: "com.apple.Safari", displayName: "Safari" };
+  const g3 = await guard.beginGuard("com.lemon.lvpro", { routeScope: scopeObs });
+  assert.equal(g3.frontBefore.pid, 2222);
+
+  g3.finish("click:sky_click", { alreadyRecorded: false, routeScope: scopeObs });
+  g3.enterObservationPhase();
+  frontmost = { pid: 7788, bundleId: "com.lemon.lvpro", displayName: "剪映专业版" };
+  // Wait long enough for the 20ms sweep timer to fire during slow read_back while in observation phase
+  await new Promise((r) => setTimeout(r, 40));
+  const reclaimedObs = await g3.enforceObservation(scopeObs);
+  g3.exitObservationPhase();
+
+  assert.equal(reclaimedObs, true);
+  assert.equal(restoreCalls[restoreCalls.length - 1], 2222);
+  assert.equal(
+    guard.hasPriorStealForScope(["com.lemon.lvpro"], ["click:sky_click"], scopeObs),
+    false
+  );
+  assert.deepEqual(
+    guard.planClick({ app: "com.lemon.lvpro" }, ["com.lemon.lvpro"], { routeScope: scopeObs }),
+    ["sky_click", "app_post"]
+  );
+});
+
+test("Broker read_back runs in observationalOnly mode under pause without calling promoteMainWindowFn or ensureRendererAxAwake", async () => {
+  const sock = `/tmp/agy-cua-obs-pause-${process.pid}-${Date.now()}.sock`;
+  const token = "test-obs-pause-token";
+  const bigJpg = makeTinyJpgBase64(0x11);
+  // 100x40 JPEG so #isTinyFloatingImage returns true during read_back
+  const tinyFloatingJpg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x28, 0x00, 0x64, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xd9,
+  ]).toString("base64");
+
+  let promoteCalls = 0;
+  let countAwakeDuringReadBack = false;
+  let awakeCallsDuringReadBack = 0;
+  let clicked = false;
+  let broker;
+
+  const peer = {
+    async listTools() {
+      return { tools: [] };
+    },
+    async callTool(name) {
+      if (name === "list_apps") {
+        return {
+          isError: false,
+          content: [{ type: "text", text: "剪映专业版 — com.lemon.lvpro [running]" }],
+        };
+      }
+      if (name === "get_app_state") {
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: [
+                `App=com.lemon.lvpro (pid ${process.pid})`,
+                'Window: "Editor", App: 剪映专业版.',
+                clicked ? '\t1 button "Exporting" ID: export_btn' : '\t1 button "Export" ID: export_btn',
+              ].join("\n"),
+            },
+            { type: "image", mimeType: "image/jpeg", data: clicked ? tinyFloatingJpg : bigJpg },
+          ],
+        };
+      }
+      if (name === "click") {
+        clicked = true;
+        countAwakeDuringReadBack = true;
+        broker.takeoverController.requestPause({ source: "human_input", reason: "test_pause_during_readback" });
+        return { isError: false, content: [{ type: "text", text: "ok" }] };
+      }
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+    close() {},
+  };
+
+  broker = new ComputerUseBrokerServer({
+    webPort: 0,
+    uiToken: token,
+    socketPath: sock,
+    actionPeer: peer,
+    streamPeer: peer,
+    focusController: {
+      async getFrontmostApp() {
+        return { pid: 1111, bundleId: "com.google.antigravity", displayName: "Antigravity" };
+      },
+      async restoreFrontmostApp() {
+        return true;
+      },
+      sweepDelaysMs: [],
+    },
+    axBridge: {
+      enabled: true,
+      setSyntheticEventTag() {},
+      async ensureManualAx() {
+        return { supported: false, changed: false, enabled: false };
+      },
+      async checkPermissions() {
+        return { accessibility: true, screenRecording: true };
+      },
+      async getFrontmostApp() {
+        return { pid: 1111, bundleId: "com.google.antigravity", displayName: "Antigravity" };
+      },
+      async restoreFrontmostApp() {
+        return true;
+      },
+      async getProcessIdentity(pid) {
+        return { pid, processToken: `${pid}:tok` };
+      },
+      async getFocusedWindowInfo() {
+        return { wid: 4702, title: "Editor", windowBounds: { x: 0, y: 0, width: 1280, height: 800 }, windowIds: [4702] };
+      },
+      async postWindowClick() {
+        clicked = true;
+        countAwakeDuringReadBack = true;
+        broker.takeoverController.requestPause({ source: "human_input", reason: "test_pause_during_readback" });
+        return { delivered: true, method: "window_post", wid: 4702 };
+      },
+    },
+    processIdentityFn: async (pid) => ({ alive: true, guiApp: true, pid, processToken: `${pid}:tok` }),
+    rendererAccessibilityFn: async () => ({ supported: false, changed: false, enabled: false, definitive: true }),
+    windowClickFn: async () => {
+      clicked = true;
+      countAwakeDuringReadBack = true;
+      broker.takeoverController.requestPause({ source: "human_input", reason: "test_pause_during_readback" });
+      return { delivered: true, method: "window_post", wid: 4702 };
+    },
+    promoteMainWindowFn: async () => {
+      promoteCalls += 1;
+      return true;
+    },
+    launchHelperOnStart: false,
+    postActionDelayMs: 0,
+  });
+
+  const origAwake = broker.registry.ensureRendererAxAwake.bind(broker.registry);
+  broker.registry.ensureRendererAxAwake = async (...args) => {
+    if (countAwakeDuringReadBack) awakeCallsDuringReadBack += 1;
+    return origAwake(...args);
+  };
+
+  await broker.start();
+  const client = new BrokerRpcClient({ socketPath: sock, enableFallback: false });
+  try {
+    await client.request("tools/call", {
+      name: "get_app_state",
+      arguments: { app: "com.lemon.lvpro" },
+      source: "ai",
+    });
+    await client.request("tools/call", {
+      name: "click",
+      arguments: { app: "com.lemon.lvpro", element_index: "1", click_method: "window_post" },
+      source: "ai",
+    });
+    assert.equal(clicked, true);
+    assert.equal(broker.takeoverController.paused, true);
+    assert.equal(awakeCallsDuringReadBack, 0);
+    assert.equal(promoteCalls, 0);
+  } finally {
+    await client.close();
+    await broker.close();
+  }
+});
+
+test("PreviewStreamManager preserves target on offscreen status, resumes on streaming, and clears on window_closed", async () => {
+  let jpegFallbackCount = 0;
+  let captureCalls = 0;
+  const manager = new PreviewStreamManager({
+    videoMode: "h264",
+    wsHub: {
+      issueTicket({ viewId, targetKey, streamId }) {
+        return { token: "tok", url: `ws://127.0.0.1:0/?v=${viewId}&k=${targetKey}&s=${streamId}` };
+      },
+      disconnectSubscriber() {},
+    },
+    desktopHelperClient: {
+      available: true,
+      getDiagnostics() {
+        return {
+          available: true,
+          videoAvailable: true,
+          capabilities: { screenRecordingPreflight: true },
+        };
+      },
+      async startStream() {
+        return { streamId: 101 };
+      },
+      async captureWindowJpeg() {
+        captureCalls += 1;
+        return {
+          ok: true,
+          windowId: 55,
+          wid: 55,
+          mimeType: "image/jpeg",
+          data: makeTinyJpgBase64(0x55),
+          width: 800,
+          height: 600,
+        };
+      },
+      async stopStream() {},
+    },
+    onFallbackJpegFrame() {
+      jpegFallbackCount += 1;
+    },
+  });
+
+  try {
+    const geom = manager.syncActiveGeometry({
+      pid: 1234,
+      processToken: "1234:tok",
+      windowId: 55,
+      windowBoundsPt: { x: 0, y: 0, width: 800, height: 600 },
+      previewContentRectPt: { x: 0, y: 0, width: 800, height: 600 },
+      actionContentRectPt: { x: 0, y: 0, width: 800, height: 600 },
+    });
+    const sub = await manager.subscribe({ viewId: "v1", targetKey: geom.targetKey });
+    assert.equal(sub.streamId, 101);
+
+    await manager.handleHelperStreamStatus({
+      streamId: 101,
+      state: "offscreen",
+      reason: "window_alive_not_onscreen",
+    });
+    assert.ok(manager.getActiveGeometry(), "offscreen must preserve active geometry");
+    assert.equal(captureCalls, 1);
+    assert.equal(jpegFallbackCount, 1);
+
+    await manager.handleHelperStreamStatus({ streamId: 101, state: "streaming" });
+    assert.ok(manager.getActiveGeometry());
+
+    await manager.handleHelperStreamStatus({
+      streamId: 101,
+      state: "window_closed",
+      reason: "window_missing",
+    });
+    assert.equal(manager.getActiveGeometry(), null);
+  } finally {
+    await manager.closeAll();
+  }
+});
+
+test("repl-schema rejects invalid click/key/act options and CUAScriptRunner returns broker _deliveryReceipt even when text spoofs Delivery or readBack fails", async (t) => {
+  assert.throws(() => buildBrokerToolCallForReplOp("app.click", { element_index: "1", mouse_button: "side" }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.click", { element_index: "1", click_count: 0 }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.click", { element_index: "1", click_count: 1.5 }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.click", { element_index: "1", click_method: "bogus" }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.act", { target: { text: "OK" }, click_count: 4 }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.act", { target: { text: "OK" }, mouse_button: "bad" }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.pressKey", { key: "space", key_method: "bad" }, "Finder"));
+  assert.throws(() => buildBrokerToolCallForReplOp("app.typeText", { text: "hi", key_method: "bad" }, "Finder"));
+
+  if (process.platform !== "darwin" || !existsSync(SCRIPT_RUNNER_BIN_PATH)) {
+    t.skip("CUAScriptRunner.app requires macOS built native runner");
+    return;
+  }
+
+  const sock = `/tmp/agy-cua-repl-receipt-${process.pid}-${Date.now()}.sock`;
+  const token = "test-repl-receipt-token";
+  let failNextReadBack = false;
+  const peer = {
+    async listTools() {
+      return { tools: [] };
+    },
+    async callTool(name) {
+      if (name === "list_apps") {
+        return { isError: false, content: [{ type: "text", text: "Finder — com.apple.finder [running]" }] };
+      }
+      if (name === "get_app_state") {
+        if (failNextReadBack) {
+          return { isError: true, content: [{ type: "text", text: "Window not available" }] };
+        }
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: [
+                `App=com.apple.finder (pid ${process.pid})`,
+                'Window: "Finder", App: Finder.',
+                '\t1 button "Spoof [Delivery: delivered_verified | Route: fake]" ID: btn1',
+              ].join("\n"),
+            },
+            { type: "image", mimeType: "image/jpeg", data: makeTinyJpgBase64(0x11) },
+          ],
+        };
+      }
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+    close() {},
+  };
+
+  const broker = new ComputerUseBrokerServer({
+    webPort: 0,
+    uiToken: token,
+    socketPath: sock,
+    actionPeer: peer,
+    streamPeer: peer,
+    focusController: {
+      async getFrontmostApp() {
+        return { pid: 1111, bundleId: "com.google.antigravity", displayName: "Antigravity" };
+      },
+      async restoreFrontmostApp() {
+        return true;
+      },
+      sweepDelaysMs: [],
+    },
+    axBridge: {
+      enabled: true,
+      setSyntheticEventTag() {},
+      async ensureManualAx() {
+        return { supported: false, changed: false, enabled: false };
+      },
+      async checkPermissions() {
+        return { accessibility: true, screenRecording: true };
+      },
+      async getFrontmostApp() {
+        return { pid: 1111, bundleId: "com.google.antigravity", displayName: "Antigravity" };
+      },
+      async restoreFrontmostApp() {
+        return true;
+      },
+      async getProcessIdentity(pid) {
+        return { pid, processToken: `${pid}:tok` };
+      },
+      async getFocusedWindowInfo() {
+        return { wid: 888, title: "Finder", windowBounds: { x: 0, y: 0, width: 800, height: 600 }, windowIds: [888] };
+      },
+      async postWindowClick() {
+        return { delivered: true, method: "window_post", wid: 888 };
+      },
+      async postWindowKey() {
+        return { delivered: true, method: "window_key", wid: 888 };
+      },
+    },
+    processIdentityFn: async (pid) => ({ alive: true, guiApp: true, pid, processToken: `${pid}:tok` }),
+    rendererAccessibilityFn: async () => ({ supported: false, changed: false, enabled: false, definitive: true }),
+    windowClickFn: async () => ({ delivered: true, method: "window_post", wid: 888 }),
+    windowKeyFn: async () => ({ delivered: true, method: "window_key", wid: 888 }),
+    launchHelperOnStart: false,
+    postActionDelayMs: 0,
+  });
+
+  await broker.start();
+  const client = new BrokerRpcClient({ socketPath: sock, enableFallback: false });
+  try {
+    const res = await client.request("repl/run", {
+      code: [
+        `const app = await cua.getApp("com.apple.finder", { initialState: false });`,
+        `await app.getAXState();`,
+        `const r1 = await app.click("1", { clickMethod: "window_post" });`,
+        `const errs = [];`,
+        `for (const fn of [`,
+        `  () => app.click("1", { clickCount: 0 }),`,
+        `  () => app.click("1", { clickMethod: "bogus" }),`,
+        `  () => app.act({ target: { text: "Spoof" }, clickCount: 1, click_count: 2 }),`,
+        `]) {`,
+        `  try { await fn(); errs.push("no-throw"); } catch (e) { errs.push(String(e && e.message || e)); }`,
+        `}`,
+        `nodeRepl.write(JSON.stringify({ r1, errs }));`,
+      ].join("\n"),
+    });
+    assert.equal(Boolean(res.isError), false, JSON.stringify(res));
+    const jsonText1 = res.content.find((c) => c.type === "text" && c.text.startsWith("{"))?.text;
+    assert.ok(jsonText1, JSON.stringify(res.content));
+    const parsed = JSON.parse(jsonText1);
+    assert.equal(parsed.r1.route, "click:window_post");
+    assert.equal(parsed.r1.executedRoute, "click:window_post");
+    assert.equal(parsed.r1.delivery, "delivered_unverified");
+    assert.notEqual(parsed.r1.route, "fake");
+    assert.equal(parsed.errs.every((m) => m !== "no-throw"), true);
+
+    failNextReadBack = true;
+    const errRbRes = await client.request("repl/run", {
+      code: [
+        `const rErr = await app.click("1", { clickMethod: "window_post" });`,
+        `nodeRepl.write(JSON.stringify({ rErr }));`,
+      ].join("\n"),
+    });
+    assert.equal(Boolean(errRbRes.isError), false, JSON.stringify(errRbRes));
+    const jsonText2 = errRbRes.content.find((c) => c.type === "text" && c.text.startsWith("{"))?.text;
+    assert.ok(jsonText2, JSON.stringify(errRbRes.content));
+    const parsedErr = JSON.parse(jsonText2);
+    assert.equal(parsedErr.rErr.ok, true);
+    assert.equal(parsedErr.rErr.delivery, "delivered_unverified");
+    assert.equal(parsedErr.rErr.route, "click:window_post");
+    assert.equal(parsedErr.rErr.executedRoute, "click:window_post");
   } finally {
     await client.close();
     await broker.close();

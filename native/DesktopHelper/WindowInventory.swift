@@ -73,20 +73,14 @@ enum WindowInventory {
     return nil
   }
 
-  static func rawOnScreenWindows() -> [[String: Any]] {
+  static func rawOnScreenWindows() -> [[String: Any]]? {
     let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-    guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
-      return []
-    }
-    return raw
+    return CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]
   }
 
-  static func rawAllWindows() -> [[String: Any]] {
+  static func rawAllWindows() -> [[String: Any]]? {
     let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
-    guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
-      return []
-    }
-    return raw
+    return CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]
   }
 
   private static func entries(_ raw: [[String: Any]], containPid pid: Int32, windowId: Int64) -> Bool {
@@ -103,12 +97,14 @@ enum WindowInventory {
     return false
   }
 
-  static func windowExists(pid: Int32, windowId: Int64) -> Bool {
-    return entries(rawAllWindows(), containPid: pid, windowId: windowId)
+  static func windowExists(pid: Int32, windowId: Int64) -> Bool? {
+    guard let raw = rawAllWindows() else { return nil }
+    return entries(raw, containPid: pid, windowId: windowId)
   }
 
-  static func isWindowOnScreen(pid: Int32, windowId: Int64) -> Bool {
-    return entries(rawOnScreenWindows(), containPid: pid, windowId: windowId)
+  static func isWindowOnScreen(pid: Int32, windowId: Int64) -> Bool? {
+    guard let raw = rawOnScreenWindows() else { return nil }
+    return entries(raw, containPid: pid, windowId: windowId)
   }
 
   static func parseBounds(_ dict: Any?) -> WindowRectPt? {
@@ -124,7 +120,7 @@ enum WindowInventory {
   }
 
   static func listWindows(filterPid: Int32? = nil) -> [WindowSummary] {
-    let raw = rawOnScreenWindows()
+    let raw = rawOnScreenWindows() ?? []
     var bundleByPid: [Int32: String] = [:]
     var tokenByPid: [Int32: String] = [:]
     var out: [WindowSummary] = []
@@ -181,7 +177,7 @@ enum WindowInventory {
   /// If an overlay, menu, dialog, or other application is above `targetPid`/`targetWindowId`,
   /// the click belongs to that front window (or returns "unknown" on ambiguous transparent overlays).
   static func hitTest(pointPt: CGPoint) -> HitTestResult {
-    let raw = rawOnScreenWindows()
+    let raw = rawOnScreenWindows() ?? []
     if raw.isEmpty {
       return HitTestResult(
         state: "unknown",
@@ -343,6 +339,61 @@ enum WindowInventory {
       return Int64(wid)
     }
     return nil
+  }
+
+  static func allWindowIds(for pid: Int32) -> [Int64] {
+    guard pid > 0, let raw = rawAllWindows() else { return [] }
+    var ids: [Int64] = []
+    for entry in raw {
+      guard let entryPid = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+            entryPid == pid,
+            let widNum = entry[kCGWindowNumber as String] as? NSNumber else {
+        continue
+      }
+      let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+      let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0
+      if layer != 0 || alpha <= 0.01 { continue }
+      if let b = parseBounds(entry[kCGWindowBounds as String]), b.width >= 120, b.height >= 80 {
+        ids.append(widNum.int64Value)
+      }
+    }
+    return ids
+  }
+
+  static func focusedWindowInfo(for pid: Int32) -> [String: Any] {
+    let allIds = allWindowIds(for: pid)
+    guard pid > 0, let wid = focusedWindowId(for: pid) else {
+      return [
+        "wid": NSNull(),
+        "title": NSNull(),
+        "windowBounds": NSNull(),
+        "windowIds": allIds,
+      ]
+    }
+    var title: String?
+    var boundsDict: [String: Double]?
+    if let raw = rawAllWindows() {
+      for entry in raw {
+        guard let entryPid = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+              entryPid == pid,
+              let widNum = entry[kCGWindowNumber as String] as? NSNumber,
+              widNum.int64Value == wid else {
+          continue
+        }
+        let rawTitle = (entry[kCGWindowName as String] as? String) ?? ""
+        title = rawTitle.isEmpty ? nil : rawTitle
+        if let b = parseBounds(entry[kCGWindowBounds as String]), b.width > 0, b.height > 0 {
+          boundsDict = ["x": b.x, "y": b.y, "w": b.width, "h": b.height]
+        }
+        break
+      }
+    }
+    return [
+      "wid": wid,
+      "title": title ?? NSNull(),
+      "windowBounds": boundsDict ?? NSNull(),
+      "windowIds": allIds,
+    ]
   }
 
   static func frontmostAppInfo() -> FrontmostInfo? {

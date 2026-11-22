@@ -56,7 +56,7 @@ import {
 import { PersistentAxBridge } from "./ax-bridge.mjs";
 import { FocusPolicyGuard } from "./focus-policy-guard.mjs";
 import { AppSnapshotRegistry, isSecureTextRole } from "./app-snapshot-registry.mjs";
-import { BackgroundActionExecutor, appendResultFooter } from "./action-executor.mjs";
+import { BackgroundActionExecutor, appendResultFooter, attachDeliveryReceipt } from "./action-executor.mjs";
 import { AtomicActExecutor, buildActToolResult } from "./act-executor.mjs";
 import { BIND_HOST, SidecarWebAdapter } from "./sidecar-web-adapter.mjs";
 import { DesktopHelperClient } from "./desktop-helper-client.mjs";
@@ -869,6 +869,7 @@ export class ComputerUseBrokerServer {
     {
       updateActiveApp = true,
       allowLaunch = true,
+      observationalOnly = false,
       preserveScreenshotState = false,
       preservePinnedWindow = false,
       timeoutMs = null,
@@ -880,7 +881,8 @@ export class ComputerUseBrokerServer {
       ...rawArgs,
       window_placement: "keep",
     };
-    const canMutateForRead = allowLaunch && (!operation?.isAi || !this.takeoverController.paused);
+    const canMutateForRead =
+      !observationalOnly && allowLaunch && (!operation?.isAi || !this.takeoverController.paused);
 
     if (app) {
       const check = await this.#checkAppRunning(peer, app);
@@ -906,7 +908,7 @@ export class ComputerUseBrokerServer {
       }
     }
 
-    if (peer === this.actionPeer && argsWithReadOnly.include_ax !== false && app) {
+    if (!observationalOnly && peer === this.actionPeer && argsWithReadOnly.include_ax !== false && app) {
       const preCached = this.registry.getMeta(app);
       if (preCached?.pid > 0 && !(operation?.isAi && this.takeoverController.paused)) {
         const wakePromise = this.registry.ensureRendererAxAwake(
@@ -951,7 +953,7 @@ export class ComputerUseBrokerServer {
     if (result?.isError && app && !LOCKED_SESSION_POSIX_RE.test(text)) {
       const errCheck = await this.#checkAppRunning(peer, app);
       if (errCheck.running) {
-        if (!operation?.isAi || !this.takeoverController.paused) {
+        if (!observationalOnly && (!operation?.isAi || !this.takeoverController.paused)) {
           if (operation?.isAi) {
             this.takeoverController.assertMayDispatch(operation, { isRead: false });
           }
@@ -990,7 +992,12 @@ export class ComputerUseBrokerServer {
     if (!result?.isError && argsWithReadOnly.include_screenshot !== false && this.#isTinyFloatingImage(result)) {
       const fallbackPid =
         parseSnapshotMetadata(text).pid || this.registry.getMeta(app)?.pid || this.state.pid;
-      if (peer === this.actionPeer && fallbackPid > 0 && typeof this.promoteMainWindowFn === "function") {
+      if (
+        !observationalOnly &&
+        peer === this.actionPeer &&
+        fallbackPid > 0 &&
+        typeof this.promoteMainWindowFn === "function"
+      ) {
         const promoted = await this.promoteMainWindowFn(fallbackPid);
         if (promoted) {
           const retryRes = await peer.callTool("get_app_state", argsWithReadOnly);
@@ -1000,7 +1007,7 @@ export class ComputerUseBrokerServer {
           }
         }
       }
-      if (this.#isTinyFloatingImage(result)) {
+      if (!observationalOnly && this.#isTinyFloatingImage(result)) {
         const upgraded = await this.#upgradeTinyFloatingWindowResult(result, fallbackPid);
         result = upgraded.result;
         text = extractResultText(result);
@@ -1022,11 +1029,27 @@ export class ComputerUseBrokerServer {
           ? await this.registry.resolveProcessIdentity(targetPid)
           : null;
 
-      if (peer === this.actionPeer && argsWithReadOnly.include_ax !== false && targetPid) {
-        const wake = await this.registry.ensureRendererAxAwake(
+      if (
+        !observationalOnly &&
+        peer === this.actionPeer &&
+        argsWithReadOnly.include_ax !== false &&
+        targetPid &&
+        !(operation?.isAi && this.takeoverController.paused)
+      ) {
+        const wakePromise = this.registry.ensureRendererAxAwake(
           targetPid,
-          procIdentity?.processToken
+          procIdentity?.processToken,
+          {
+            beforeWriteCheck: operation?.isAi
+              ? () => this.takeoverController.assertMayDispatch(operation, { isRead: false })
+              : null,
+          }
         );
+        const wake = await (operation
+          ? this.takeoverController.trackNativeWrite(operation, wakePromise, {
+              routeKey: "ax:ensure_manual",
+            })
+          : wakePromise);
         if (wake?.changed) {
           await new Promise((r) => setTimeout(r, 35));
           const wokenRes = await peer.callTool("get_app_state", argsWithReadOnly).catch(() => null);
@@ -1866,51 +1889,21 @@ export class ComputerUseBrokerServer {
         validatedSnapshot ||
         (parsedRef.snapshotId ? this.registry.ledger.getSnapshot(parsedRef.snapshotId) : null) ||
         (app ? this.registry.getLatestSnapshot(preMeta?.bundleId || app) : null);
-      let preWindowId =
-        Number(
-          windowDelivery?.windowId ||
-            preMeta?.tinyWindowOverride?.wid ||
-            preSnap?.windowId ||
-            preMeta?.windowId ||
-            0
-        ) || null;
-      if (
-        !preWindowId &&
-        preMeta?.pid > 0 &&
-        typeof this.axBridge?.getFocusedWindowInfo === "function"
-      ) {
-        const preWinInfo = await this.axBridge
-          .getFocusedWindowInfo(preMeta.pid, { windowTitle: preMeta.windowTitle || "" })
-          .catch(() => null);
-        if (Number(preWinInfo?.wid) > 0) {
-          preWindowId = Number(preWinInfo.wid);
-          this.registry.recordMeta(
-            app,
-            {
-              pid: preMeta.pid,
-              bundleId: preMeta.bundleId,
-              appDisplayName: preMeta.appDisplayName,
-              windowId: preWindowId,
-              windowTitle: preWinInfo.title || undefined,
-              windowBounds: preWinInfo.windowBounds || undefined,
-            },
-            {
-              fromActionPeer: false,
-              includeAx: false,
-              includeScreenshot: false,
-              preserveScreenshotState: true,
-            }
-          );
-        }
-      }
-      routeScope =
-        preMeta || preWindowId
-          ? {
-              pid: preMeta?.pid || null,
-              processToken: preMeta?.processToken || null,
-              windowId: preWindowId || null,
-            }
+      const initialRouteScope = this.registry.buildRouteScope(preMeta, {
+        snapshot: preSnap,
+        windowId: windowDelivery?.windowId || null,
+      });
+      const preFocusObs =
+        app && (name === "click" || !initialRouteScope?.windowId)
+          ? await this.registry.captureWindowObservation(app, {
+              desktopHelperClient: this.desktopHelperClient,
+              preferredTitle: preMeta?.windowTitle || "",
+            })
           : null;
+      routeScope = this.registry.buildRouteScope(preMeta, {
+        snapshot: preSnap,
+        windowId: windowDelivery?.windowId || preFocusObs?.wid || null,
+      });
 
       touchedTargetOs = true;
       const dispatched = await this.actionExecutor.dispatch({
@@ -1930,6 +1923,7 @@ export class ComputerUseBrokerServer {
         operation,
         windowDelivery,
         routeScope,
+        focusScope,
       });
       lastRouteKey = dispatched.actionRouteKey || lastRouteKey;
 
@@ -1944,37 +1938,13 @@ export class ComputerUseBrokerServer {
 
       let result = dispatched.result;
       let businessWindowTransition = false;
-      if (
-        name === "click" &&
-        result &&
-        !result.isError &&
-        preWindowId > 0 &&
-        preMeta?.pid > 0 &&
-        typeof this.axBridge?.getFocusedWindowInfo === "function"
-      ) {
-        const postWinInfo = await this.axBridge
-          .getFocusedWindowInfo(preMeta.pid, { windowTitle: "" })
-          .catch(() => null);
-        const postWindowId = Number(postWinInfo?.wid || 0);
-        if (postWindowId > 0 && postWindowId !== preWindowId) {
+      if (name === "click" && result && !result.isError && Number(preFocusObs?.wid || 0) > 0) {
+        const postFocusObs = await this.registry.captureWindowObservation(app, {
+          desktopHelperClient: this.desktopHelperClient,
+        });
+        if (this.registry.detectNewWindowTransition(preFocusObs, postFocusObs)) {
           businessWindowTransition = true;
-          this.registry.recordMeta(
-            app,
-            {
-              pid: preMeta.pid,
-              bundleId: preMeta.bundleId,
-              appDisplayName: preMeta.appDisplayName,
-              windowId: postWindowId,
-              windowTitle: postWinInfo.title || undefined,
-              windowBounds: postWinInfo.windowBounds || undefined,
-            },
-            {
-              fromActionPeer: false,
-              includeAx: false,
-              includeScreenshot: false,
-              preserveScreenshotState: false,
-            }
-          );
+          this.registry.recordObservedWindowTransition(app, preMeta, postFocusObs);
         }
       }
       if (app && focusScope) {
@@ -2015,24 +1985,38 @@ export class ComputerUseBrokerServer {
             parsedRef,
             ...dispatched,
             checkAppRunningFn: () => this.#checkAppRunning(this.actionPeer, app),
+            onBeforeReadBackFn: () => focusScope?.enterObservationPhase?.(),
             readBackStateFn: () =>
               this.#safeGetAppState(
                 this.actionPeer,
                 { app },
-                { updateActiveApp: shouldFollow, allowLaunch: false }
+                {
+                  updateActiveApp: shouldFollow,
+                  allowLaunch: false,
+                  observationalOnly: true,
+                  operation,
+                }
               ),
-            onReclaimFocusFn: () =>
-              focusScope?.enforce("read_back", { recordRoutePenalty: false }),
+            onReclaimFocusFn: () => focusScope?.enforceObservation?.(),
+            onAfterReadBackFn: () => focusScope?.exitObservationPhase?.(),
           });
           if (verifiedOut.verified) {
             this.state.headlessStats.verifiedMutations += 1;
           }
           result = verifiedOut.result;
-        } else if (this.sseClients.size > 0 && shouldFollow) {
-          if (dispatched.directDeliveryVerified) {
-            this.state.headlessStats.verifiedMutations += 1;
+        } else {
+          attachDeliveryReceipt(result, {
+            delivery: dispatched.directDeliveryVerified ? "delivered_verified" : "delivered_unverified",
+            route: dispatched.actionRouteKey,
+            executedRoute: dispatched.actionRouteKey,
+            ...(dispatched.requestedRoute ? { requestedRoute: dispatched.requestedRoute } : {}),
+          });
+          if (this.sseClients.size > 0 && shouldFollow) {
+            if (dispatched.directDeliveryVerified) {
+              this.state.headlessStats.verifiedMutations += 1;
+            }
+            void this.#captureStreamFrameOnce();
           }
-          void this.#captureStreamFrameOnce();
         }
         this.webAdapter.broadcastState();
       }

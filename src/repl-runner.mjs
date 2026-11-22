@@ -37,33 +37,6 @@ function classifyToolErrorCode(text) {
   return m ? m[1] : "TOOL_ERROR";
 }
 
-function parseDeliveryReceipt(text) {
-  if (typeof text !== "string" || !text) return null;
-  const matches = Array.from(
-    text.matchAll(
-      /\[Delivery:\s*([^|\n]+?)\s*\|\s*Route:\s*([^|\n\]]+?)(?:\s*\|\s*([^\n]+?))?\](?=\s*(?:\r?\n|$))/gu
-    )
-  );
-  const last = matches.length > 0 ? matches[matches.length - 1] : null;
-  if (!last) return null;
-  const delivery = last[1].trim();
-  const route = last[2].trim();
-  const tail = last[3] ? last[3].trim() : "";
-  let requestedRoute = null;
-  if (tail) {
-    const reqMatch = tail.match(/(?:^|\|\s*)Requested:\s*([^\s|\]]+)/u);
-    if (reqMatch) {
-      requestedRoute = reqMatch[1].trim();
-    }
-  }
-  return {
-    ok: true,
-    ...(delivery ? { delivery } : {}),
-    ...(route ? { route } : {}),
-    ...(requestedRoute ? { requestedRoute } : {}),
-  };
-}
-
 function validateBindingsPayload(bindings, sessionData) {
   if (!Array.isArray(bindings)) {
     throw new Error("INVALID_BINDINGS_PAYLOAD");
@@ -705,14 +678,22 @@ export class StrictReplSessionManager {
           return;
         }
 
-        const receipt = parseDeliveryReceipt(extractResultText(toolRes));
+        const receipt = toolRes?._deliveryReceipt || null;
         sendToChild({
           v: 1,
           type: "reply",
           runId,
           id: msg.id,
           ok: true,
-          value: receipt || { ok: true },
+          value: receipt
+            ? {
+                ok: true,
+                ...(receipt.delivery ? { delivery: receipt.delivery } : {}),
+                ...(receipt.route ? { route: receipt.route } : {}),
+                ...(receipt.executedRoute ? { executedRoute: receipt.executedRoute } : {}),
+                ...(receipt.requestedRoute ? { requestedRoute: receipt.requestedRoute } : {}),
+              }
+            : { ok: true },
         });
       } catch (err) {
         if (isTakeoverAbortedError(err)) {

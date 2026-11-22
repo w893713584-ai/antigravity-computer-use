@@ -273,6 +273,10 @@ final class DesktopHelperController {
       let arr = wins.compactMap(encodeToJsonObject)
       replyOk(["windows": arr])
 
+    case "focusedWindow":
+      let pid = (params["pid"] as? NSNumber)?.int32Value ?? 0
+      replyOk(WindowInventory.focusedWindowInfo(for: pid))
+
     case "setTakeoverTargets":
       let targets = (params["targets"] as? [[String: Any]]) ?? []
       if let trustedRaw = params["trustedPids"] as? [NSNumber] {
