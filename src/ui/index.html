@@ -1,0 +1,1595 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Computer Use 小窗</title>
+  <script src="/preload.js"></script>
+  <script src="/preview-video.js"></script>
+  <style>
+    :root {
+      color-scheme: dark light;
+      --cua-bg: var(--background, #0f1115);
+      --cua-fg: var(--foreground, #e6e8ec);
+      --cua-surface: color-mix(in srgb, var(--cua-fg) 5%, var(--cua-bg));
+      --cua-surface-2: color-mix(in srgb, var(--cua-fg) 9%, var(--cua-bg));
+      --cua-border: color-mix(in srgb, var(--cua-fg) 13%, transparent);
+      --cua-muted: color-mix(in srgb, var(--cua-fg) 58%, transparent);
+      --cua-accent: #339cff;
+      --cua-green: #28c840;
+      --cua-amber: #febc2e;
+      --cua-red: #ff5f57;
+    }
+
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--cua-bg);
+      color: var(--cua-fg);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+      font-size: 12px;
+    }
+
+    .shell {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      width: 100%;
+    }
+
+    /* Top Control Bar */
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--cua-border);
+      background: var(--cua-surface);
+      flex-shrink: 0;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 500;
+      background: var(--cua-surface-2);
+      border: 1px solid var(--cua-border);
+      white-space: nowrap;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--cua-green);
+      transition: background 0.2s ease;
+    }
+
+    .status-pill.acting .status-dot {
+      background: var(--cua-accent);
+      box-shadow: 0 0 0 3px rgba(51, 156, 255, 0.25);
+      animation: pulse 1.1s infinite ease-in-out;
+    }
+
+    .status-pill.paused .status-dot {
+      background: var(--cua-amber);
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.25); opacity: 0.72; }
+    }
+
+    .app-select-wrap {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex: 1;
+      min-width: 0;
+    }
+
+    select.app-select, select.win-select {
+      flex: 1;
+      min-width: 0;
+      height: 25px;
+      padding: 0 22px 0 8px;
+      border-radius: 6px;
+      border: 1px solid var(--cua-border);
+      background: var(--cua-bg);
+      color: var(--cua-fg);
+      font-size: 11.5px;
+      outline: none;
+      text-overflow: ellipsis;
+    }
+
+    select.win-select {
+      flex: 0.75;
+      max-width: 148px;
+    }
+
+    .stream-badge {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(15, 18, 25, 0.85);
+      border: 1px solid rgba(254, 188, 46, 0.45);
+      color: var(--cua-amber);
+      font-size: 10.5px;
+      pointer-events: none;
+      z-index: 12;
+      display: none;
+    }
+
+    .stream-badge.show {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .canvas-box.readonly {
+      cursor: not-allowed;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      height: 25px;
+      padding: 0 8px;
+      border-radius: 6px;
+      border: 1px solid var(--cua-border);
+      background: var(--cua-bg);
+      color: var(--cua-fg);
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.14s ease, border-color 0.14s ease;
+    }
+
+    .btn:hover {
+      background: var(--cua-surface-2);
+    }
+
+    .btn.active {
+      border-color: rgba(51, 156, 255, 0.55);
+      background: rgba(51, 156, 255, 0.14);
+      color: #6cb8ff;
+    }
+
+    .btn.warn {
+      border-color: rgba(254, 188, 46, 0.55);
+      background: rgba(254, 188, 46, 0.15);
+      color: var(--cua-amber);
+    }
+
+    .btn-icon {
+      padding: 0 6px;
+      font-size: 12px;
+    }
+
+    /* Center Stage */
+    .stage {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      position: relative;
+      background:
+        radial-gradient(circle at 50% 0%, rgba(51, 156, 255, 0.05), transparent 65%),
+        var(--cua-bg);
+    }
+
+    .mini-window {
+      display: flex;
+      flex-direction: column;
+      max-width: 100%;
+      max-height: 100%;
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--cua-border);
+      background: #14171d;
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.36), 0 1px 0 rgba(255, 255, 255, 0.05) inset;
+      overflow: hidden;
+    }
+
+    .mini-titlebar {
+      height: 26px;
+      padding: 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      color: #cfd4dc;
+      font-size: 11px;
+      flex-shrink: 0;
+    }
+
+    .traffic-lights {
+      display: flex;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    .traffic-lights span {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      opacity: 0.78;
+    }
+    .tl-red { background: var(--cua-red); }
+    .tl-yellow { background: var(--cua-amber); }
+    .tl-green { background: var(--cua-green); }
+
+    .win-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: center;
+      font-weight: 500;
+      color: #d6dbe3;
+    }
+
+    .win-meta {
+      font-variant-numeric: tabular-nums;
+      color: #8b93a1;
+      font-size: 10.5px;
+      flex-shrink: 0;
+    }
+
+    .viewport-wrap {
+      position: relative;
+      flex: 1;
+      min-height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0b0d11;
+      overflow: hidden;
+    }
+
+    .canvas-box {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      max-width: 100%;
+      max-height: 100%;
+      cursor: crosshair;
+    }
+
+    canvas#screenCanvas {
+      display: block;
+      max-width: 100%;
+      max-height: calc(100vh - 155px);
+      width: auto;
+      height: auto;
+      object-fit: contain;
+    }
+
+    .empty-placeholder {
+      padding: 28px 20px;
+      text-align: center;
+      color: var(--cua-muted);
+      line-height: 1.6;
+      max-width: 280px;
+    }
+
+    .empty-placeholder strong {
+      display: block;
+      color: var(--cua-fg);
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+
+    /* Codex-style Virtual Cursor & Ripple inside Mini-Window */
+    .cua-cursor {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 22px;
+      height: 22px;
+      pointer-events: none;
+      transform: translate(-2px, -2px);
+      transition: left 0.24s cubic-bezier(0.22, 1, 0.36, 1), top 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.25s ease;
+      opacity: 0;
+      z-index: 10;
+      filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.55));
+    }
+
+    .cua-cursor.visible {
+      opacity: 1;
+    }
+
+    .cursor-tag {
+      position: absolute;
+      left: 16px;
+      top: 14px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(19, 24, 34, 0.88);
+      border: 1px solid rgba(51, 156, 255, 0.6);
+      color: #e8f2ff;
+      font-size: 10.5px;
+      white-space: nowrap;
+      backdrop-filter: blur(6px);
+      max-width: 190px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .click-ripple {
+      position: absolute;
+      width: 26px;
+      height: 26px;
+      margin-left: -13px;
+      margin-top: -13px;
+      border-radius: 50%;
+      border: 2px solid var(--cua-accent);
+      background: rgba(51, 156, 255, 0.22);
+      pointer-events: none;
+      z-index: 9;
+      animation: rippleOut 0.52s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    @keyframes rippleOut {
+      0% { transform: scale(0.35); opacity: 1; }
+      100% { transform: scale(1.75); opacity: 0; }
+    }
+
+    .action-toast {
+      position: absolute;
+      bottom: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(15, 18, 25, 0.86);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      color: #eef2f8;
+      font-size: 11px;
+      pointer-events: none;
+      white-space: nowrap;
+      max-width: 90%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+      z-index: 11;
+    }
+
+    .action-toast.show {
+      opacity: 1;
+    }
+
+    /* Bottom Keyboard & Log Bar */
+    .bottombar {
+      border-top: 1px solid var(--cua-border);
+      background: var(--cua-surface);
+      padding: 7px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .key-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    input.type-input {
+      flex: 1;
+      min-width: 0;
+      height: 26px;
+      padding: 0 8px;
+      border-radius: 6px;
+      border: 1px solid var(--cua-border);
+      background: var(--cua-bg);
+      color: var(--cua-fg);
+      font-size: 11.5px;
+      outline: none;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+
+    input.type-input:focus {
+      border-color: var(--cua-accent);
+    }
+
+    .shortcut-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+    }
+
+    .shortcut-keys {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+
+    .key-chip {
+      height: 21px;
+      padding: 0 6px;
+      border-radius: 5px;
+      border: 1px solid var(--cua-border);
+      background: var(--cua-bg);
+      color: var(--cua-muted);
+      font-size: 10.5px;
+      cursor: pointer;
+    }
+
+    .key-chip:hover {
+      color: var(--cua-fg);
+      background: var(--cua-surface-2);
+    }
+
+    .log-toggle {
+      font-size: 10.5px;
+      color: var(--cua-muted);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .log-toggle:hover {
+      color: var(--cua-fg);
+    }
+
+    .log-drawer {
+      display: none;
+      max-height: 110px;
+      overflow-y: auto;
+      border-top: 1px solid var(--cua-border);
+      padding-top: 5px;
+      font-size: 11px;
+      color: var(--cua-muted);
+    }
+
+    .log-drawer.open {
+      display: block;
+    }
+
+    .log-item {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 2px 0;
+    }
+
+    .log-item .src-ai { color: var(--cua-accent); }
+    .log-item .src-ui { color: var(--cua-green); }
+    .log-item .src-guard { color: var(--cua-amber); }
+    .log-item .src-stale { color: var(--cua-red); }
+    .log-item .src-takeover { color: var(--cua-amber); font-weight: 600; }
+
+    .perm-banner {
+      display: none;
+      padding: 5px 10px;
+      font-size: 11px;
+      line-height: 1.4;
+      background: rgba(254, 188, 46, 0.14);
+      border-bottom: 1px solid rgba(254, 188, 46, 0.35);
+      color: var(--cua-amber);
+      flex-shrink: 0;
+    }
+
+    .perm-banner.show {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .perm-btn {
+      height: 20px;
+      padding: 0 7px;
+      border-radius: 5px;
+      border: 1px solid rgba(254, 188, 46, 0.55);
+      background: rgba(254, 188, 46, 0.18);
+      color: var(--cua-amber);
+      font-size: 10.5px;
+      cursor: pointer;
+    }
+
+    .perm-btn:hover {
+      background: rgba(254, 188, 46, 0.28);
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div id="statusPill" class="status-pill">
+        <span class="status-dot"></span>
+        <span id="statusText">后台无感</span>
+      </div>
+
+      <div class="app-select-wrap">
+        <select id="appSelect" class="app-select" title="选择在侧面小窗中观察/操作的后台应用">
+          <option value="">等待 AI 或手动选择应用…</option>
+        </select>
+        <select id="windowSelect" class="win-select" title="指定同应用下的目标窗口（区分主窗/弹窗）" style="display:none;">
+          <option value="">自动主窗口</option>
+        </select>
+        <button id="refreshAppsBtn" class="btn btn-icon" title="刷新运行中的应用列表">↻</button>
+      </div>
+
+      <button id="followBtn" class="btn active" title="AI 切换操作目标时自动跟随显示">跟随</button>
+      <button id="pauseBtn" class="btn" title="暂停或恢复 AI 对窗口的操作">暂停</button>
+      <button id="frontBtn" class="btn" title="将真实窗口调到屏幕最前面">置顶</button>
+    </div>
+
+    <div id="permBanner" class="perm-banner"></div>
+
+    <div class="stage">
+      <div class="mini-window">
+        <div class="mini-titlebar">
+          <div class="traffic-lights">
+            <span class="tl-red"></span>
+            <span class="tl-yellow"></span>
+            <span class="tl-green"></span>
+          </div>
+          <div id="winTitle" class="win-title">Computer Use 侧面小窗（操作不抢焦点）</div>
+          <div id="winMeta" class="win-meta">就绪</div>
+        </div>
+
+        <div class="viewport-wrap">
+          <div id="emptyState" class="empty-placeholder">
+            <strong>正在等待后台窗口画面</strong>
+            当 AI 调用 Computer Use 时，被操作的窗口不会弹到最前面，而会自动在这里实时显示。<br/>你也可以在上方下拉框直接任选一个后台应用在这里点按操作。
+          </div>
+
+          <div id="canvasBox" class="canvas-box" style="display:none;">
+            <canvas id="screenCanvas"></canvas>
+            <div id="streamBadge" class="stream-badge"></div>
+            <div id="cuaCursor" class="cua-cursor">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <path d="M4.5 3.2L19.2 11.4L12.1 13.3L9.3 20.1L4.5 3.2Z" fill="#339cff" stroke="#ffffff" stroke-width="1.8" stroke-linejoin="round"/>
+              </svg>
+              <div id="cursorTag" class="cursor-tag">AI</div>
+            </div>
+            <div id="actionToast" class="action-toast"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bottombar">
+      <div class="key-row">
+        <input id="typeInput" class="type-input" type="text" placeholder="直接在小窗点击画面，或在此输入文字回车发往后台窗口…" />
+        <button id="sendTextBtn" class="btn">发送</button>
+      </div>
+      <div class="shortcut-strip">
+        <div class="shortcut-keys">
+          <button class="key-chip" data-key="Return">⏎ 回车</button>
+          <button class="key-chip" data-key="BackSpace">⌫ 退格</button>
+          <button class="key-chip" data-key="Tab">Tab</button>
+          <button class="key-chip" data-key="Escape">Esc</button>
+          <button class="key-chip" data-key="cmd+a">⌘A</button>
+          <button class="key-chip" data-key="cmd+c">⌘C</button>
+          <button class="key-chip" data-key="cmd+v">⌘V</button>
+          <button class="key-chip" data-key="cmd+z">⌘Z</button>
+        </div>
+        <span id="logToggle" class="log-toggle">动作记录 (0) ▾</span>
+      </div>
+      <div id="logDrawer" class="log-drawer"></div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const urlParams = new URLSearchParams(window.location.search);
+      const token = urlParams.get("token") || "";
+
+      function withToken(path) {
+        if (!token) return path;
+        const sep = path.includes("?") ? "&" : "?";
+        return `${path}${sep}token=${encodeURIComponent(token)}`;
+      }
+
+      const statusPill = document.getElementById("statusPill");
+      const statusText = document.getElementById("statusText");
+      const appSelect = document.getElementById("appSelect");
+      const windowSelect = document.getElementById("windowSelect");
+      const refreshAppsBtn = document.getElementById("refreshAppsBtn");
+      const followBtn = document.getElementById("followBtn");
+      const pauseBtn = document.getElementById("pauseBtn");
+      const frontBtn = document.getElementById("frontBtn");
+      const winTitle = document.getElementById("winTitle");
+      const winMeta = document.getElementById("winMeta");
+      const emptyState = document.getElementById("emptyState");
+      const canvasBox = document.getElementById("canvasBox");
+      const canvas = document.getElementById("screenCanvas");
+      const streamBadge = document.getElementById("streamBadge");
+      const ctx = canvas.getContext("2d");
+      const cuaCursor = document.getElementById("cuaCursor");
+      const cursorTag = document.getElementById("cursorTag");
+      const actionToast = document.getElementById("actionToast");
+      const typeInput = document.getElementById("typeInput");
+      const sendTextBtn = document.getElementById("sendTextBtn");
+      const logToggle = document.getElementById("logToggle");
+      const logDrawer = document.getElementById("logDrawer");
+      const permBanner = document.getElementById("permBanner");
+
+      let currentState = {
+        brokerBootId: null,
+        activeApp: null,
+        appDisplayName: null,
+        bundleId: null,
+        targetKey: null,
+        geometryRev: 1,
+        windowId: null,
+        pinnedWindowId: null,
+        previewGeometry: null,
+        previewReadOnly: false,
+        previewReadOnlyReason: null,
+        streamPaused: false,
+        streamPausedReason: null,
+        videoTransport: "jpeg",
+        availableWindows: [],
+        followAi: true,
+        paused: false,
+        frameSeq: 0,
+      };
+      let loadingFrameSeq = 0;
+      let displayedFrameSeq = 0;
+      let displayedFrameRef = null;
+      let cursorHideTimer = null;
+      let toastTimer = null;
+      let localVideoMode = "jpeg";
+      let localVideoReason = null;
+
+      function showToast(text) {
+        if (!text) return;
+        actionToast.textContent = text;
+        actionToast.classList.add("show");
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => actionToast.classList.remove("show"), 2200);
+      }
+
+      async function apiPost(path, body = {}) {
+        const headers = { "Content-Type": "application/json" };
+        if (token) headers["X-Sidecar-Token"] = token;
+        const res = await fetch(withToken(path), {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data?.error || data?.ok === false) {
+          if (data?.state) {
+            applyState(data.state);
+          }
+          const msg = data?.error || `请求失败 (${res.status})`;
+          showToast(msg);
+          throw new Error(msg);
+        }
+        return data;
+      }
+
+      function getVisibleContentRectOnCanvas() {
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        const crop = currentState.previewGeometry?.previewContentRectPt;
+        const vw = crop?.width > 0 ? crop.width : canvas.width;
+        const vh = crop?.height > 0 ? crop.height : canvas.height;
+        const visible = window.CUAPreviewVideo?.computeContainDisplayRect
+          ? window.CUAPreviewVideo.computeContainDisplayRect(rect.width, rect.height, vw, vh)
+          : { x: 0, y: 0, width: rect.width, height: rect.height };
+        return visible ? { rect, visible } : null;
+      }
+
+      function showCursorAt(normX, normY, label, withRipple = true) {
+        if (!Number.isFinite(normX) || !Number.isFinite(normY)) return;
+        const clampedX = Math.max(0.01, Math.min(0.99, normX));
+        const clampedY = Math.max(0.01, Math.min(0.99, normY));
+        const geom = getVisibleContentRectOnCanvas();
+        const boxRect = canvasBox.getBoundingClientRect();
+        let leftStyle;
+        let topStyle;
+        if (geom && boxRect.width > 0 && boxRect.height > 0) {
+          const offsetLeft = geom.rect.left - boxRect.left;
+          const offsetTop = geom.rect.top - boxRect.top;
+          leftStyle = `${(offsetLeft + geom.visible.x + clampedX * geom.visible.width).toFixed(1)}px`;
+          topStyle = `${(offsetTop + geom.visible.y + clampedY * geom.visible.height).toFixed(1)}px`;
+        } else {
+          leftStyle = `${(clampedX * 100).toFixed(2)}%`;
+          topStyle = `${(clampedY * 100).toFixed(2)}%`;
+        }
+        cuaCursor.style.left = leftStyle;
+        cuaCursor.style.top = topStyle;
+        if (label) cursorTag.textContent = label;
+        cuaCursor.classList.add("visible");
+
+        if (withRipple) {
+          const ripple = document.createElement("div");
+          ripple.className = "click-ripple";
+          ripple.style.left = leftStyle;
+          ripple.style.top = topStyle;
+          canvasBox.appendChild(ripple);
+          setTimeout(() => ripple.remove(), 560);
+        }
+
+        if (cursorHideTimer) clearTimeout(cursorHideTimer);
+        cursorHideTimer = setTimeout(() => {
+          cuaCursor.classList.remove("visible");
+        }, 4200);
+      }
+
+      let viewGeneration = 1;
+      let singleClickTimer = null;
+      let displayedFrameApp = "";
+      let displayedFrameBoot = "";
+
+      function currentAppIdentity(s = currentState) {
+        return String(s?.bundleId || s?.activeApp || "");
+      }
+
+      function cancelPendingSingleClick() {
+        if (singleClickTimer) {
+          clearTimeout(singleClickTimer);
+          singleClickTimer = null;
+        }
+      }
+
+      const videoCtrl = window.CUAPreviewVideo
+        ? new window.CUAPreviewVideo.PreviewVideoController({
+            canvas,
+            apiPost,
+            getToken: () => token,
+            getBrokerBootId: () => currentState.brokerBootId || "",
+            onH264Frame: ({ frameRef, codedWidth, codedHeight }) => {
+              displayedFrameRef = frameRef;
+              displayedFrameSeq = frameRef.seq;
+              displayedFrameApp = currentAppIdentity();
+              displayedFrameBoot = currentState.brokerBootId || "";
+              if (codedWidth) currentState.frameWidth = codedWidth;
+              if (codedHeight) currentState.frameHeight = codedHeight;
+              emptyState.style.display = "none";
+              canvasBox.style.display = "flex";
+              renderStreamBadge();
+              renderWinMeta();
+            },
+            onTransportChange: ({ mode, reason }) => {
+              localVideoMode = mode || "jpeg";
+              localVideoReason = reason || null;
+              if (mode === "jpeg" && currentState.frameSeq > 0) {
+                loadFrame(currentState.frameSeq);
+              }
+              renderStreamBadge();
+              renderWinMeta();
+            },
+          })
+        : null;
+
+      function clearDisplayedCanvas() {
+        displayedFrameSeq = 0;
+        displayedFrameApp = "";
+        displayedFrameBoot = "";
+        displayedFrameRef = null;
+        loadingFrameSeq = 0;
+        canvasBox.style.display = "none";
+        emptyState.style.display = "";
+        cuaCursor.classList.remove("visible");
+      }
+
+      function bumpViewGeneration() {
+        viewGeneration += 1;
+        loadingFrameSeq = 0;
+        cancelPendingSingleClick();
+      }
+
+      function syncBootId(bootId) {
+        if (bootId && currentState.brokerBootId && bootId !== currentState.brokerBootId) {
+          clearDisplayedCanvas();
+          bumpViewGeneration();
+        }
+        if (bootId) {
+          currentState.brokerBootId = bootId;
+        }
+      }
+
+      function renderStreamBadge() {
+        if (currentState.streamPaused) {
+          streamBadge.textContent = "画面暂停 · 暂不可点击";
+          streamBadge.classList.add("show");
+          canvasBox.classList.add("readonly");
+          return;
+        }
+        if (currentState.previewReadOnly) {
+          streamBadge.textContent = "只读保护 · 未证实同窗坐标";
+          streamBadge.classList.add("show");
+          canvasBox.classList.add("readonly");
+          return;
+        }
+        streamBadge.classList.remove("show");
+        canvasBox.classList.remove("readonly");
+      }
+
+      function loadFrame(seq, expectedFrameRef = null) {
+        if (!seq) return;
+        const expectedApp = currentAppIdentity();
+        if (!expectedApp) return;
+        const expectedTargetKey = expectedFrameRef?.targetKey || currentState.targetKey || "";
+        if (localVideoMode === "h264" && videoCtrl?.targetKey && videoCtrl.targetKey === expectedTargetKey) {
+          return;
+        }
+        if (seq < displayedFrameSeq) {
+          displayedFrameSeq = 0;
+          loadingFrameSeq = 0;
+        }
+        if (seq <= displayedFrameSeq || seq === loadingFrameSeq) return;
+        loadingFrameSeq = seq;
+        const expectedGen = viewGeneration;
+        const expectedBoot = currentState.brokerBootId || "";
+        const expectedGeomRev = expectedFrameRef?.geometryRev || currentState.geometryRev || 1;
+        const expectedWindowId = expectedFrameRef?.windowId || currentState.windowId || null;
+        const img = new Image();
+        img.onload = () => {
+          if (
+            expectedGen !== viewGeneration ||
+            expectedBoot !== (currentState.brokerBootId || "") ||
+            expectedApp !== currentAppIdentity() ||
+            (expectedTargetKey && expectedTargetKey !== (currentState.targetKey || "")) ||
+            (localVideoMode === "h264" && videoCtrl?.targetKey === expectedTargetKey)
+          ) {
+            return;
+          }
+          displayedFrameSeq = seq;
+          displayedFrameApp = expectedApp;
+          displayedFrameBoot = expectedBoot;
+          displayedFrameRef = expectedFrameRef || {
+            transport: "jpeg",
+            brokerBootId: expectedBoot,
+            seq,
+            targetKey: expectedTargetKey || null,
+            geometryRev: expectedGeomRev,
+            windowId: expectedWindowId,
+          };
+          loadingFrameSeq = 0;
+          if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+          }
+          ctx.drawImage(img, 0, 0);
+          emptyState.style.display = "none";
+          canvasBox.style.display = "flex";
+          renderStreamBadge();
+
+          if (currentState.frameSeq > displayedFrameSeq && localVideoMode !== "h264") {
+            loadFrame(currentState.frameSeq);
+          }
+        };
+        img.onerror = () => {
+          if (expectedGen === viewGeneration) {
+            loadingFrameSeq = 0;
+          }
+        };
+        const targetParam = expectedTargetKey ? `&targetKey=${encodeURIComponent(expectedTargetKey)}` : "";
+        img.src = withToken(`/api/frame.jpg?seq=${seq}&boot=${encodeURIComponent(expectedBoot)}${targetParam}`);
+      }
+
+      function renderAppOptions(runningApps = [], activeApp = null) {
+        const prevValues = Array.from(appSelect.options).map((o) => o.value).join("|");
+        const items = [...runningApps];
+        if (activeApp && !items.some((a) => a.bundleId === activeApp || a.displayName === activeApp)) {
+          items.unshift({ displayName: currentState.appDisplayName || activeApp, bundleId: activeApp });
+        }
+        const nextSig = items.map((a) => a.bundleId).join("|");
+        if (prevValues !== "|" + nextSig) {
+          const frag = document.createDocumentFragment();
+          const placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = "选择后台窗口…";
+          frag.appendChild(placeholder);
+
+          for (const app of items) {
+            const opt = document.createElement("option");
+            opt.value = app.bundleId;
+            opt.textContent = app.displayName;
+            frag.appendChild(opt);
+          }
+          appSelect.replaceChildren(frag);
+        }
+        if (activeApp) {
+          const match = Array.from(appSelect.options).find(
+            (o) => o.value === activeApp || o.textContent === currentState.appDisplayName
+          );
+          if (match) appSelect.value = match.value;
+        } else {
+          appSelect.value = "";
+        }
+      }
+
+      function renderWindowOptions(windows = [], pinnedWindowId = null, activeWindowId = null) {
+        if (!Array.isArray(windows) || (windows.length <= 1 && !pinnedWindowId)) {
+          windowSelect.style.display = "none";
+          return;
+        }
+        windowSelect.style.display = "";
+        const sig = windows.map((w) => `${w.windowId}:${w.kind}:${w.title}`).join("|");
+        const curSig = windowSelect.getAttribute("data-sig") || "";
+        if (curSig !== sig) {
+          const frag = document.createDocumentFragment();
+          const autoOpt = document.createElement("option");
+          autoOpt.value = "";
+          autoOpt.textContent = "自动主窗";
+          frag.appendChild(autoOpt);
+          for (const w of windows) {
+            const opt = document.createElement("option");
+            opt.value = String(w.windowId);
+            const tag = w.kind === "popup" ? "[弹窗]" : "[主窗]";
+            const lbl = w.title ? String(w.title).slice(0, 18) : `窗口 ${w.windowId}`;
+            const dims = w.boundsPt ? ` (${Math.round(w.boundsPt.width)}×${Math.round(w.boundsPt.height)})` : "";
+            opt.textContent = `${tag} ${lbl}${dims}`;
+            frag.appendChild(opt);
+          }
+          windowSelect.replaceChildren(frag);
+          windowSelect.setAttribute("data-sig", sig);
+        }
+        windowSelect.value = pinnedWindowId ? String(pinnedWindowId) : activeWindowId ? "" : "";
+      }
+
+      function renderActionLogs(actions = []) {
+        logToggle.textContent = `动作记录 (${actions.length}) ▾`;
+        const frag = document.createDocumentFragment();
+        for (const a of actions) {
+          const row = document.createElement("div");
+          row.className = "log-item";
+
+          const left = document.createElement("span");
+          const badge = document.createElement("b");
+          if (a.type === "focus_guard") {
+            badge.className = "src-guard";
+            badge.textContent = "[防抢焦点] ";
+          } else if (a.type === "stale_ref") {
+            badge.className = "src-stale";
+            badge.textContent = "[快照拦截] ";
+          } else if (a.type === "takeover") {
+            badge.className = "src-takeover";
+            badge.textContent = "[人类接管] ";
+          } else {
+            badge.className = a.source === "ui" ? "src-ui" : "src-ai";
+            badge.textContent = a.source === "ui" ? "[手动] " : "[AI] ";
+          }
+          left.appendChild(badge);
+          left.appendChild(document.createTextNode(String(a.label || "")));
+
+          const right = document.createElement("span");
+          right.textContent = new Date(a.timestamp).toLocaleTimeString("zh-CN", { hour12: false });
+
+          row.appendChild(left);
+          row.appendChild(right);
+          frag.appendChild(row);
+        }
+        logDrawer.replaceChildren(frag);
+      }
+
+      async function requestHelperPermission(kind) {
+        try {
+          const res = await apiPost("/api/permissions/request", { kind });
+          if (res?.permissions) {
+            currentState.permissions = {
+              platform: res.permissions.platform,
+              accessibility: res.permissions.accessibility,
+              screenRecording: res.permissions.screenRecording,
+            };
+            if (res.permissions.components) {
+              currentState.permissionComponents = res.permissions.components;
+            }
+            renderPermissionsBanner(currentState.permissions, currentState.permissionComponents);
+          }
+          videoCtrl?.resetCapabilitySuppression();
+          videoCtrl?.syncTarget({
+            targetKey: currentState.targetKey,
+            activeApp: currentState.activeApp,
+            streamPaused: currentState.streamPaused,
+          });
+          showToast(kind === "inputMonitoring" ? "已请求输入监控授权" : "已请求屏幕录制授权");
+        } catch {}
+      }
+
+      function renderPermissionsBanner(permissions, permissionComponents = null) {
+        if (!permissions || permissions.platform !== "darwin") {
+          permBanner.classList.remove("show");
+          permBanner.replaceChildren();
+          return;
+        }
+        const helperComp = permissionComponents?.desktopHelper || null;
+        const helperCaps = helperComp?.capabilities || null;
+        const helperStatus = helperComp?.status || "unavailable";
+        const helperReason = helperComp?.reason || null;
+        const helperAvail = Boolean(helperStatus && helperStatus !== "unavailable");
+        const helperReconnecting = Boolean(
+          !helperAvail &&
+            (helperReason === "reconnecting" ||
+              helperReason === "helper_disconnected" ||
+              helperReason === "helper_heartbeat_timeout" ||
+              helperReason === "helper_socket_error")
+        );
+        const ocuStreamVerified = permissionComponents?.ocuStream?.status === "verified";
+        const effectiveScreenRecordingMissing =
+          helperAvail && helperCaps && typeof helperCaps.screenRecordingPreflight === "boolean"
+            ? !helperCaps.screenRecordingPreflight && !ocuStreamVerified
+            : permissions.screenRecording === false && !ocuStreamVerified;
+
+        const missing = [];
+        if (permissions.accessibility === false) missing.push("辅助功能 (Accessibility)");
+        if (effectiveScreenRecordingMissing) missing.push("屏幕录制 (Screen Recording)");
+
+        const needsInputMonitoring = Boolean(
+          helperAvail && helperCaps && !helperCaps.mouseTapActive && !helperCaps.keyTapActive
+        );
+        const needsHelperScreenRecording = Boolean(
+          helperAvail && helperCaps && helperCaps.screenRecordingPreflight === false
+        );
+
+        if (
+          missing.length === 0 &&
+          !needsInputMonitoring &&
+          !needsHelperScreenRecording &&
+          !helperReconnecting
+        ) {
+          permBanner.classList.remove("show");
+          permBanner.replaceChildren();
+          return;
+        }
+
+        const frag = document.createDocumentFragment();
+        const textSpan = document.createElement("span");
+        const parts = [];
+        if (missing.length > 0) {
+          parts.push(`⚠ 缺少 macOS 权限：${missing.join("、")}（请在「系统设置 → 隐私与安全性」授权）`);
+        }
+        if (helperReconnecting) {
+          parts.push("桌面辅助进程正在重连…");
+        }
+        if (needsInputMonitoring) {
+          parts.push("当前为「基础接管模式」（授权输入监控后可启用精准目标点击/热键接管）");
+        }
+        textSpan.textContent = parts.join(" · ");
+        frag.appendChild(textSpan);
+
+        if (needsInputMonitoring) {
+          const btn = document.createElement("button");
+          btn.className = "perm-btn";
+          btn.type = "button";
+          btn.textContent = "开启精准输入接管";
+          btn.addEventListener("click", () => requestHelperPermission("inputMonitoring"));
+          frag.appendChild(btn);
+        }
+        if (needsHelperScreenRecording) {
+          const btn = document.createElement("button");
+          btn.className = "perm-btn";
+          btn.type = "button";
+          btn.textContent = "授权辅助录屏";
+          btn.addEventListener("click", () => requestHelperPermission("screenRecording"));
+          frag.appendChild(btn);
+        }
+
+        permBanner.replaceChildren(frag);
+        permBanner.classList.add("show");
+      }
+
+      function renderWinMeta() {
+        if (!currentState.activeApp) {
+          winMeta.textContent = currentState.takeoverMode === "enhanced" ? "⚡强化接管" : "就绪";
+          return;
+        }
+        const parts = [];
+        if (currentState.takeoverMode === "enhanced") {
+          parts.push("⚡强化接管");
+        } else {
+          parts.push("基础接管");
+        }
+        if (currentState.streamPaused) {
+          parts.push("画面暂停");
+        } else if (localVideoMode === "h264" || currentState.videoTransport === "h264") {
+          parts.push("H.264");
+        } else {
+          parts.push("JPEG");
+        }
+        if (currentState.previewReadOnly) {
+          parts.push("只读");
+        }
+        if (currentState.activeSnapshotId) parts.push(currentState.activeSnapshotId);
+        if (currentState.headlessStats?.focusStealsPrevented > 0) {
+          parts.push(`🛡${currentState.headlessStats.focusStealsPrevented}`);
+        }
+        if (currentState.frameWidth && currentState.frameHeight) {
+          parts.push(`${currentState.frameWidth}×${currentState.frameHeight}`);
+          if (currentState.frameLatencyMs) parts.push(`${currentState.frameLatencyMs}ms`);
+        }
+        winMeta.textContent = parts.length > 0 ? parts.join(" · ") : "就绪";
+      }
+
+      function applyState(state) {
+        if (!state || typeof state !== "object") return;
+        syncBootId(state.brokerBootId);
+        const prevAppIdentity = currentAppIdentity(currentState);
+        const nextAppIdentity =
+          (state.bundleId !== undefined ? state.bundleId : currentState.bundleId) ||
+          (state.activeApp !== undefined ? state.activeApp : currentState.activeApp) ||
+          "";
+        const prevTargetKey = currentState.targetKey || "";
+        const nextTargetKey =
+          state.targetKey !== undefined ? (state.targetKey || "") : prevTargetKey;
+        if (prevAppIdentity !== nextAppIdentity || (prevTargetKey && nextTargetKey && prevTargetKey !== nextTargetKey)) {
+          clearDisplayedCanvas();
+          bumpViewGeneration();
+        }
+        const prevSR = currentState.permissionComponents?.desktopHelper?.capabilities?.screenRecordingPreflight;
+        currentState = { ...currentState, ...state };
+        const nextSR = currentState.permissionComponents?.desktopHelper?.capabilities?.screenRecordingPreflight;
+        if (prevSR !== nextSR) {
+          videoCtrl?.resetCapabilitySuppression();
+        }
+
+        renderPermissionsBanner(currentState.permissions, currentState.permissionComponents);
+        renderStreamBadge();
+
+        statusPill.classList.toggle("acting", state.aiStatus && state.aiStatus !== "idle" && !state.paused);
+        statusPill.classList.toggle("paused", Boolean(state.paused));
+        if (state.paused) {
+          if (state.pausePhase === "draining") {
+            statusText.textContent = "排空中 · 已暂停 AI";
+          } else if (state.pauseDetail?.label) {
+            statusText.textContent = `已暂停 · ${String(state.pauseDetail.label).slice(0, 18)}`;
+          } else {
+            statusText.textContent = "已暂停 AI";
+          }
+        } else if (state.aiStatus === "acting") {
+          statusText.textContent = "AI 操作中";
+        } else if (state.aiStatus === "observing") {
+          statusText.textContent = "AI 读取中";
+        } else {
+          statusText.textContent = "后台无感";
+        }
+
+        followBtn.classList.toggle("active", Boolean(state.followAi));
+        pauseBtn.classList.toggle("warn", Boolean(state.paused));
+        pauseBtn.textContent = state.paused ? "继续" : "暂停";
+        const hkHint = state.emergencyHotkey || "ctrl+opt+escape";
+        pauseBtn.title = state.paused
+          ? `恢复 AI 自动操作 (${state.takeoverMode === "enhanced" ? `全局急停: ${hkHint}` : "基础接管"})`
+          : `暂停 AI 对窗口的操作 (${state.takeoverMode === "enhanced" ? `全局急停: ${hkHint}` : "小窗暂停"})`;
+
+        if (state.activeApp) {
+          const titlePart = state.windowTitle ? `${state.windowTitle}` : state.appDisplayName || state.activeApp;
+          const appPart = state.appDisplayName && state.windowTitle ? ` — ${state.appDisplayName}` : "";
+          winTitle.textContent = `${titlePart}${appPart}`;
+        } else {
+          winTitle.textContent = "Computer Use 侧面小窗（操作不抢焦点）";
+        }
+        renderWinMeta();
+
+        renderAppOptions(state.runningApps || [], state.activeApp);
+        renderWindowOptions(state.availableWindows || [], state.pinnedWindowId, state.windowId);
+        renderActionLogs(state.recentActions || []);
+
+        videoCtrl?.syncTarget({
+          targetKey: currentState.targetKey,
+          activeApp: currentState.activeApp,
+          streamPaused: currentState.streamPaused,
+        });
+
+        if (currentState.streamPaused) {
+          clearDisplayedCanvas();
+        } else if (!state.hasFrame && localVideoMode !== "h264") {
+          clearDisplayedCanvas();
+        } else if (
+          localVideoMode !== "h264" &&
+          (state.frameSeq > displayedFrameSeq || state.frameSeq < displayedFrameSeq)
+        ) {
+          loadFrame(state.frameSeq);
+        }
+      }
+
+      function isEventTargetingCurrentView(evt) {
+        if (!evt || evt.source === "ui") return true;
+        if (evt.targetKey && currentState.targetKey) {
+          return evt.targetKey === currentState.targetKey;
+        }
+        if (evt.windowId && currentState.windowId && Number(evt.windowId) !== Number(currentState.windowId)) {
+          return false;
+        }
+        if (!currentState.activeApp || !evt.targetApp) return true;
+        const evtApp = String(evt.targetApp).toLowerCase();
+        return (
+          evtApp === String(currentState.activeApp).toLowerCase() ||
+          (currentState.bundleId && evtApp === String(currentState.bundleId).toLowerCase()) ||
+          (currentState.appDisplayName && String(evt.app || "").toLowerCase() === String(currentState.appDisplayName).toLowerCase())
+        );
+      }
+
+      function handleActionEvent(evt) {
+        if (!evt) return;
+        const onCurrentView = isEventTargetingCurrentView(evt);
+        const prefix =
+          evt.type === "takeover"
+            ? "人类接管"
+            : evt.source === "ui"
+              ? "手动"
+              : !onCurrentView && evt.app
+                ? `AI (${evt.app})`
+                : "AI";
+        showToast(`${prefix} · ${evt.label}`);
+        if (!onCurrentView || evt.type === "takeover") {
+          return;
+        }
+        const previewCrop = currentState.previewGeometry?.previewContentRectPt;
+        if (evt.windowPointPt && previewCrop && window.CUAPreviewVideo?.projectCursor) {
+          const projected = window.CUAPreviewVideo.projectCursor(evt.windowPointPt, previewCrop);
+          if (projected.visible) {
+            showCursorAt(projected.normX, projected.normY, evt.label, evt.type === "click");
+          }
+          return;
+        }
+        if (Number.isFinite(evt.normX) && Number.isFinite(evt.normY)) {
+          showCursorAt(evt.normX, evt.normY, evt.label, evt.type === "click");
+        }
+      }
+
+      function connectEvents() {
+        const es = new EventSource(withToken("/api/events"));
+        es.addEventListener("state", (e) => {
+          try { applyState(JSON.parse(e.data)); } catch {}
+        });
+        es.addEventListener("frame", (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            syncBootId(d.brokerBootId);
+            if (d.targetKey) currentState.targetKey = d.targetKey;
+            if (d.geometryRev) currentState.geometryRev = d.geometryRev;
+            if (d.windowId) currentState.windowId = d.windowId;
+            currentState.frameSeq = d.frameSeq;
+            if (localVideoMode !== "h264") {
+              if (d.width) currentState.frameWidth = d.width;
+              if (d.height) currentState.frameHeight = d.height;
+              if (d.latencyMs) currentState.frameLatencyMs = d.latencyMs;
+              renderWinMeta();
+              loadFrame(d.frameSeq, d.frameRef || null);
+            }
+          } catch {}
+        });
+        es.addEventListener("action", (e) => {
+          try { handleActionEvent(JSON.parse(e.data)); } catch {}
+        });
+        es.onerror = () => {
+          es.close();
+          setTimeout(connectEvents, 1500);
+        };
+      }
+
+      fetch(withToken("/api/state"))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((s) => { if (s) applyState(s); })
+        .catch(() => {});
+      connectEvents();
+
+      appSelect.addEventListener("change", async () => {
+        const app = appSelect.value;
+        if (!app) return;
+        clearDisplayedCanvas();
+        bumpViewGeneration();
+        try {
+          const next = await apiPost("/api/select-app", { app });
+          applyState(next);
+        } catch {}
+      });
+
+      windowSelect.addEventListener("change", async () => {
+        const app = currentState.activeApp || appSelect.value;
+        if (!app) return;
+        const widVal = windowSelect.value ? Number(windowSelect.value) : null;
+        clearDisplayedCanvas();
+        bumpViewGeneration();
+        try {
+          const next = await apiPost("/api/select-app", { app, windowId: widVal });
+          applyState(next);
+        } catch {}
+      });
+
+      refreshAppsBtn.addEventListener("click", async () => {
+        try {
+          const next = await apiPost("/api/refresh-apps");
+          applyState(next);
+        } catch {}
+      });
+
+      followBtn.addEventListener("click", async () => {
+        try {
+          const next = await apiPost("/api/settings", { followAi: !currentState.followAi });
+          applyState(next);
+        } catch {}
+      });
+
+      pauseBtn.addEventListener("click", async () => {
+        try {
+          const body = currentState.paused
+            ? { paused: false, expectedPauseEpoch: currentState.pauseEpoch ?? 0 }
+            : { paused: true };
+          const next = await apiPost("/api/settings", body);
+          applyState(next);
+        } catch {
+          try {
+            const r = await fetch(withToken("/api/state"));
+            if (r.ok) applyState(await r.json());
+          } catch {}
+        }
+      });
+
+      frontBtn.addEventListener("click", async () => {
+        try {
+          await apiPost("/api/bring-to-front", { app: currentState.activeApp });
+        } catch {}
+      });
+
+      logToggle.addEventListener("click", () => {
+        logDrawer.classList.toggle("open");
+      });
+
+      function nextIntentId() {
+        if (typeof crypto?.randomUUID === "function") return crypto.randomUUID();
+        return `ui-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+      }
+
+      let pendingPointerClaim = null;
+
+      function takeOrCreateIntentId(app) {
+        const now = Date.now();
+        if (
+          pendingPointerClaim &&
+          pendingPointerClaim.app === app &&
+          now - pendingPointerClaim.ts <= 1200
+        ) {
+          const id = pendingPointerClaim.intentId;
+          pendingPointerClaim = null;
+          return id;
+        }
+        pendingPointerClaim = null;
+        return nextIntentId();
+      }
+
+      function canvasCoords(e) {
+        const geom = getVisibleContentRectOnCanvas();
+        if (!geom) return null;
+        if (window.CUAPreviewVideo?.pointerToNormalizedContent) {
+          return window.CUAPreviewVideo.pointerToNormalizedContent(
+            e.clientX - geom.rect.left,
+            e.clientY - geom.rect.top,
+            geom.visible
+          );
+        }
+        const relX = (e.clientX - geom.rect.left) / geom.rect.width;
+        const relY = (e.clientY - geom.rect.top) / geom.rect.height;
+        if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return null;
+        return { normX: relX, normY: relY };
+      }
+
+      function buildInteractionTarget({ requireRenderedFrame = false } = {}) {
+        const appId = currentAppIdentity();
+        if (!currentState.activeApp || !appId) return null;
+        if (requireRenderedFrame) {
+          if (currentState.previewReadOnly || currentState.streamPaused) {
+            return null;
+          }
+          if (
+            !displayedFrameSeq ||
+            !displayedFrameApp ||
+            !displayedFrameRef ||
+            displayedFrameApp !== appId ||
+            (currentState.brokerBootId && displayedFrameBoot !== currentState.brokerBootId)
+          ) {
+            return null;
+          }
+          return {
+            app: displayedFrameApp,
+            brokerBootId: displayedFrameBoot || currentState.brokerBootId || undefined,
+            frameRef: displayedFrameRef,
+            viewId: videoCtrl?.viewId || undefined,
+            windowId: currentState.windowId || undefined,
+            requireActiveMatch: true,
+            gen: viewGeneration,
+          };
+        }
+        return {
+          app: currentState.activeApp,
+          brokerBootId: currentState.brokerBootId || undefined,
+          requireActiveMatch: true,
+          gen: viewGeneration,
+        };
+      }
+
+      canvas.addEventListener("mousedown", (e) => {
+        if (e.button !== 0 && e.button !== 2) return;
+        const pt = canvasCoords(e);
+        const target = buildInteractionTarget({ requireRenderedFrame: true });
+        if (!pt || !target) return;
+        const intentId = nextIntentId();
+        pendingPointerClaim = { intentId, app: target.app, ts: Date.now() };
+        apiPost("/api/takeover-claim", {
+          app: target.app,
+          brokerBootId: target.brokerBootId,
+          requireActiveMatch: true,
+          intentId,
+        })
+          .then((res) => {
+            if (res?.state) applyState(res.state);
+          })
+          .catch(() => {});
+      });
+
+      canvas.addEventListener("click", (e) => {
+        if (e.detail > 1) return;
+        const pt = canvasCoords(e);
+        const target = buildInteractionTarget({ requireRenderedFrame: true });
+        if (!pt || !target) return;
+        const intentId = takeOrCreateIntentId(target.app);
+        cancelPendingSingleClick();
+        singleClickTimer = setTimeout(() => {
+          singleClickTimer = null;
+          if (target.gen !== viewGeneration || displayedFrameApp !== target.app) return;
+          apiPost("/api/interact", {
+            app: target.app,
+            brokerBootId: target.brokerBootId,
+            frameRef: target.frameRef,
+            viewId: target.viewId,
+            windowId: target.windowId,
+            requireActiveMatch: true,
+            intentId,
+            kind: "click",
+            normX: pt.normX,
+            normY: pt.normY,
+            button: "left",
+            clickCount: 1,
+          }).catch(() => {});
+        }, 240);
+      });
+
+      canvas.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        cancelPendingSingleClick();
+        const pt = canvasCoords(e);
+        const target = buildInteractionTarget({ requireRenderedFrame: true });
+        if (!pt || !target) return;
+        const intentId = takeOrCreateIntentId(target.app);
+        apiPost("/api/interact", {
+          app: target.app,
+          brokerBootId: target.brokerBootId,
+          frameRef: target.frameRef,
+          viewId: target.viewId,
+          windowId: target.windowId,
+          requireActiveMatch: true,
+          intentId,
+          kind: "click",
+          normX: pt.normX,
+          normY: pt.normY,
+          button: "left",
+          clickCount: 2,
+        }).catch(() => {});
+      });
+
+      canvas.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const pt = canvasCoords(e);
+        const target = buildInteractionTarget({ requireRenderedFrame: true });
+        if (!pt || !target) return;
+        const intentId = takeOrCreateIntentId(target.app);
+        apiPost("/api/interact", {
+          app: target.app,
+          brokerBootId: target.brokerBootId,
+          frameRef: target.frameRef,
+          viewId: target.viewId,
+          windowId: target.windowId,
+          requireActiveMatch: true,
+          intentId,
+          kind: "click",
+          normX: pt.normX,
+          normY: pt.normY,
+          button: "right",
+          clickCount: 1,
+        }).catch(() => {});
+      });
+
+      let scrollBusy = false;
+      canvas.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const target = buildInteractionTarget({ requireRenderedFrame: true });
+        if (scrollBusy || !target) return;
+        const pt = canvasCoords(e);
+        if (!pt) return;
+        const absY = Math.abs(e.deltaY);
+        const absX = Math.abs(e.deltaX);
+        if (absY < 4 && absX < 4) return;
+        scrollBusy = true;
+        const direction = absY >= absX ? (e.deltaY > 0 ? "down" : "up") : (e.deltaX > 0 ? "right" : "left");
+        const pages = Math.min(1.2, Math.max(0.18, Math.max(absY, absX) / 260));
+        apiPost("/api/interact", {
+          app: target.app,
+          brokerBootId: target.brokerBootId,
+          frameRef: target.frameRef,
+          viewId: target.viewId,
+          windowId: target.windowId,
+          requireActiveMatch: true,
+          intentId: nextIntentId(),
+          kind: "scroll",
+          direction,
+          pages,
+          normX: pt.normX,
+          normY: pt.normY,
+        })
+          .catch(() => {})
+          .finally(() => {
+            setTimeout(() => { scrollBusy = false; }, 110);
+          });
+      }, { passive: false });
+
+      async function submitText() {
+        const text = typeInput.value;
+        const target = buildInteractionTarget();
+        if (!text || !target) return;
+        try {
+          await apiPost("/api/interact", {
+            app: target.app,
+            brokerBootId: target.brokerBootId,
+            requireActiveMatch: true,
+            intentId: nextIntentId(),
+            kind: "type_text",
+            text,
+          });
+          typeInput.value = "";
+        } catch {}
+      }
+
+      sendTextBtn.addEventListener("click", submitText);
+      typeInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.isComposing) {
+          e.preventDefault();
+          submitText();
+        }
+      });
+
+      document.querySelectorAll(".key-chip").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const key = btn.getAttribute("data-key");
+          const target = buildInteractionTarget();
+          if (key && target) {
+            apiPost("/api/interact", {
+              app: target.app,
+              brokerBootId: target.brokerBootId,
+              requireActiveMatch: true,
+              intentId: nextIntentId(),
+              kind: "press_key",
+              key,
+            }).catch(() => {});
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

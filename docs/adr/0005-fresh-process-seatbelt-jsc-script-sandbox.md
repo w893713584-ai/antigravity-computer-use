@@ -1,0 +1,3 @@
+# Fresh-Process Seatbelt and Hardened JSC Script Sandbox
+
+We execute each `computer-use-js` turn inside a freshly spawned `CUAScriptRunner.app` child confined by macOS Seatbelt (`sandbox_init` denying default network, filesystem, and Mach lookups) and Hardened JavaScriptCore (JIT/WASM disabled, primordials frozen, `eval`/`Function` disabled, CPU watchdog + `RLIMIT_CPU`) while persisting only bounded serializable JSON bindings and Broker-issued app handle descriptors across turns and disabling unsandboxed Node VM fallback in production. Spawning a new process per turn avoids proving that abandoned timers, microtasks, or closures from a cancelled turn cannot retain capability handles across unpauses or epoch resets.

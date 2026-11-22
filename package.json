@@ -1,0 +1,43 @@
+{
+  "name": "codex-style-computer-use",
+  "version": "1.0.0",
+  "description": "Codex-style non-intrusive background Computer Use broker, MCP servers, and Antigravity Aux Pane live mini-window sidecar.",
+  "type": "module",
+  "license": "MIT",
+  "author": "w893713584-ai",
+  "homepage": "https://github.com/w893713584-ai/antigravity-computer-use#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/w893713584-ai/antigravity-computer-use.git"
+  },
+  "bugs": {
+    "url": "https://github.com/w893713584-ai/antigravity-computer-use/issues"
+  },
+  "keywords": [
+    "antigravity",
+    "computer-use",
+    "mcp",
+    "macos",
+    "accessibility",
+    "sidecar",
+    "codex",
+    "automation"
+  ],
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "pretest": "node scripts/build-native.mjs --if-missing",
+    "test": "node --test test/*.test.mjs",
+    "install-agy": "node scripts/install-agy.mjs",
+    "uninstall-agy": "node scripts/uninstall-agy.mjs",
+    "pack-share": "node scripts/pack-share.mjs",
+    "start:sidecar": "node src/broker-sidecar.mjs",
+    "start:mcp": "node src/mcp-server.mjs",
+    "start:mcp-js": "node src/mcp-repl-server.mjs"
+  },
+  "optionalDependencies": {
+    "open-computer-use": "^1.1.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

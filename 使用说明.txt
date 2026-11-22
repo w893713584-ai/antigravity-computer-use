@@ -1,0 +1,29 @@
+【Codex 风格 Computer Use 一键安装说明（macOS 14.0+ / Antigravity）】
+
+功能效果：
+1. AI 操作任何桌面窗口时全程在后台进行，不把窗口弹到最前面、不抢鼠标键盘焦点、无桌面悬浮光标。
+2. 对话框右侧自动附上「Computer Use 小窗」入口，点开即可实时查看后台窗口画面、AI 虚拟光标与点击波纹，也支持直接在小窗里点击/滚动/打字/暂停 AI/一键置顶。
+
+==================== 安装步骤 ====================
+
+前置要求：macOS 14.0 (Sonoma) 或更高版本，已安装 Antigravity 与 Node.js（>= 18）。
+
+• 推荐方式一（终端一行命令，100% 绕过微信文件在 macOS 15 Sequoia 上的安全拦截）：
+  1. 解压本压缩包；
+  2. 打开「终端 (Terminal)」，输入 bash 加一个空格（即 `bash `）；
+  3. 把解压出来的「双击安装.command」拖进终端窗口，按回车即可一键装好！
+
+• 方式二（Finder 打开）：
+  - macOS 14 Sonoma：在「双击安装.command」上【右键 → 打开】，弹窗中再点一次「打开」。
+  - macOS 15 Sequoia 及以上：双击后若系统提示无法验证开发者，打开「系统设置 → 隐私与安全性」，拉到底部点击「仍要打开」即可。
+
+提示：
+- 安装程序会自动把插件完整部署到 ~/.gemini/codex-style-computer-use 并热刷新 Antigravity，装完后下载的压缩包和解压文件夹可随时删除。
+- 首次使用请在「系统设置 → 隐私与安全性」完成以下授权（未全部开启也能在基础模式使用，但推荐一次配齐）：
+  1.「辅助功能 (Accessibility)」：勾选 Antigravity.app、Open Computer Use.app，以及下方 CUADesktopHelper.app；
+  2.「录屏与系统录音 (Screen Recording)」：勾选 Open Computer Use.app 与下方 CUADesktopHelper.app（开启 H.264 实时硬件视频流）；
+  3.「输入监控 (Input Monitoring)」：勾选下方 CUADesktopHelper.app（开启精准人工接管刹车与急停热键）。
+  * CUADesktopHelper.app 路径（在列表点击「+」后按 Command+Shift+G 粘贴前往）：
+    ~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app
+  * 注：因原生助手当前为本地 ad-hoc 签名，若覆盖重装了新版且开关已显示打开但仍提示缺权限，请先选中 CUADesktopHelper 点左下角「−」移出，再点「+」重新添加一次即可。
+- 如需卸载还原，随时运行「双击卸载.command」（或 `bash ~/.gemini/codex-style-computer-use/双击卸载.command`）即可干净恢复原状。

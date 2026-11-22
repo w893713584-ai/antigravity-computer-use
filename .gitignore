@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.DS_Store
+native-runtime/
+native-payloads/
+native/ScriptRunner/GeneratedEmbeddedAssets.swift
+.previous-mcp-entries.json
+*.log
+.env
+.env.*

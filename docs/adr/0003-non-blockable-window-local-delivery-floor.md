@@ -1,0 +1,3 @@
+# Non-Blockable Window-Local Delivery Floor
+
+We exempt `window_post` (`SLEventPostToPid` with window-local coordinates) and `window_key` from adaptive Delivery Route blacklisting even when a clicked UI control triggers a Focus Steal reclaimed by the Focus Guard. Unlike `sky_click` and `sky_key` (which emit SkyLight `0x0d` synthetic activation), `window_post` emits zero synthetic focus events and is the only non-activating Delivery Route capable of reaching Qt `QQuickWidget` subsurfaces (such as Jianying Pro panels); downgrading `window_post` to `app_post` (`CGEventPostToPid`) after a dialog button self-activates would silently break all subsequent `QQuickWidget` interactions.

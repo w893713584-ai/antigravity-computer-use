@@ -1,0 +1,29 @@
+(version 1)
+(deny default)
+
+(allow file-read-metadata
+  (literal "/")
+  (literal "/System")
+  (literal "/System/Library")
+  (literal "/usr")
+  (literal "/usr/share"))
+
+(allow file-read* file-map-executable
+  (subpath "/System/Library/Frameworks")
+  (subpath "/usr/lib")
+  (subpath "/System/Library/dyld")
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"))
+
+(allow file-read*
+  (subpath "/usr/share/icu")
+  (subpath "/usr/share/zoneinfo")
+  (subpath "/private/var/db/timezone/zoneinfo"))
+
+(allow sysctl-read
+  (sysctl-name "hw.ncpu")
+  (sysctl-name "hw.logicalcpu")
+  (sysctl-name "hw.physicalcpu")
+  (sysctl-name "hw.pagesize")
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "hw.memsize")
+  (sysctl-name "hw.cachelinesize"))

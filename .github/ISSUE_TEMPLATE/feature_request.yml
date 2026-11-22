@@ -1,0 +1,19 @@
+name: Feature Request / 功能建议
+description: Propose a new capability or improvement / 提出新功能或体验改进建议
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use Case & Problem / 使用场景与想解决的问题
+      placeholder: "What problem are you trying to solve?"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution / 期望实现方案
+      placeholder: "How should this work while staying non-intrusive in the background?"
+    validations:
+      required: true

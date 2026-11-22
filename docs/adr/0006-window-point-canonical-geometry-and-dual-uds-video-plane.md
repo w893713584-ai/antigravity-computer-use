@@ -1,0 +1,3 @@
+# Window-Local Point Canonical Geometry and Dual-UDS Video Plane
+
+We standardize `PreviewGeometry` on Window-Local Points across H.264 streams, JPEG previews, and action screenshots — rejecting out-of-content black-bar clicks, refusing arbitrary coordinate writes (`409 UNPROVEN_SAME_WINDOW` / `STALE_VIEW`) unless same-window dispatch is proven, and decoupling video frame dimensions from screenshot freshness — and separate `CUADesktopHelper` control NDJSON and `CUV1` H.264 video packets across two Unix Domain Sockets feeding per-subscriber backpressure queues on the same HTTP/WebSocket port. Dual sockets ensure large IDR keyframes or a stalled WebCodecs viewer never delay human-takeover sensor events on the control channel.

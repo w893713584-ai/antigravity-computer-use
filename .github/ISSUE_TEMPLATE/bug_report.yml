@@ -1,0 +1,49 @@
+name: Bug Report / 问题反馈
+description: Report a bug in background control, Mini-Window streaming, sandbox, or installer / 反馈后台控制、小窗推流、沙箱或安装问题
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量补充环境与复现信息，方便定位 macOS TCC 权限或窗口交互问题。
+        Thanks for reporting! Please share your macOS environment and steps to reproduce.
+  - type: input
+    id: macos_version
+    attributes:
+      label: macOS Version & Chip / 系统版本与芯片
+      placeholder: "e.g. macOS 15.2 (arm64 / M3)"
+    validations:
+      required: true
+  - type: input
+    id: node_version
+    attributes:
+      label: Node.js Version / Node.js 版本
+      placeholder: "e.g. v22.11.0"
+    validations:
+      required: true
+  - type: input
+    id: target_app
+    attributes:
+      label: Target Application / 目标应用（如适用）
+      placeholder: "e.g. Finder, Safari, Chrome, Jianying..."
+  - type: checkboxes
+    id: tcc_permissions
+    attributes:
+      label: Granted macOS Permissions / 已开启的系统权限
+      options:
+        - label: Accessibility / 辅助功能
+        - label: Screen Recording / 录屏与系统录音
+        - label: Input Monitoring / 输入监控
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug / 问题描述与复现步骤
+      placeholder: "1. ... 2. ... Expected vs actual behavior"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or Test Output / 日志或错误输出（请脱敏个人路径）
+      render: shell
