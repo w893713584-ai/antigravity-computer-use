@@ -1538,14 +1538,17 @@ test("Slice 4 (Post-Review Regressions): Independent overlap preservation, cross
               text: JSON.stringify({
                 window_id: args?.window_id || 1323,
                 window_title: "剪映专业版",
-                matches: [
-                  {
-                    index: 1000039,
-                    role: "AXStaticText",
-                    title: args?.text || "模板",
-                    bounds: { x: 62, y: 252, w: 28, h: 17 },
-                  },
-                ],
+                matches:
+                  !args?.text || args.text === "模板"
+                    ? [
+                        {
+                          index: 1000039,
+                          role: "AXStaticText",
+                          title: "模板",
+                          bounds: { x: 62, y: 252, w: 28, h: 17 },
+                        },
+                      ]
+                    : [],
               }),
             },
           ],
