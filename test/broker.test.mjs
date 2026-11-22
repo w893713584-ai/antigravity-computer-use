@@ -291,9 +291,11 @@ test("Stream loop stops and detaches instead of auto-relaunching when user quits
     await new Promise((r) => setTimeout(r, 180));
 
     // 3. User quits Gemini (Cmd+Q): process exits
-    appAlive = false;
     await new Promise((resolve) => {
-      dummyProc.once("exit", resolve);
+      dummyProc.once("exit", () => {
+        appAlive = false;
+        resolve();
+      });
       dummyProc.kill("SIGKILL");
     });
 
