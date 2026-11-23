@@ -97,6 +97,7 @@ export async function resolveFocusedWindowObservation({
         windowBounds: helperObs.windowBounds || null,
         windowIds: toPositiveIds(helperObs.windowIds),
         ...(helperObs.focusedExcludedWindow ? { focusedExcludedWindow: true } : {}),
+        ...(helperObs.hasAuxOnScreenWindows ? { hasAuxOnScreenWindows: true } : {}),
       };
     }
   }
@@ -110,12 +111,16 @@ export async function resolveFocusedWindowObservation({
       const focusedExcluded = Boolean(
         axObs.focusedExcludedWindow || helperObs?.focusedExcludedWindow
       );
+      const hasAuxOnScreenWindows = Boolean(
+        axObs.hasAuxOnScreenWindows || helperObs?.hasAuxOnScreenWindows
+      );
       return {
         wid: Number(axObs.wid) > 0 ? Number(axObs.wid) : null,
-        title: axObs.title || null,
-        windowBounds: axObs.windowBounds || null,
+        title: axObs.title || helperObs?.title || null,
+        windowBounds: axObs.windowBounds || helperObs?.windowBounds || null,
         windowIds: axIds?.length ? axIds : helperWindowIds,
         ...(focusedExcluded ? { focusedExcludedWindow: true } : {}),
+        ...(hasAuxOnScreenWindows ? { hasAuxOnScreenWindows: true } : {}),
       };
     }
   }
@@ -126,6 +131,7 @@ export async function resolveFocusedWindowObservation({
       windowBounds: helperObs.windowBounds || null,
       windowIds: helperWindowIds || [],
       ...(helperObs.focusedExcludedWindow ? { focusedExcludedWindow: true } : {}),
+      ...(helperObs.hasAuxOnScreenWindows ? { hasAuxOnScreenWindows: true } : {}),
     };
   }
   if (
@@ -135,9 +141,35 @@ export async function resolveFocusedWindowObservation({
   ) {
     const wins = await desktopHelperClient.listWindows(numPid).catch(() => null);
     if (Array.isArray(wins) && wins.length > 0) {
-      const windowIds = toPositiveIds(wins.map((w) => w?.windowId || w?.wid));
+      const mainWins = wins.filter((w) => {
+        const layer = Number(w?.layer ?? 0);
+        const bw = Number(w?.boundsPt?.width ?? w?.boundsPt?.w ?? 0);
+        const bh = Number(w?.boundsPt?.height ?? w?.boundsPt?.h ?? 0);
+        return layer === 0 && bw >= 120 && bh >= 80;
+      });
+      const windowIds = toPositiveIds(
+        (mainWins.length > 0 ? mainWins : wins).map((w) => w?.windowId || w?.wid)
+      );
+      const mainIdSet = new Set(mainWins.map((w) => Number(w?.windowId || w?.wid || 0)).filter((x) => x > 0));
+      const hasAuxOnScreenWindows =
+        mainWins.length > 0 &&
+        wins.some((w) => {
+          const id = Number(w?.windowId || w?.wid || 0);
+          if (mainIdSet.has(id)) return false;
+          const layer = Number(w?.layer ?? 0);
+          const bw = Number(w?.boundsPt?.width ?? w?.boundsPt?.w ?? 0);
+          const bh = Number(w?.boundsPt?.height ?? w?.boundsPt?.h ?? 0);
+          return layer >= 0 && layer < 25 && bw >= 40 && bh >= 30;
+        });
       if (windowIds?.length) {
-        return { wid: null, windowIds };
+        return {
+          wid: null,
+          title: mainWins.length === 1 && !hasAuxOnScreenWindows ? mainWins[0]?.title || null : null,
+          windowBounds:
+            mainWins.length === 1 && !hasAuxOnScreenWindows ? mainWins[0]?.boundsPt || null : null,
+          windowIds,
+          ...(hasAuxOnScreenWindows ? { hasAuxOnScreenWindows: true } : {}),
+        };
       }
     }
   }
@@ -250,6 +282,7 @@ export function evaluateScreenshotMetaProof(
   );
   const liveMultiWindow = Boolean(
     liveFocusedExcluded ||
+      liveWindowObs?.hasAuxOnScreenWindows === true ||
       (liveWindowIds &&
         (liveWindowIds.length !== 1 || (shotWid > 0 && Number(liveWindowIds[0]) !== shotWid)))
   );
@@ -845,7 +878,6 @@ export class AppSnapshotRegistry {
 
     const isPinnedRef = Boolean(parsedRef.snapshotId);
     const isNativeQueryAlias =
-      !isPinnedRef &&
       validatedElement?.origin === "query" &&
       Number(parsedRef.rawIndex) >= 1_000_000;
 
@@ -872,8 +904,14 @@ export class AppSnapshotRegistry {
         verifyErr = err;
       }
 
+      let jxaUntrusted =
+        !verifyErr &&
+        (liveCheck?.reason === "jxa_accessibility_untrusted" ||
+          liveCheck?.skipped === "jxa_accessibility_untrusted");
+
       const needsRebind =
         isPinnedRef &&
+        !jxaUntrusted &&
         (Boolean(verifyErr) ||
           liveCheck?.skipped === "snapshot_not_retained" ||
           liveCheck?.skipped === "element_not_bound");
@@ -896,17 +934,41 @@ export class AppSnapshotRegistry {
             elements: targetElements,
           })
           .catch(() => null);
-        if (rebound?.bound) {
+        if (rebound?.reason === "jxa_accessibility_untrusted") {
+          jxaUntrusted = true;
+        } else if (rebound?.bound) {
           verifyErr = null;
           try {
             liveCheck = await callVerify();
           } catch (err2) {
             verifyErr = err2;
           }
+          if (
+            !verifyErr &&
+            (liveCheck?.reason === "jxa_accessibility_untrusted" ||
+              liveCheck?.skipped === "jxa_accessibility_untrusted")
+          ) {
+            jxaUntrusted = true;
+          }
         }
       }
 
-      if (verifyErr) {
+      if (
+        !jxaUntrusted &&
+        !verifyErr &&
+        (liveCheck?.skipped === "snapshot_not_retained" ||
+          liveCheck?.skipped === "element_not_bound") &&
+        typeof this.#axBridge.checkPermissions === "function"
+      ) {
+        const perms = await this.#axBridge.checkPermissions().catch(() => null);
+        if (perms && perms.accessibility === false) {
+          jxaUntrusted = true;
+        }
+      }
+
+      if (jxaUntrusted) {
+        liveCheck = { ok: true, skipped: "jxa_accessibility_untrusted" };
+      } else if (verifyErr) {
         if (isPinnedRef) {
           liveCheck = {
             ok: false,
@@ -1111,21 +1173,42 @@ export class AppSnapshotRegistry {
     const windowCount = Array.isArray(obs?.windowIds) ? obs.windowIds.length : null;
     const obsWid = Number(obs?.wid || 0);
     const parsedWid = Number(parsedWindowId || 0);
+    const canUseSoleVisibleWindow =
+      !(obsWid > 0) &&
+      windowCount === 1 &&
+      Number(obs.windowIds[0]) > 0 &&
+      obs?.focusedExcludedWindow !== true &&
+      obs?.hasAuxOnScreenWindows !== true;
+    const candidateWid = obsWid > 0 ? obsWid : canUseSoleVisibleWindow ? Number(obs.windowIds[0]) : 0;
     const preWid = Number(preObs?.wid || 0);
     const preIds = Array.isArray(preObs?.windowIds)
       ? preObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
       : null;
-    const preStable = Boolean(
-      !(hadPrePid && !preWid && parsedWid === 0) &&
-      !(preWid > 0 && obsWid > 0 && preWid !== obsWid) &&
-        !(preIds && preIds.length > 0 && (preIds.length !== 1 || (obsWid > 0 && preIds[0] !== obsWid)))
+    const preSoleWidMatches = Boolean(
+      candidateWid > 0 &&
+        preObs &&
+        preObs.focusedExcludedWindow !== true &&
+        preObs.hasAuxOnScreenWindows !== true &&
+        preIds?.length === 1 &&
+        preIds[0] === candidateWid
     );
-    const parsedWidMatches = !(parsedWid > 0 && obsWid > 0 && parsedWid !== obsWid);
+    const preStable = Boolean(
+      !(hadPrePid && !preWid && !preSoleWidMatches && parsedWid === 0) &&
+        !(preWid > 0 && candidateWid > 0 && preWid !== candidateWid) &&
+        !(preObs?.focusedExcludedWindow === true) &&
+        !(!(preWid > 0) && preObs?.hasAuxOnScreenWindows === true) &&
+        !(
+          preIds &&
+          preIds.length > 0 &&
+          (preIds.length !== 1 || (candidateWid > 0 && preIds[0] !== candidateWid))
+        )
+    );
+    const parsedWidMatches = !(parsedWid > 0 && candidateWid > 0 && parsedWid !== candidateWid);
     const cleanExpectedTitle = String(windowTitle || "").trim();
     const cleanObservedTitle = String(obs?.title || "").trim();
     const titleConsistent =
       !cleanExpectedTitle || !cleanObservedTitle || cleanExpectedTitle === cleanObservedTitle;
-    if (obsWid > 0 && obs?.windowBounds) {
+    if (candidateWid > 0 && obs?.windowBounds) {
       const obW = Number(obs.windowBounds.width ?? obs.windowBounds.w ?? 0);
       const obH = Number(obs.windowBounds.height ?? obs.windowBounds.h ?? 0);
       if (
@@ -1133,15 +1216,16 @@ export class AppSnapshotRegistry {
         obH > 0 &&
         hasMatchingAspectRatio(obW, obH, iw, ih, 0.03) &&
         windowCount === 1 &&
-        Number(obs.windowIds[0]) === obsWid &&
+        Number(obs.windowIds[0]) === candidateWid &&
         preStable &&
         obs?.focusedExcludedWindow !== true &&
+        !(!(obsWid > 0) && obs?.hasAuxOnScreenWindows === true) &&
         parsedWidMatches &&
         titleConsistent
       ) {
         return {
           proven: true,
-          windowId: obsWid,
+          windowId: candidateWid,
           windowBounds: obs.windowBounds,
           windowCount: 1,
           singleWindowProven: true,

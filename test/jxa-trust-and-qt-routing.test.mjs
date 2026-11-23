@@ -22,6 +22,7 @@ import { BRIDGE_JXA_SOURCE, PersistentAxBridge } from "../src/ax-bridge.mjs";
 import {
   dispatchBackgroundPointClickDetailed,
   dispatchBackgroundPointDragDetailed,
+  parseSnapshotMetadata,
 } from "../src/background-policy.mjs";
 import { ComputerUseBrokerServer } from "../src/broker-sidecar.mjs";
 import {
@@ -4856,5 +4857,353 @@ test("R11 fixes: focusedExcludedWindow propagation, #resolveLiveWindowObs fallba
     rmSync(sockR11, { force: true });
   }
 });
+
+test("v1.1.3 Regressions: pinned @sN:100000x & untrusted JXA validation, off-screen Qt 6 window filtering, and single-visible-window coord click under accessibilityTrusted=false", async () => {
+  // 1) JXA VM: off-screen layer=0 Qt backing windows excluded via OnScreenOnly & kCGWindowIsOnscreen;
+  //    sole visible window exposes windowBounds even when AX focus is unavailable, while visible aux panel blocks fallback.
+  let seenCgOpts = null;
+  const { sandbox: sQt } = createJxaHarness({ axTrusted: false, axWindows: {} });
+  sQt.$.CGWindowListCopyWindowInfo = (opts) => {
+    seenCgOpts = opts;
+    return [
+      {
+        kCGWindowNumber: 5789,
+        kCGWindowOwnerPID: 75189,
+        kCGWindowLayer: 0,
+        kCGWindowAlpha: 1,
+        kCGWindowIsOnscreen: false,
+        kCGWindowName: "",
+        kCGWindowBounds: { X: 0, Y: 0, Width: 800, Height: 600 },
+      },
+      {
+        kCGWindowNumber: 5788,
+        kCGWindowOwnerPID: 75189,
+        kCGWindowLayer: 0,
+        kCGWindowAlpha: 1,
+        kCGWindowIsOnscreen: false,
+        kCGWindowName: "",
+        kCGWindowBounds: { X: 0, Y: 0, Width: 800, Height: 600 },
+      },
+      {
+        kCGWindowNumber: 5780,
+        kCGWindowOwnerPID: 75189,
+        kCGWindowLayer: 0,
+        kCGWindowAlpha: 1,
+        kCGWindowIsOnscreen: true,
+        kCGWindowName: "",
+        kCGWindowBounds: { X: 151, Y: 58, Width: 1168, Height: 780 },
+      },
+    ];
+  };
+  const qtObs = sQt.handleFocusedWindow({ pid: 75189 });
+  assert.equal(seenCgOpts, 17, "listVisiblePidCgWindows must query OnScreenOnly | ExcludeDesktopElements (17)");
+  assert.equal(qtObs.wid, null);
+  assert.deepEqual(Array.from(qtObs.windowIds), [5780], "Off-screen Qt backing windows must be excluded");
+  assert.deepEqual({ ...qtObs.windowBounds }, { x: 151, y: 58, w: 1168, h: 780 });
+  assert.equal(Boolean(qtObs.hasAuxOnScreenWindows), false);
+
+  // Untrusted JXA bindSnapshot & verifyLiveRef report jxa_accessibility_untrusted instead of snapshot_not_retained
+  const untrustedBind = sQt.handleBindSnapshot({ snapshotId: "s6", pid: 75189, elements: [] });
+  assert.equal(untrustedBind.bound, false);
+  assert.equal(untrustedBind.reason, "jxa_accessibility_untrusted");
+  const untrustedVerify = sQt.handleVerifyLiveRef({ snapshotId: "s6", elementIndex: "2", requireBound: true });
+  assert.equal(untrustedVerify.ok, false);
+  assert.equal(untrustedVerify.reason, "jxa_accessibility_untrusted");
+
+  // With a visible floating aux window alongside sole main window, untrusted fallback must refuse sole windowBounds
+  sQt.$.CGWindowListCopyWindowInfo = () => [
+    {
+      kCGWindowNumber: 5780,
+      kCGWindowOwnerPID: 75189,
+      kCGWindowLayer: 0,
+      kCGWindowAlpha: 1,
+      kCGWindowIsOnscreen: true,
+      kCGWindowName: "",
+      kCGWindowBounds: { X: 151, Y: 58, Width: 1168, Height: 780 },
+    },
+    {
+      kCGWindowNumber: 5901,
+      kCGWindowOwnerPID: 75189,
+      kCGWindowLayer: 3,
+      kCGWindowAlpha: 1,
+      kCGWindowIsOnscreen: true,
+      kCGWindowName: "AI Ultra",
+      kCGWindowBounds: { X: 300, Y: 200, Width: 320, Height: 180 },
+    },
+  ];
+  const qtAuxObs = sQt.handleFocusedWindow({ pid: 75189 });
+  assert.equal(qtAuxObs.wid, null);
+  assert.equal(qtAuxObs.windowBounds, null);
+  assert.equal(qtAuxObs.hasAuxOnScreenWindows, true);
+
+  // 2) Registry: untrusted JXA allows fresh pinned @sN:index while still failing stale snapshots;
+  //    proveScreenshotWindowObservation proves sole visible window without AX focus and rejects aux/mismatch/null preObs.
+  const untrustedReg = new AppSnapshotRegistry({
+    axBridge: {
+      enabled: true,
+      async checkPermissions() {
+        return { accessibility: false };
+      },
+      async bindSnapshot() {
+        return { bound: false, boundCount: 0, windowBound: false, reason: "jxa_accessibility_untrusted" };
+      },
+      async verifyLiveRef() {
+        return { ok: false, skipped: "jxa_accessibility_untrusted", reason: "jxa_accessibility_untrusted" };
+      },
+      async getFocusedWindowInfo() {
+        return {
+          wid: null,
+          title: null,
+          windowBounds: { x: 151, y: 58, w: 1168, h: 780 },
+          windowIds: [5780],
+        };
+      },
+    },
+  });
+  const regSnap = untrustedReg.recordMeta(
+    "com.lemon.lvpro",
+    parseSnapshotMetadata(
+      [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "剪映专业版", App: 剪映专业版.', "\t2 button 开始创作"].join("\n")
+    ),
+    { fromActionPeer: true, includeAx: true, includeScreenshot: false }
+  );
+  const pinnedUntrustedOk = await untrustedReg.validateTargetRef({
+    app: "com.lemon.lvpro",
+    parsedRef: { ok: true, hasElementRef: true, snapshotId: regSnap.snapshotId, rawIndex: "2", displayRef: `@${regSnap.snapshotId}:2` },
+  });
+  assert.equal(pinnedUntrustedOk.ok, true, "Fresh pinned ref must degrade to ledger checks when JXA lacks Accessibility TCC");
+
+  const soleProof = await untrustedReg.proveScreenshotWindowObservation("com.lemon.lvpro", {
+    pid: process.pid,
+    imgDims: { width: 1280, height: 854 },
+    parsedWindowId: null,
+    hadPrePid: true,
+    preObs: { wid: null, title: null, windowBounds: { x: 151, y: 58, w: 1168, h: 780 }, windowIds: [5780] },
+  });
+  assert.equal(soleProof.proven, true, "Sole visible window with matching aspect ratio must prove Same-Window Proof");
+  assert.equal(soleProof.windowId, 5780);
+  assert.equal(soleProof.singleWindowProven, true);
+
+  const nullPreProof = await untrustedReg.proveScreenshotWindowObservation("com.lemon.lvpro", {
+    pid: process.pid,
+    imgDims: { width: 1280, height: 854 },
+    parsedWindowId: null,
+    hadPrePid: true,
+    preObs: null,
+  });
+  assert.equal(nullPreProof.proven, false, "Missing preObs when hadPrePid=true must fail closed");
+
+  const badAspectProof = await untrustedReg.proveScreenshotWindowObservation("com.lemon.lvpro", {
+    pid: process.pid,
+    imgDims: { width: 800, height: 800 },
+    parsedWindowId: null,
+    hadPrePid: true,
+    preObs: { wid: null, title: null, windowBounds: { x: 151, y: 58, w: 1168, h: 780 }, windowIds: [5780] },
+  });
+  assert.equal(badAspectProof.proven, false, "Aspect ratio mismatch must fail closed");
+
+  const auxBlockedProof = await untrustedReg.proveScreenshotWindowObservation("com.lemon.lvpro", {
+    pid: process.pid,
+    imgDims: { width: 1280, height: 854 },
+    parsedWindowId: null,
+    hadPrePid: true,
+    preObs: { wid: null, windowIds: [5780], windowBounds: { x: 151, y: 58, w: 1168, h: 780 } },
+    desktopHelperClient: {
+      available: true,
+      async getFocusedWindow() {
+        return { wid: null, title: null, windowBounds: null, windowIds: [5780], hasAuxOnScreenWindows: true };
+      },
+    },
+  });
+  assert.equal(auxBlockedProof.proven, false, "Visible aux/floating window under untrusted AX must fail closed");
+
+  const axFocusedWithAuxProof = await untrustedReg.proveScreenshotWindowObservation("com.lemon.lvpro", {
+    pid: process.pid,
+    imgDims: { width: 1280, height: 854 },
+    parsedWindowId: null,
+    hadPrePid: true,
+    preObs: {
+      wid: 5780,
+      windowIds: [5780],
+      windowBounds: { x: 151, y: 58, w: 1168, h: 780 },
+      hasAuxOnScreenWindows: true,
+    },
+    desktopHelperClient: {
+      available: true,
+      async getFocusedWindow() {
+        return {
+          wid: 5780,
+          title: null,
+          windowBounds: { x: 151, y: 58, w: 1168, h: 780 },
+          windowIds: [5780],
+          hasAuxOnScreenWindows: true,
+        };
+      },
+    },
+  });
+  assert.equal(
+    axFocusedWithAuxProof.proven,
+    true,
+    "AX-confirmed focused main window must still prove Same-Window Proof even when an unfocused aux panel exists"
+  );
+
+  // 3) Broker E2E: get_app_state (1280x854) -> click(x=316, y=622, click_method="auto") succeeds
+  //    on single visible main window even with accessibilityTrusted: false and wid: null
+  const jpg1280x854 = Buffer.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x03, 0x56, 0x05, 0x00, 0x01, 0x01, 0x11, 0x00, 0xff, 0xd9,
+  ]).toString("base64");
+  const dispatchedClicks = [];
+  const sockCoord = path.join(tmpdir(), `cua-sole-coord-${process.pid}-${Date.now()}.sock`);
+  const peerCoord = {
+    agentInstanceId: "peer-sole-1",
+    async listTools() {
+      return { tools: [{ name: "list_apps" }, { name: "get_app_state" }, { name: "click" }] };
+    },
+    async callTool(name, args) {
+      if (name === "list_apps") {
+        return { isError: false, content: [{ type: "text", text: "剪映专业版 — com.lemon.lvpro [running]" }] };
+      }
+      if (name === "get_app_state") {
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: `App=com.lemon.lvpro (pid 75189)\nWindow: "", App: 剪映专业版.\n\t1 button 开始创作`,
+            },
+            { type: "image", mimeType: "image/jpeg", data: jpg1280x854 },
+          ],
+        };
+      }
+      if (name === "click") {
+        dispatchedClicks.push(args);
+        return { isError: false, content: [{ type: "text", text: "Clicked" }] };
+      }
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+    close() {},
+  };
+  const brokerCoord = new ComputerUseBrokerServer({
+    webPort: 0,
+    uiToken: "sole-coord-tok",
+    socketPath: sockCoord,
+    infoPath: null,
+    actionPeer: peerCoord,
+    streamPeer: peerCoord,
+    axBridge: {
+      enabled: true,
+      async checkPermissions() {
+        return { accessibility: false };
+      },
+      async bindSnapshot() {
+        return { bound: false, boundCount: 0, windowBound: false, reason: "jxa_accessibility_untrusted" };
+      },
+      async verifyLiveRef() {
+        return { ok: false, skipped: "jxa_accessibility_untrusted", reason: "jxa_accessibility_untrusted" };
+      },
+      async getFocusedWindowInfo() {
+        return {
+          wid: null,
+          title: null,
+          windowBounds: { x: 151, y: 58, w: 1168, h: 780 },
+          windowIds: [5780],
+        };
+      },
+      async ensureManualAccessibility() {
+        return { supported: false, changed: false, enabled: false, definitive: true };
+      },
+      async getProcessInfo(pid) {
+        return { alive: true, guiApp: true, pid, processToken: `${pid}:tok1` };
+      },
+      async dropSnapshots() {
+        return { ok: true };
+      },
+    },
+    desktopHelperClient: {
+      available: true,
+      videoAvailable: false,
+      getDiagnostics: () => ({
+        available: true,
+        videoAvailable: false,
+        pid: 4329,
+        bundleId: "io.codexstyle.cua.desktop-helper.dev",
+        capabilities: { accessibilityTrusted: false, screenRecordingPreflight: false, inputMonitoringPreflight: false },
+      }),
+      async listWindows() {
+        return [
+          {
+            pid: 75189,
+            windowId: 5780,
+            layer: 0,
+            title: "",
+            boundsPt: { x: 151, y: 58, width: 1168, height: 780 },
+            onScreen: true,
+          },
+        ];
+      },
+      async getFocusedWindow() {
+        return {
+          wid: null,
+          title: null,
+          windowBounds: { x: 151, y: 58, w: 1168, h: 780 },
+          windowIds: [5780],
+        };
+      },
+      async start() {
+        return this.getDiagnostics();
+      },
+      async setTakeoverTargets() {
+        return true;
+      },
+      async resetTakeoverLatch() {
+        return true;
+      },
+      async probe() {
+        return this.getDiagnostics();
+      },
+      async close() {},
+    },
+    focusController: {
+      async getFrontmostApp() {
+        return { pid: 900, bundleId: "com.google.antigravity", displayName: "Antigravity" };
+      },
+      async restoreFrontmostApp() {
+        return true;
+      },
+      sweepDelaysMs: [],
+    },
+    permissionsFn: async () => ({ platform: "darwin", accessibility: false, screenRecording: true }),
+    runningAppIdentityFn: async () => ({ pid: 75189, bundleId: "com.lemon.lvpro", processToken: "75189:tok1" }),
+    processIdentityFn: async (pid) => ({ pid, alive: true, guiApp: true, processToken: `${pid}:tok1` }),
+    launchHelperOnStart: false,
+  });
+  await brokerCoord.start();
+  const rpcCoord = new BrokerRpcClient({ socketPath: sockCoord, enableFallback: false });
+  try {
+    const stateRes = await rpcCoord.request("tools/call", {
+      name: "get_app_state",
+      arguments: { app: "com.lemon.lvpro" },
+    });
+    assert.equal(Boolean(stateRes.isError), false);
+
+    const clickRes = await rpcCoord.request("tools/call", {
+      name: "click",
+      arguments: { app: "com.lemon.lvpro", x: 316, y: 622, click_method: "auto" },
+    });
+    assert.equal(
+      Boolean(clickRes.isError),
+      false,
+      `Coord click on single visible window must succeed without unproven_same_window, got: ${clickRes.content?.[0]?.text}`
+    );
+    assert.equal(dispatchedClicks.length, 1);
+    assert.equal(dispatchedClicks[0].x, 316);
+    assert.equal(dispatchedClicks[0].y, 622);
+  } finally {
+    await rpcCoord.close();
+    await brokerCoord.close();
+    rmSync(sockCoord, { force: true });
+  }
+});
+
 
 

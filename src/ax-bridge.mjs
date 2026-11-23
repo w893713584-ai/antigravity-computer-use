@@ -659,6 +659,9 @@ function handleBindSnapshot(params) {
   if (!snapshotId || !pid || pid <= 0) {
     return { bound: false, boundCount: 0, windowBound: false };
   }
+  if (typeof $.AXIsProcessTrusted === "function" && !$.AXIsProcessTrusted()) {
+    return { bound: false, boundCount: 0, windowBound: false, reason: "jxa_accessibility_untrusted" };
+  }
   var appEl = createAppElement(pid, 0.7);
   var winEl = selectTargetWindow(appEl, params.windowTitle || "");
   if (!winEl) {
@@ -775,6 +778,14 @@ function handleVerifyLiveRef(params) {
   var requireBound = Boolean(params.requireBound);
   var snap = snapshotId ? retainedSnapshots[snapshotId] : null;
   if (!snap) {
+    if (typeof $.AXIsProcessTrusted === "function" && !$.AXIsProcessTrusted()) {
+      return {
+        ok: false,
+        skipped: "jxa_accessibility_untrusted",
+        reason: "jxa_accessibility_untrusted",
+        message: "JXA live AX verifier lacks Accessibility permission."
+      };
+    }
     return {
       ok: false,
       skipped: "snapshot_not_retained",
@@ -1135,7 +1146,12 @@ function listVisiblePidCgWindows(pid, opts) {
   var cgRef = null;
   var cgList = [];
   try {
-    cgRef = $.CGWindowListCopyWindowInfo(0, 0);
+    var cgOpts =
+      (typeof $.kCGWindowListOptionOnScreenOnly === "number" ? $.kCGWindowListOptionOnScreenOnly : 1) |
+      (typeof $.kCGWindowListExcludeDesktopElements === "number"
+        ? $.kCGWindowListExcludeDesktopElements
+        : 16);
+    cgRef = $.CGWindowListCopyWindowInfo(cgOpts, 0);
     if (cgRef) {
       cgList = ObjC.deepUnwrap(ObjC.castRefToObject(cgRef)) || [];
     }
@@ -1151,7 +1167,9 @@ function listVisiblePidCgWindows(pid, opts) {
   for (var i = 0; i < cgList.length; i++) {
     var w = cgList[i];
     if (Number(w.kCGWindowOwnerPID) !== pid) continue;
-    if (!includeSmallAndAux && Number(w.kCGWindowLayer || 0) !== 0) continue;
+    if (w.kCGWindowIsOnscreen !== undefined && !w.kCGWindowIsOnscreen) continue;
+    var layer = Number(w.kCGWindowLayer || 0);
+    if (!includeSmallAndAux && layer !== 0) continue;
     var alpha = w.kCGWindowAlpha === undefined ? 1 : Number(w.kCGWindowAlpha);
     if (alpha <= 0.01) continue;
     var wb = w.kCGWindowBounds || {};
@@ -1161,6 +1179,7 @@ function listVisiblePidCgWindows(pid, opts) {
     if (!includeSmallAndAux && (bw < 120 || bh < 80)) continue;
     out.push({
       wid: Number(w.kCGWindowNumber || 0),
+      layer: layer,
       title: String(w.kCGWindowName || ""),
       x: Number(wb.X || 0),
       y: Number(wb.Y || 0),
@@ -1251,19 +1270,21 @@ function handleFocusedWindow(params) {
   var rawAxBounds = null;
   var axTitle = "";
   var axWid = 0;
-  try {
-    var appEl = createAppElement(pid, 0.45);
-    axWin = readAttr(appEl, "AXFocusedWindow") || readAttr(appEl, "AXMainWindow");
-    if (axWin) {
-      axWid = getAxWindowId(axWin);
-      rawAxBounds = readBounds(axWin);
-      if (rawAxBounds && rawAxBounds.w >= 120 && rawAxBounds.h >= 80) {
-        axBounds = rawAxBounds;
+  if (typeof $.AXIsProcessTrusted !== "function" || $.AXIsProcessTrusted()) {
+    try {
+      var appEl = createAppElement(pid, 0.45);
+      axWin = readAttr(appEl, "AXFocusedWindow") || readAttr(appEl, "AXMainWindow");
+      if (axWin) {
+        axWid = getAxWindowId(axWin);
+        rawAxBounds = readBounds(axWin);
+        if (rawAxBounds && rawAxBounds.w >= 120 && rawAxBounds.h >= 80) {
+          axBounds = rawAxBounds;
+        }
+        var t = readStr(axWin, "AXTitle");
+        if (t) axTitle = t;
       }
-      var t = readStr(axWin, "AXTitle");
-      if (t) axTitle = t;
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
 
   if (axWid > 0) {
     for (var k = 0; k < pidWindows.length; k++) {
@@ -1322,12 +1343,32 @@ function handleFocusedWindow(params) {
     }
   }
 
+  var hasAuxOnScreenWindows = false;
+  var soleWin = null;
+  if (!focusedExcludedWindow && pidWindows.length === 1) {
+    var allOnScreen = listVisiblePidCgWindows(pid, { includeSmallAndAux: true });
+    for (var auxIdx = 0; auxIdx < allOnScreen.length; auxIdx++) {
+      var aw = allOnScreen[auxIdx];
+      if (aw.wid === pidWindows[0].wid) continue;
+      if (aw.layer >= 0 && aw.layer < 25 && aw.w >= 40 && aw.h >= 30) {
+        hasAuxOnScreenWindows = true;
+        break;
+      }
+    }
+    if (!hasAuxOnScreenWindows) {
+      soleWin = pidWindows[0];
+    }
+  }
+
   return {
     wid: null,
-    title: axTitle || null,
-    windowBounds: null,
+    title: axTitle || (soleWin && soleWin.title ? soleWin.title : null),
+    windowBounds: soleWin
+      ? { x: soleWin.x, y: soleWin.y, w: soleWin.w, h: soleWin.h }
+      : null,
     windowIds: windowIds,
-    ...(focusedExcludedWindow ? { focusedExcludedWindow: true } : {})
+    ...(focusedExcludedWindow ? { focusedExcludedWindow: true } : {}),
+    ...(hasAuxOnScreenWindows ? { hasAuxOnScreenWindows: true } : {})
   };
 }
 

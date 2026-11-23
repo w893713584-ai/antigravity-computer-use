@@ -240,12 +240,49 @@ test("Slice 1 (P0): Reference-origin tiered validation preserves query bounds/wi
     });
     assert.equal(Boolean(qRes.isError), false);
     assert.equal(brokerBindCalls.length, 0, "High-index OCU query matches (>=1000000) must not trigger whole-tree JXA bindSnapshot");
+    const qPayload = JSON.parse(qRes.content[0].text);
+    assert.ok(qPayload.snapshot_id, "query must attach snapshot_id");
+
+    const pinnedClickRes = await client.request("tools/call", {
+      name: "click",
+      arguments: {
+        app: "com.lemon.lvpro",
+        element_index: `@${qPayload.snapshot_id}:1000001`,
+      },
+    });
+    assert.equal(
+      Boolean(pinnedClickRes.isError),
+      false,
+      "Click on fresh pinned OCU query ref @sN:1000001 must succeed without STALE_REF"
+    );
+    assert.equal(
+      brokerBindCalls.includes(qPayload.snapshot_id),
+      false,
+      "Pinned native query alias click must not trigger whole-tree JXA bindSnapshot for the query snapshot"
+    );
+
+    const qRes2 = await client.request("tools/call", {
+      name: "query",
+      arguments: { app: "com.lemon.lvpro", text: "心理学男声_Ep1V3_Seg06" },
+    });
+    assert.equal(Boolean(qRes2.isError), false);
 
     const clickRes = await client.request("tools/call", {
       name: "click",
       arguments: { app: "com.lemon.lvpro", element_index: "1000001" },
     });
     assert.equal(Boolean(clickRes.isError), false, "Click on fresh unpinned OCU query ref 1000001 must succeed");
+
+    // Stale pinned @sN:1000001 after prior mutating click must still fail with STALE_REF
+    const stalePinnedClick = await client.request("tools/call", {
+      name: "click",
+      arguments: {
+        app: "com.lemon.lvpro",
+        element_index: `@${qPayload.snapshot_id}:1000001`,
+      },
+    });
+    assert.equal(Boolean(stalePinnedClick.isError), true, "Stale @sN:1000001 after mutation must fail");
+    assert.match(String(stalePinnedClick.content?.[0]?.text || ""), /STALE_REF/);
   } finally {
     await client.close();
     await broker.close();

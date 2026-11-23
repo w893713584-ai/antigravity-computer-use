@@ -3157,11 +3157,19 @@ export class ComputerUseBrokerServer {
             queryToken,
             resolvedQueryApp,
           });
+          const nonAliasElements =
+            merged.elements instanceof Map
+              ? new Map(
+                  Array.from(merged.elements.entries()).filter(
+                    ([idx]) => !(Number(idx) >= 1_000_000)
+                  )
+                )
+              : null;
           const allNativeQueryAliases =
             parsed.matches.length === 0 ||
             parsed.matches.every((m) => Number(m?.index) >= 1_000_000);
-          if (!allNativeQueryAliases) {
-            this.registry.bindSnapshotHandles(merged);
+          if (!allNativeQueryAliases && nonAliasElements && nonAliasElements.size > 0) {
+            this.registry.bindSnapshotHandles({ ...merged, elements: nonAliasElements });
           }
           if (merged.snapshotId) {
             parsed.snapshot_id = merged.snapshotId;

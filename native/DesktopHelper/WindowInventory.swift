@@ -330,49 +330,116 @@ enum WindowInventory {
       return nil
     }
     let appEl = AXUIElementCreateApplication(pid)
-    var val: AnyObject?
-    let err = AXUIElementCopyAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, &val)
-    guard err == .success, let cfObj = val else { return nil }
-    let winEl = unsafeBitCast(cfObj, to: AXUIElement.self)
-    var wid: CGWindowID = 0
-    if getWin(winEl, &wid) == .success && wid > 0 {
-      return Int64(wid)
+    for attr in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+      var val: AnyObject?
+      let err = AXUIElementCopyAttributeValue(appEl, attr as CFString, &val)
+      guard err == .success, let cfObj = val else { continue }
+      let winEl = unsafeBitCast(cfObj, to: AXUIElement.self)
+      var wid: CGWindowID = 0
+      if getWin(winEl, &wid) == .success && wid > 0 {
+        return Int64(wid)
+      }
     }
     return nil
   }
 
-  static func allWindowIds(for pid: Int32) -> [Int64] {
-    guard pid > 0, let raw = rawAllWindows() else { return [] }
-    var ids: [Int64] = []
+  private struct VisibleWindowEntry {
+    let windowId: Int64
+    let layer: Int
+    let title: String?
+    let bounds: [String: Double]
+    let width: Double
+    let height: Double
+  }
+
+  private static func onScreenWindowEntries(for pid: Int32) -> [VisibleWindowEntry] {
+    guard pid > 0, let raw = rawOnScreenWindows() else { return [] }
+    var out: [VisibleWindowEntry] = []
     for entry in raw {
       guard let entryPid = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
             entryPid == pid,
             let widNum = entry[kCGWindowNumber as String] as? NSNumber else {
         continue
       }
-      let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
-      let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0
-      if layer != 0 || alpha <= 0.01 { continue }
-      if let b = parseBounds(entry[kCGWindowBounds as String]), b.width >= 120, b.height >= 80 {
-        ids.append(widNum.int64Value)
+      if let isOnScreen = (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue, !isOnScreen {
+        continue
       }
+      let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0
+      if alpha <= 0.01 { continue }
+      guard let b = parseBounds(entry[kCGWindowBounds as String]), b.width > 0, b.height > 0 else {
+        continue
+      }
+      let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
+      let rawTitle = (entry[kCGWindowName as String] as? String) ?? ""
+      out.append(
+        VisibleWindowEntry(
+          windowId: widNum.int64Value,
+          layer: layer,
+          title: rawTitle.isEmpty ? nil : rawTitle,
+          bounds: ["x": b.x, "y": b.y, "w": b.width, "h": b.height],
+          width: b.width,
+          height: b.height
+        )
+      )
     }
-    return ids
+    return out
+  }
+
+  static func allWindowIds(for pid: Int32) -> [Int64] {
+    return onScreenWindowEntries(for: pid)
+      .filter { $0.layer == 0 && $0.width >= 120 && $0.height >= 80 }
+      .map { $0.windowId }
   }
 
   static func focusedWindowInfo(for pid: Int32) -> [String: Any] {
-    let allIds = allWindowIds(for: pid)
-    guard pid > 0, let wid = focusedWindowId(for: pid) else {
+    guard pid > 0 else {
       return [
+        "wid": NSNull(),
+        "title": NSNull(),
+        "windowBounds": NSNull(),
+        "windowIds": [Int64](),
+      ]
+    }
+    let visible = onScreenWindowEntries(for: pid)
+    let mainWindows = visible.filter { $0.layer == 0 && $0.width >= 120 && $0.height >= 80 }
+    let allIds = mainWindows.map { $0.windowId }
+    let mainIdSet = Set(allIds)
+    let hasAuxOnScreenWindows = visible.contains {
+      !mainIdSet.contains($0.windowId) &&
+        $0.layer >= 0 &&
+        $0.layer < 25 &&
+        $0.width >= 40 &&
+        $0.height >= 30
+    }
+
+    guard let wid = focusedWindowId(for: pid) else {
+      if mainWindows.count == 1 && !hasAuxOnScreenWindows {
+        let sole = mainWindows[0]
+        return [
+          "wid": NSNull(),
+          "title": sole.title ?? NSNull(),
+          "windowBounds": sole.bounds,
+          "windowIds": allIds,
+        ]
+      }
+      var res: [String: Any] = [
         "wid": NSNull(),
         "title": NSNull(),
         "windowBounds": NSNull(),
         "windowIds": allIds,
       ]
+      if hasAuxOnScreenWindows {
+        res["hasAuxOnScreenWindows"] = true
+      }
+      return res
     }
+
     var title: String?
     var boundsDict: [String: Double]?
-    if let raw = rawAllWindows() {
+    if let match = visible.first(where: { $0.windowId == wid }) {
+      title = match.title
+      boundsDict = match.bounds
+    } else if let raw = rawAllWindows() {
       for entry in raw {
         guard let entryPid = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
               entryPid == pid,
@@ -388,12 +455,19 @@ enum WindowInventory {
         break
       }
     }
-    return [
+    var res: [String: Any] = [
       "wid": wid,
       "title": title ?? NSNull(),
       "windowBounds": boundsDict ?? NSNull(),
       "windowIds": allIds,
     ]
+    if !mainIdSet.contains(wid) {
+      res["focusedExcludedWindow"] = true
+    }
+    if hasAuxOnScreenWindows {
+      res["hasAuxOnScreenWindows"] = true
+    }
+    return res
   }
 
   static func frontmostAppInfo() -> FrontmostInfo? {
