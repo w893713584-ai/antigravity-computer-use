@@ -424,6 +424,14 @@ test("Broker takeover integration: sensor targeting, drain ordering before manua
     async ensureManualAccessibility() {
       return { supported: true, changed: false, enabled: true, definitive: true };
     },
+    async getFocusedWindowInfo() {
+      return {
+        wid: 501,
+        title: "主窗口",
+        windowBounds: { x: 0, y: 0, w: 1280, h: 800 },
+        windowIds: [501],
+      };
+    },
     async resolveActionTarget(_pid, opts) {
       return {
         resolved: true,

@@ -1,17 +1,26 @@
 import {
   dispatchBackgroundPointClickDetailed,
-  dispatchBackgroundPointDrag,
+  dispatchBackgroundPointDragDetailed,
   extractResultImage,
   extractResultText,
   unhideAppWithoutActivating,
 } from "./background-policy.mjs";
-import { normalizeElementBounds } from "./app-snapshot-registry.mjs";
+import {
+  buildRouteScopeFromMeta,
+  evaluateScreenshotMetaProof,
+  hasMatchingAspectRatio,
+  isSingleWindowProven,
+  normalizeElementBounds,
+  resolveFocusedWindowObservation,
+} from "./app-snapshot-registry.mjs";
+import { isWriteOutcomeUnknown } from "./ax-bridge.mjs";
 import { formatDeliveryRoute } from "./focus-policy-guard.mjs";
 import { TakeoverAbortedError } from "./takeover-controller.mjs";
 import {
   buildStaleRefToolResult,
   computeFrameDigest,
   didUiStructurallyChange,
+  resolveJxaPostTrust,
   shouldAttemptSelectedTextFastPath,
   tryHeadlessBackgroundScroll,
   tryHeadlessContextMenu,
@@ -117,6 +126,105 @@ export function windowPointToScreenshotPixel(
   };
 }
 
+const AX_ORIGIN_OFFSET_BUNDLE_RE = /^com\.lemon\.lvpro$/iu;
+
+function hasAxOriginOffsetQuirk(bundle, match) {
+  return (
+    AX_ORIGIN_OFFSET_BUNDLE_RE.test(String(bundle || "").trim()) &&
+    Boolean(normalizeElementBounds(match?.bounds || match?.frame))
+  );
+}
+
+function normalizeUnknownOutcomeResult(
+  res,
+  fallbackText = "Write outcome unknown; blocked fallback or retry to avoid duplicate side effects.",
+  fallbackReason = "write_outcome_unknown"
+) {
+  const existingText = extractResultText(res);
+  return {
+    ...(res && typeof res === "object" ? res : {}),
+    isError: true,
+    deliveryState: "sent_unknown",
+    fatal: true,
+    code: "WRITE_OUTCOME_UNKNOWN",
+    reason: res?.reason || fallbackReason,
+    content:
+      Array.isArray(res?.content) && res.content.length > 0
+        ? res.content
+        : [{ type: "text", text: existingText || fallbackText }],
+  };
+}
+
+function sentUnknownError(message, reason = "write_outcome_unknown") {
+  return {
+    isError: true,
+    deliveryState: "sent_unknown",
+    fatal: true,
+    code: "WRITE_OUTCOME_UNKNOWN",
+    reason,
+    content: [{ type: "text", text: message }],
+  };
+}
+
+/**
+ * Authorize converting Window-Local Points onto the current OCU action screenshot
+ * under the Same-Window Proof invariant.
+ */
+export function authorizeActionScreenshotCoords(
+  meta,
+  {
+    pid = null,
+    callerExplicitWindowId = null,
+    targetWindowId = null,
+    windowSize = null,
+    localPoint = null,
+    actionPeerInstanceId = null,
+    liveWindowObs = null,
+  } = {}
+) {
+  const proof = evaluateScreenshotMetaProof(meta, {
+    pid,
+    expectedPeerInstanceId: actionPeerInstanceId,
+    callerExplicitWindowId,
+    targetWindowId,
+    windowSize,
+    liveWindowObs,
+    requireSingleWindow: false,
+    requirePositiveWid: true,
+  });
+  const hasValidInput = Boolean(
+    localPoint &&
+      Number.isFinite(Number(localPoint.x)) &&
+      Number.isFinite(Number(localPoint.y)) &&
+      windowSize &&
+      Number(windowSize.width) > 0 &&
+      Number(windowSize.height) > 0
+  );
+  const sameWindowProven = Boolean(proof.sameWindowProven && hasValidInput);
+  const rawPx = sameWindowProven
+    ? windowPointToScreenshotPixel(localPoint, {
+        windowWidth: windowSize.width,
+        windowHeight: windowSize.height,
+        imageWidth: proof.width,
+        imageHeight: proof.height,
+      })
+    : null;
+  const rx = rawPx ? Math.round(rawPx.x) : null;
+  const ry = rawPx ? Math.round(rawPx.y) : null;
+  const authorized = Boolean(
+    sameWindowProven && rawPx && rx >= 0 && ry >= 0 && rx <= proof.width && ry <= proof.height
+  );
+
+  return {
+    authorized,
+    sameWindowProven,
+    pixelPoint: authorized ? { x: rx, y: ry } : null,
+    peerInstanceId: proof.peerInstanceId,
+    singleWindowProven: proof.singleWindowProven,
+    windowCount: proof.windowCount,
+  };
+}
+
 /**
  * Inverse seam: convert encoded screenshot pixels back into window-local logical points
  * (`pointWindowPt`) for `window_post` / `window_scroll`.
@@ -147,11 +255,45 @@ export function screenshotPixelToWindowPoint(
   };
 }
 
+function unpackPointDispatchResult(rawRes, defaultMethod, actionLabel) {
+  const isObj = typeof rawRes === "object" && rawRes !== null;
+  const ok = isObj ? Boolean(rawRes.delivered) : Boolean(rawRes);
+  const deliveryState = isObj ? rawRes.deliveryState : undefined;
+  const reason = isObj ? rawRes.reason : undefined;
+  const method = (isObj && rawRes.method) || defaultMethod;
+  const unknown = isObj && isWriteOutcomeUnknown(rawRes);
+  const baseErr = {
+    isError: true,
+    ...(deliveryState ? { deliveryState } : {}),
+    ...(reason ? { reason } : {}),
+    content: [
+      {
+        type: "text",
+        text:
+          reason === "jxa_accessibility_untrusted"
+            ? `Background point ${actionLabel} unavailable (jxa_accessibility_untrusted).`
+            : reason
+              ? `Background point ${actionLabel} failed (${reason}).`
+              : `Background point ${actionLabel} failed.`,
+      },
+    ],
+  };
+  const result = ok
+    ? {
+        isError: false,
+        content: [{ type: "text", text: actionLabel === "drag" ? "Drag delivered via app_post" : "ok" }],
+      }
+    : unknown
+      ? normalizeUnknownOutcomeResult(baseErr)
+      : baseErr;
+  return { method, result };
+}
+
 /**
  * Compute center point of `targetBox`, clipped inside `clipBox` (e.g., visible list viewport)
  * when provided and intersecting; falls back to `targetBox` center if no overlap.
  */
-export function clipBoxIntersectionCenter(targetBox, clipBox = null) {
+export function clipBoxIntersectionCenter(targetBox, clipBox = null, { requireOverlap = false } = {}) {
   if (!targetBox || !(Number(targetBox.w) > 0) || !(Number(targetBox.h) > 0)) return null;
   const tx1 = Number(targetBox.x);
   const ty1 = Number(targetBox.y);
@@ -169,8 +311,81 @@ export function clipBoxIntersectionCenter(targetBox, clipBox = null) {
     if (ix2 > ix1 && iy2 > iy1) {
       return { x: (ix1 + ix2) / 2, y: (iy1 + iy2) / 2 };
     }
+    if (requireOverlap) {
+      return null;
+    }
   }
   return { x: (tx1 + tx2) / 2, y: (ty1 + ty2) / 2 };
+}
+
+function buildActNativeClickArgs({
+  app,
+  clickMethod,
+  match,
+  resolvedTarget = null,
+  meta = null,
+  auth = null,
+  callerExplicitWindowId = null,
+  queryPeerInstanceId = null,
+  jxaTrusted = true,
+  mouseButton = "left",
+  clickCount = 1,
+}) {
+  const isPinned = Number(callerExplicitWindowId) > 0;
+  const sameWindowProven = Boolean(auth?.sameWindowProven);
+  const canMapPx = Boolean(auth?.authorized && auth?.pixelPoint);
+  const rx = auth?.pixelPoint?.x ?? null;
+  const ry = auth?.pixelPoint?.y ?? null;
+
+  // OCU app_post sends PID-only events without window routing; refuse without proven single-window target match.
+  if (clickMethod === "app_post") {
+    if (!sameWindowProven || !isSingleWindowProven(auth)) {
+      return null;
+    }
+  }
+
+  const matchWid = Number(match?.window_id || 0);
+  const elemMeta = match?.index !== undefined ? meta?.elements?.get(String(match.index)) : null;
+  const hasPinnedMatchWid =
+    matchWid === Number(callerExplicitWindowId) ||
+    Number(elemMeta?.windowId || 0) === Number(callerExplicitWindowId);
+  const hasSnapshotProvenance = Boolean(elemMeta && elemMeta.origin);
+  const canUseIdx =
+    match?.index !== undefined && (!isPinned || (hasPinnedMatchWid && hasSnapshotProvenance));
+
+  const bundle = String(meta?.bundleId || app || "").trim();
+  const preferPx =
+    canMapPx &&
+    (resolvedTarget?.reason === "ax_card" ||
+      resolvedTarget?.axOriginMismatch === true ||
+      (!jxaTrusted && hasAxOriginOffsetQuirk(bundle, match)));
+
+  if ((preferPx || !canUseIdx) && canMapPx) {
+    return {
+      clickArgs: {
+        app,
+        click_method: clickMethod,
+        x: rx,
+        y: ry,
+        mouse_button: mouseButton,
+        click_count: clickCount,
+      },
+      expectedAgentInstanceId: auth?.peerInstanceId || null,
+    };
+  }
+  if (canUseIdx) {
+    return {
+      clickArgs: {
+        app,
+        click_method: clickMethod,
+        element_index: String(match.index),
+        mouse_button: mouseButton,
+        click_count: clickCount,
+      },
+      expectedAgentInstanceId: queryPeerInstanceId || null,
+    };
+  }
+  return null;
 }
 
 /**
@@ -261,12 +476,13 @@ export class BackgroundActionExecutor {
   constructor({
     actionPeer,
     axBridge = null,
+    desktopHelperClient = null,
     focusPolicyGuard,
     registry,
     unhideAppFn = unhideAppWithoutActivating,
     refreshActionStateFn = null,
     pointClickFn = dispatchBackgroundPointClickDetailed,
-    pointDragFn = dispatchBackgroundPointDrag,
+    pointDragFn = dispatchBackgroundPointDragDetailed,
     editableFocusFn = verifyEditableTextFocus,
     selectedTextInsertFn = tryHeadlessSelectedTextInsert,
     axScrollFallbackFn = tryHeadlessBackgroundScroll,
@@ -281,6 +497,7 @@ export class BackgroundActionExecutor {
   } = {}) {
     this.actionPeer = actionPeer;
     this.axBridge = axBridge;
+    this.desktopHelperClient = desktopHelperClient;
     this.focusPolicyGuard = focusPolicyGuard;
     this.registry = registry;
     this.unhideAppFn = unhideAppFn;
@@ -308,14 +525,7 @@ export class BackgroundActionExecutor {
     if (typeof this.registry?.buildRouteScope === "function") {
       return this.registry.buildRouteScope(meta, opts);
     }
-    const pid = Number(meta?.pid || 0);
-    const wid = Number(opts?.windowId ?? opts?.snapshot?.windowId ?? meta?.windowId ?? 0);
-    if (!(pid > 0) && !(wid > 0)) return null;
-    return {
-      pid: pid > 0 ? pid : null,
-      processToken: meta?.processToken || null,
-      windowId: wid > 0 ? wid : null,
-    };
+    return buildRouteScopeFromMeta(meta, opts);
   }
 
   #trackWrite(operation, promise, routeKey = null) {
@@ -356,11 +566,91 @@ export class BackgroundActionExecutor {
     return null;
   }
 
+  #formatWindowClickOutcome(winRes, { fallbackText, mapReasonText = false } = {}) {
+    if (winRes?.delivered) {
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    }
+    const text =
+      mapReasonText && winRes?.reason === "out_of_bounds"
+        ? "Click coordinates are outside the current window screenshot bounds."
+        : mapReasonText && winRes?.reason === "window_resized"
+          ? "Target window size changed since screenshot; run get_app_state before retrying."
+          : fallbackText;
+    if (isWriteOutcomeUnknown(winRes)) {
+      return normalizeUnknownOutcomeResult(winRes, text);
+    }
+    return {
+      isError: true,
+      ...(winRes?.deliveryState ? { deliveryState: winRes.deliveryState } : {}),
+      ...(winRes?.reason ? { reason: winRes.reason } : {}),
+      ...(mapReasonText
+        ? {
+            fatal:
+              winRes?.reason === "out_of_bounds" ||
+              winRes?.reason === "window_resized" ||
+              winRes?.reason === "element_window_mismatch",
+          }
+        : {}),
+      content: [{ type: "text", text }],
+    };
+  }
+
+  #buildJxaUntrustedError(text, { fatal = false } = {}) {
+    return {
+      isError: true,
+      deliveryState: "not_sent",
+      reason: "jxa_accessibility_untrusted",
+      ...(fatal ? { fatal: true } : {}),
+      content: [{ type: "text", text }],
+    };
+  }
+
+  #authorizeCoordDispatch(
+    preMeta,
+    {
+      liveWindowObs = null,
+      targetWindowId = null,
+      windowSize = null,
+      requireSingleWindow = false,
+      actionLabel = "click",
+    } = {}
+  ) {
+    const proof = evaluateScreenshotMetaProof(preMeta, {
+      expectedPeerInstanceId: this.actionPeer?.agentInstanceId || null,
+      targetWindowId,
+      windowSize,
+      liveWindowObs,
+      requireSingleWindow,
+      requirePositiveWid: true,
+    });
+    if (!proof.sameWindowProven) {
+      return {
+        ok: false,
+        reason: "unproven_same_window",
+        message: `Coordinate ${actionLabel} blocked (unproven_same_window): Same-Window Proof is missing or stale for the current screenshot; run get_app_state or target a window-verified element before acting.`,
+      };
+    }
+    if (requireSingleWindow && !proof.singleWindowProven) {
+      return {
+        ok: false,
+        reason: "unproven_single_window",
+        message: `Coordinate ${actionLabel} blocked (unproven_single_window): PID-level fallback requires a proven single-window screenshot match.`,
+      };
+    }
+    return { ok: true, proof };
+  }
+
   async #callActionPeerWithRecovery(
     toolName,
     callArgs,
     app,
-    { shouldFollow = true, allowAutoRefresh = true, operation = null, timeoutMs = undefined } = {}
+    {
+      shouldFollow = true,
+      allowAutoRefresh = true,
+      operation = null,
+      timeoutMs = undefined,
+      expectedAgentInstanceId = null,
+    } = {}
   ) {
     const routeTag =
       toolName === "click" || toolName === "drag"
@@ -369,29 +659,59 @@ export class BackgroundActionExecutor {
           ? `${toolName}:${callArgs?.key_method || "native"}`
           : toolName;
     const beforeWriteCheck = () => this.#beforeWrite(operation, false);
+    const invokePeer = async () => {
+      try {
+        return await this.#trackWrite(
+          operation,
+          this.actionPeer.callTool(toolName, callArgs, timeoutMs, {
+            beforeWriteCheck,
+            expectedAgentInstanceId,
+          }),
+          routeTag
+        );
+      } catch (err) {
+        if (err?.code === "STALE_PEER_GENERATION") {
+          return {
+            isError: true,
+            deliveryState: "not_sent",
+            fatal: true,
+            reason: "stale_peer_generation",
+            content: [{ type: "text", text: err.message }],
+          };
+        }
+        throw err;
+      }
+    };
+
     beforeWriteCheck();
-    let lastRes = await this.#trackWrite(
-      operation,
-      this.actionPeer.callTool(toolName, callArgs, timeoutMs, { beforeWriteCheck }),
-      routeTag
-    );
-    if (!lastRes?.isError) return lastRes;
+    let lastRes = await invokePeer();
+    if (isWriteOutcomeUnknown(lastRes)) return normalizeUnknownOutcomeResult(lastRes);
+    if (!lastRes?.isError || lastRes?.reason === "stale_peer_generation") return lastRes;
+
+    const hasFiniteCoord = (v) =>
+      v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
+    const isCoordPeerOp =
+      (toolName === "click" || toolName === "drag") &&
+      (hasFiniteCoord(callArgs?.x) ||
+        hasFiniteCoord(callArgs?.y) ||
+        hasFiniteCoord(callArgs?.from_x) ||
+        hasFiniteCoord(callArgs?.from_y) ||
+        hasFiniteCoord(callArgs?.to_x) ||
+        hasFiniteCoord(callArgs?.to_y));
 
     const errText = extractResultText(lastRes);
-    if (/target app is hidden/iu.test(errText)) {
+    if (!isCoordPeerOp && /target app is hidden/iu.test(errText)) {
       beforeWriteCheck();
       const meta = this.registry.getMeta(app);
       await this.#trackWrite(operation, this.unhideAppFn(meta?.pid, app), `${toolName}:unhide`);
       beforeWriteCheck();
-      lastRes = await this.#trackWrite(
-        operation,
-        this.actionPeer.callTool(toolName, callArgs, timeoutMs, { beforeWriteCheck }),
-        routeTag
-      );
-      if (!lastRes?.isError) return lastRes;
+      lastRes = await invokePeer();
+      if (isWriteOutcomeUnknown(lastRes)) return normalizeUnknownOutcomeResult(lastRes);
+      if (!lastRes?.isError || lastRes?.reason === "stale_peer_generation") return lastRes;
     }
 
     if (
+      !isCoordPeerOp &&
       allowAutoRefresh &&
       typeof this.refreshActionStateFn === "function" &&
       STALE_SNAPSHOT_RE.test(extractResultText(lastRes))
@@ -400,11 +720,8 @@ export class BackgroundActionExecutor {
       const refreshRes = await this.refreshActionStateFn(app, { shouldFollow, operation });
       if (refreshRes?.isError) return lastRes;
       beforeWriteCheck();
-      lastRes = await this.#trackWrite(
-        operation,
-        this.actionPeer.callTool(toolName, callArgs, timeoutMs, { beforeWriteCheck }),
-        routeTag
-      );
+      lastRes = await invokePeer();
+      if (isWriteOutcomeUnknown(lastRes)) return normalizeUnknownOutcomeResult(lastRes);
     }
 
     return lastRes;
@@ -425,9 +742,17 @@ export class BackgroundActionExecutor {
     } = ctx;
 
     if (method === "window_post") {
+      const jxaTrusted = await ctx.getJxaTrusted();
+      if (!jxaTrusted) {
+        return this.#buildJxaUntrustedError(
+          "Window-local click unavailable (jxa_accessibility_untrusted): grant Accessibility to osascript or use Open Computer Use routes.",
+          { fatal: cleanArgs.click_method === "window_post" }
+        );
+      }
       if (!(preMeta?.pid > 0) || typeof this.windowClickFn !== "function") {
         return {
           isError: true,
+          deliveryState: "not_sent",
           content: [{ type: "text", text: "Window-local click bridge unavailable." }],
         };
       }
@@ -448,6 +773,7 @@ export class BackgroundActionExecutor {
           Boolean(fallbackDims?.width > 0 && fallbackDims?.height > 0);
         return {
           isError: true,
+          deliveryState: "not_sent",
           fatal: isFatalNoGeometry,
           content: [
             {
@@ -503,31 +829,56 @@ export class BackgroundActionExecutor {
         this.#rethrowIfAborted(err);
         return { delivered: false, reason: err?.message || "window_click_error" };
       });
-      if (winRes?.delivered) {
-        return { isError: false, content: [{ type: "text", text: "ok" }] };
-      }
-      return {
-        isError: true,
-        fatal: winRes?.reason === "out_of_bounds" || winRes?.reason === "window_resized",
-        content: [
-          {
-            type: "text",
-            text:
-              winRes?.reason === "out_of_bounds"
-                ? "Click coordinates are outside the current window screenshot bounds."
-                : winRes?.reason === "window_resized"
-                  ? "Target window size changed since screenshot; run get_app_state before retrying."
-                  : `Window-local click unavailable (${winRes?.reason || "unavailable"}).`,
-          },
-        ],
-      };
+      return this.#formatWindowClickOutcome(winRes, {
+        fallbackText: isWriteOutcomeUnknown(winRes)
+          ? `Window-local click outcome unknown (${winRes?.reason || "sent_unknown"}).`
+          : `Window-local click unavailable (${winRes?.reason || "unavailable"}).`,
+        mapReasonText: true,
+      });
     }
 
+    const isCoordPeerClick =
+      !parsedRef?.hasElementRef && Number.isFinite(cleanArgs.x) && Number.isFinite(cleanArgs.y);
+    if (isCoordPeerClick && method === "app_post") {
+      const clickProof = evaluateScreenshotMetaProof(preMeta, {
+        expectedPeerInstanceId: this.actionPeer?.agentInstanceId || null,
+        targetWindowId: preMeta?.windowId || ctx.windowDelivery?.windowId || null,
+        liveWindowObs: ctx.liveWindowObs || null,
+        requireSingleWindow: true,
+        requirePositiveWid: false,
+      });
+      if (ctx.windowDelivery?.route === "ocu_pixel" || !clickProof.proven) {
+        return {
+          isError: true,
+          deliveryState: "not_sent",
+          fatal: true,
+          reason:
+            clickProof.sameWindowProven && !clickProof.singleWindowProven
+              ? "unproven_single_window"
+              : clickProof.singleWindowProven
+                ? "unproven_same_window"
+                : "unproven_single_window",
+          content: [
+            {
+              type: "text",
+              text: "Coordinate click blocked (unproven_single_window): PID-only app_post requires proven single-window screenshot match.",
+            },
+          ],
+        };
+      }
+    }
     return this.#callActionPeerWithRecovery(
       "click",
       { ...cleanArgs, click_method: method },
       app,
-      { shouldFollow, allowAutoRefresh, operation }
+      {
+        shouldFollow,
+        allowAutoRefresh,
+        operation,
+        expectedAgentInstanceId: isCoordPeerClick
+          ? preMeta?.actionScreenshotMeta?.peerInstanceId || null
+          : null,
+      }
     );
   }
 
@@ -546,6 +897,13 @@ export class BackgroundActionExecutor {
       return hotkeyBlock;
     }
     if (method === "window_key") {
+      const jxaTrusted = await ctx.getJxaTrusted();
+      if (!jxaTrusted) {
+        return this.#buildJxaUntrustedError(
+          "Window key delivery unavailable (jxa_accessibility_untrusted): grant Accessibility to osascript or use sky_key.",
+          { fatal: cleanArgs.key_method === "window_key" }
+        );
+      }
       const beforeWriteCheck = () => this.#beforeWrite(operation, false);
       beforeWriteCheck();
       const targetWid =
@@ -569,8 +927,12 @@ export class BackgroundActionExecutor {
           return { isError: false, content: [{ type: "text", text: "ok" }] };
         }
         const keyReason = keyRes?.reason || "unavailable";
+        if (isWriteOutcomeUnknown(keyRes)) {
+          return normalizeUnknownOutcomeResult(keyRes, `Window key delivery failed (${keyReason}).`);
+        }
         return {
           isError: true,
+          deliveryState: keyRes?.deliveryState,
           reason: keyReason,
           fatal: keyReason !== "bridge_unavailable",
           content: [
@@ -600,8 +962,12 @@ export class BackgroundActionExecutor {
           return { isError: false, content: [{ type: "text", text: "ok" }] };
         }
         const txtReason = txtRes?.reason || "unavailable";
+        if (isWriteOutcomeUnknown(txtRes)) {
+          return normalizeUnknownOutcomeResult(txtRes, `Window text delivery failed (${txtReason}).`);
+        }
         return {
           isError: true,
+          deliveryState: txtRes?.deliveryState,
           reason: txtReason,
           fatal: txtReason !== "bridge_unavailable" && txtReason !== "unicode_fn_unavailable",
           content: [
@@ -614,6 +980,7 @@ export class BackgroundActionExecutor {
       }
       return {
         isError: true,
+        deliveryState: "not_sent",
         reason: "bridge_unavailable",
         content: [{ type: "text", text: "Window key bridge unavailable." }],
       };
@@ -638,10 +1005,11 @@ export class BackgroundActionExecutor {
       preElement,
       routeScope = null,
     } = ctx;
+    const jxaTrusted = await ctx.getJxaTrusted();
     const clickMethods = this.focusPolicyGuard.planClick(
       { app, element_index: cleanArgs.element_index },
       aliases,
-      { routeScope }
+      { routeScope, windowPostAvailable: jxaTrusted }
     );
     const bypassClickCtx = {
       ...ctx,
@@ -656,16 +1024,26 @@ export class BackgroundActionExecutor {
 
     let focusedOk = false;
     let focusedClickMethod = null;
+    let lastClickRes = null;
     for (const method of clickMethods) {
-      const clickRes = await this.#dispatchClickMethod(method, bypassClickCtx);
-      if (!clickRes?.isError) {
+      lastClickRes = await this.#dispatchClickMethod(method, bypassClickCtx);
+      if (!lastClickRes?.isError) {
         focusedOk = true;
         focusedClickMethod = method;
         break;
       }
-      if (clickRes?.fatal) break;
+      if (isWriteOutcomeUnknown(lastClickRes)) {
+        return {
+          ok: false,
+          outcomeUnknown: true,
+          result: normalizeUnknownOutcomeResult(lastClickRes),
+        };
+      }
+      if (lastClickRes?.fatal) break;
     }
-    if (!focusedOk) return { ok: false };
+    if (!focusedOk) {
+      return { ok: false };
+    }
     if (ctx.focusScope && focusedClickMethod) {
       await ctx.focusScope.enforce(formatDeliveryRoute("click", focusedClickMethod), { routeScope });
     }
@@ -685,6 +1063,7 @@ export class BackgroundActionExecutor {
 
     const pressKeyMethods = this.focusPolicyGuard.planKey("press_key", { app }, aliases, {
       routeScope,
+      windowKeyAvailable: jxaTrusted,
     });
     const runBypassPressKey = async (key) => {
       for (const method of pressKeyMethods) {
@@ -696,16 +1075,45 @@ export class BackgroundActionExecutor {
         if (!res?.isError && ctx.focusScope) {
           await ctx.focusScope.enforce(formatDeliveryRoute("press_key", method), { routeScope });
         }
+        if (isWriteOutcomeUnknown(res)) return normalizeUnknownOutcomeResult(res);
         if (!res?.isError || res?.fatal) return res;
       }
       return { isError: true };
     };
 
     const selAllRes = await runBypassPressKey("cmd+a");
+    if (isWriteOutcomeUnknown(selAllRes)) {
+      return {
+        ok: false,
+        outcomeUnknown: true,
+        result: normalizeUnknownOutcomeResult(selAllRes),
+      };
+    }
     if (selAllRes?.isError) return { ok: false };
 
     const clearRes = await runBypassPressKey("BackSpace");
-    if (clearRes?.isError) return { ok: false };
+    if (clearRes?.isError) {
+      if (clearRes.deliveryState === "not_sent") {
+        return {
+          ok: false,
+          outcomeUnknown: false,
+          result: clearRes.content?.length
+            ? clearRes
+            : {
+                ...clearRes,
+                content: [{ type: "text", text: "Clearing field was not sent." }],
+              },
+        };
+      }
+      return {
+        ok: false,
+        outcomeUnknown: true,
+        result: normalizeUnknownOutcomeResult(
+          clearRes,
+          "Clearing field failed with unknown outcome."
+        ),
+      };
+    }
 
     const targetValue = String(cleanArgs.value ?? "");
     if (!targetValue.length) {
@@ -750,6 +1158,16 @@ export class BackgroundActionExecutor {
           },
         };
       }
+      if (axIns?.deliveryState === "sent_unknown") {
+        return {
+          ok: false,
+          outcomeUnknown: true,
+          result: sentUnknownError(
+            `Background set_value bypass failed (${axIns?.reason || "sent_unknown"}).`,
+            axIns?.reason || "write_outcome_unknown"
+          ),
+        };
+      }
     }
 
     const safeKeyText = focusCheck.singleLine
@@ -757,6 +1175,7 @@ export class BackgroundActionExecutor {
       : targetValue;
     const typeKeyMethods = this.focusPolicyGuard.planKey("type_text", { app }, aliases, {
       routeScope,
+      windowKeyAvailable: jxaTrusted,
     });
     let typeRes = null;
     for (const method of typeKeyMethods) {
@@ -768,14 +1187,71 @@ export class BackgroundActionExecutor {
       if (!typeRes?.isError && ctx.focusScope) {
         await ctx.focusScope.enforce(formatDeliveryRoute("type_text", method), { routeScope });
       }
+      if (isWriteOutcomeUnknown(typeRes)) {
+        typeRes = normalizeUnknownOutcomeResult(typeRes);
+        break;
+      }
       if (!typeRes?.isError || typeRes?.fatal) break;
     }
-    if (!typeRes || typeRes.isError) return { ok: false };
+    if (!typeRes || typeRes.isError) {
+      return {
+        ok: false,
+        outcomeUnknown: true,
+        result: normalizeUnknownOutcomeResult(
+          typeRes,
+          "Text bypass incomplete after clearing field.",
+          typeRes?.reason || "set_value_bypass_incomplete"
+        ),
+      };
+    }
     return {
       ok: true,
       verified: false,
       result: typeRes,
     };
+  }
+
+  #buildNotSentError(reason, text, { fatal = true } = {}) {
+    return {
+      isError: true,
+      deliveryState: "not_sent",
+      ...(fatal ? { fatal: true } : {}),
+      ...(reason ? { reason } : {}),
+      content: [{ type: "text", text }],
+    };
+  }
+
+  #evaluateTinyOverrideProof(preMeta, ov, liveWindowObs = null) {
+    const metaOvMatched = Boolean(
+      !preMeta?.windowId ||
+        !ov?.wid ||
+        Number(ov.wid) === Number(preMeta.windowId) ||
+        preMeta?.actionScreenshotMeta?.source === "tiny_window_override"
+    );
+    const liveWid = Number(liveWindowObs?.wid || liveWindowObs?.windowId || 0);
+    const liveWidOk = !(liveWid > 0 && ov?.wid > 0 && liveWid !== Number(ov.wid));
+    const lb = normalizeElementBounds(
+      liveWindowObs?.windowBounds || liveWindowObs?.boundsPt || liveWindowObs?.bounds
+    );
+    const boundsOk = Boolean(
+      !lb ||
+        !ov?.bounds ||
+        (Math.abs(lb.x - Number(ov.bounds.x || 0)) <= 2 &&
+          Math.abs(lb.y - Number(ov.bounds.y || 0)) <= 2 &&
+          Math.abs(lb.w - Number(ov.bounds.width || 0)) <= 2 &&
+          Math.abs(lb.h - Number(ov.bounds.height || 0)) <= 2)
+    );
+    const ovMatched = Boolean(metaOvMatched && liveWidOk && boundsOk);
+    const liveIds = Array.isArray(liveWindowObs?.windowIds)
+      ? liveWindowObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
+      : null;
+    const singleWindowOk = Boolean(
+      ovMatched &&
+        liveWindowObs?.focusedExcludedWindow !== true &&
+        isSingleWindowProven(preMeta?.actionScreenshotMeta) &&
+        (!liveIds || (liveIds.length === 1 && (!(ov?.wid > 0) || liveIds[0] === Number(ov.wid))))
+    );
+    return { ovMatched, boundsOk, singleWindowOk };
   }
 
   async dispatch({
@@ -790,6 +1266,7 @@ export class BackgroundActionExecutor {
     fallbackDims = { width: 0, height: 0 },
     operation = null,
     windowDelivery = null,
+    liveWindowObs = null,
     routeScope = null,
     focusScope = null,
   }) {
@@ -830,6 +1307,13 @@ export class BackgroundActionExecutor {
       normalizedExplicitMethod !== "global"
         ? formatDeliveryRoute(name, normalizedExplicitMethod)
         : null;
+    let jxaTrustedPromise = null;
+    const getJxaTrusted = () => {
+      if (!jxaTrustedPromise) {
+        jxaTrustedPromise = this.#isJxaPostTrusted();
+      }
+      return jxaTrustedPromise;
+    };
     const ctx = {
       app,
       cleanArgs,
@@ -844,8 +1328,10 @@ export class BackgroundActionExecutor {
       fallbackDims,
       operation,
       windowDelivery,
+      liveWindowObs,
       routeScope: effectiveRouteScope,
       focusScope,
+      getJxaTrusted,
     };
 
     if (name === "click") {
@@ -870,11 +1356,21 @@ export class BackgroundActionExecutor {
         Number.isFinite(cleanArgs.y);
 
       if (windowDelivery?.route === "window_post") {
+        const jxaTrusted = await getJxaTrusted();
         const targetPid = Number(windowDelivery.pid || preMeta?.pid || 0);
-        if (!(targetPid > 0) || typeof this.windowClickFn !== "function") {
+        if (!jxaTrusted) {
+          actionRouteKey = formatDeliveryRoute("click", "window_post");
+          result = this.#buildJxaUntrustedError(
+            "Window-local click unavailable (jxa_accessibility_untrusted): grant Accessibility to osascript or use Open Computer Use routes.",
+            { fatal: true }
+          );
+        } else if (!(targetPid > 0) || typeof this.windowClickFn !== "function") {
           actionRouteKey = formatDeliveryRoute("click", "window_post");
           result = {
             isError: true,
+            deliveryState: "not_sent",
+            fatal: true,
+            reason: "bridge_unavailable",
             content: [{ type: "text", text: "Window-local click bridge unavailable." }],
           };
         } else {
@@ -911,26 +1407,21 @@ export class BackgroundActionExecutor {
             return { delivered: false, reason: err?.message || "window_click_error" };
           });
           actionRouteKey = formatDeliveryRoute("click", winRes?.method || "window_post");
-          result = winRes?.delivered
-            ? { isError: false, content: [{ type: "text", text: "ok" }] }
-            : {
-                isError: true,
-                content: [
-                  {
-                    type: "text",
-                    text: `Window-local click rejected (${winRes?.reason || "unavailable"}).`,
-                  },
-                ],
-              };
+          result = this.#formatWindowClickOutcome(winRes, {
+            fallbackText: `Window-local click rejected (${winRes?.reason || "unavailable"}).`,
+          });
         }
       } else if (
         isCoordClickDispatch &&
         preMeta?.windowId > 0 &&
         preMeta?.actionHasScreenshot === false
       ) {
-        actionRouteKey = requestedRoute || formatDeliveryRoute("click", "window_post");
+        actionRouteKey = requestedRoute || null;
         result = {
           isError: true,
+          deliveryState: "not_sent",
+          fatal: true,
+          reason: "missing_screenshot_geometry",
           content: [
             {
               type: "text",
@@ -940,30 +1431,32 @@ export class BackgroundActionExecutor {
         };
       } else if (
         isCoordClickDispatch &&
+        windowDelivery?.route !== "ocu_pixel" &&
         isValidTinyOverrideGeometry(ov) &&
         preMeta?.pid > 0 &&
         typeof this.pointClickFn === "function"
       ) {
+        const ovProof = this.#evaluateTinyOverrideProof(preMeta, ov, liveWindowObs);
         if (!isWithinTinyOverrideBounds(ov, cleanArgs.x, cleanArgs.y)) {
-          actionRouteKey = formatDeliveryRoute(
-            "click",
-            cleanArgs.click_method === "window_post" ? "window_post" : "app_post"
+          actionRouteKey = requestedRoute || null;
+          result = this.#buildNotSentError(
+            "out_of_bounds",
+            "Click coordinates are outside the current window screenshot bounds."
           );
-          result = {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: "Click coordinates are outside the current window screenshot bounds.",
-              },
-            ],
-          };
+        } else if (!ovProof.ovMatched) {
+          actionRouteKey = requestedRoute || null;
+          result = this.#buildNotSentError(
+            "unproven_same_window",
+            "Coordinate click blocked (unproven_same_window): tiny-window override does not match current target window."
+          );
         } else {
           const beforeWriteCheck = () => this.#beforeWrite(operation, false);
           beforeWriteCheck();
           const { screenX, screenY } = mapTinyOverridePoint(ov, cleanArgs.x, cleanArgs.y);
           const allowAppPostFallback =
             cleanArgs.click_method !== "window_post" &&
+            windowDelivery?.route !== "ocu_pixel" &&
+            ovProof.singleWindowOk &&
             !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post", {
               routeScope: effectiveRouteScope,
             });
@@ -980,32 +1473,95 @@ export class BackgroundActionExecutor {
               beforeWriteCheck,
             }),
             "click:point_override"
+          ).catch((err) => {
+            this.#rethrowIfAborted(err);
+            return { delivered: false, deliveryState: "not_sent", reason: err?.message || "point_click_error" };
+          });
+          const unpackedPt = unpackPointDispatchResult(
+            rawClick,
+            cleanArgs.click_method === "window_post" ? "window_post" : "app_post",
+            "click"
           );
-          const ok =
-            typeof rawClick === "object" && rawClick !== null
-              ? Boolean(rawClick.delivered)
-              : Boolean(rawClick);
-          const effectiveMethod =
-            (typeof rawClick === "object" && rawClick?.method) ||
-            (cleanArgs.click_method === "window_post" ? "window_post" : "app_post");
-          actionRouteKey = formatDeliveryRoute("click", effectiveMethod);
-          result = ok
-            ? { isError: false, content: [{ type: "text", text: "ok" }] }
-            : { isError: true, content: [{ type: "text", text: "Background point click failed." }] };
+          actionRouteKey = formatDeliveryRoute("click", unpackedPt.method);
+          result = unpackedPt.result;
         }
       } else {
-        const methods = this.focusPolicyGuard.planClick(cleanArgs, aliases, {
-          routeScope: effectiveRouteScope,
-        });
+        const regularCoordAuth =
+          isCoordClickDispatch && (!windowDelivery?.route || windowDelivery.route === "ocu_pixel")
+            ? this.#authorizeCoordDispatch(preMeta, {
+                liveWindowObs,
+                targetWindowId: windowDelivery?.windowId || null,
+                windowSize: windowDelivery?.windowBoundsPt
+                  ? {
+                      width: windowDelivery.windowBoundsPt.width ?? windowDelivery.windowBoundsPt.w,
+                      height: windowDelivery.windowBoundsPt.height ?? windowDelivery.windowBoundsPt.h,
+                    }
+                  : null,
+                actionLabel: "click",
+              })
+            : { ok: true };
         let lastRes = null;
-        for (const method of methods) {
-          actionRouteKey = formatDeliveryRoute("click", method);
-          lastRes = await this.#dispatchClickMethod(method, ctx);
-          if (!lastRes?.isError || lastRes?.fatal) break;
+        if (!regularCoordAuth.ok) {
+          actionRouteKey = requestedRoute || null;
+          lastRes = {
+            isError: true,
+            deliveryState: "not_sent",
+            fatal: true,
+            reason: regularCoordAuth.reason,
+            content: [{ type: "text", text: regularCoordAuth.message }],
+          };
+        } else {
+          const windowPostAvailable = await getJxaTrusted();
+          const plannedMethods = this.focusPolicyGuard.planClick(cleanArgs, aliases, {
+            routeScope: effectiveRouteScope,
+            windowPostAvailable,
+          });
+          const isOcuPixel = windowDelivery?.route === "ocu_pixel";
+          const methods = isOcuPixel
+            ? plannedMethods.includes("sky_click")
+              ? ["sky_click"]
+              : []
+            : plannedMethods;
+          if (methods.length === 0) {
+            actionRouteKey = requestedRoute || null;
+            lastRes = {
+              isError: true,
+              deliveryState: "not_sent",
+              fatal: true,
+              reason: isOcuPixel
+                ? "ocu_pixel_sky_click_blocked"
+                : !windowPostAvailable
+                  ? "jxa_accessibility_untrusted"
+                  : "click_route_blocked",
+              content: [
+                {
+                  type: "text",
+                  text: isOcuPixel
+                    ? "Click blocked: sky_click caused focus steals on this window and ocu_pixel cannot fall back to non-sky routes."
+                    : !windowPostAvailable
+                      ? "Click blocked: all OCU click routes caused focus steals on this window and window_post is unavailable (jxa_accessibility_untrusted)."
+                      : "Click blocked: no compliant non-activating Delivery Route available for this window.",
+                },
+              ],
+            };
+          } else {
+            for (const method of methods) {
+              actionRouteKey = formatDeliveryRoute("click", method);
+              lastRes = await this.#dispatchClickMethod(method, ctx);
+              if (isWriteOutcomeUnknown(lastRes)) {
+                lastRes = normalizeUnknownOutcomeResult(lastRes);
+                break;
+              }
+              if (!lastRes?.isError || lastRes?.fatal) break;
+            }
+          }
         }
 
         if (
           lastRes?.isError &&
+          !lastRes?.fatal &&
+          !isWriteOutcomeUnknown(lastRes) &&
+          cleanArgs.click_method !== "window_post" &&
           (cleanArgs.mouse_button || "left") === "right" &&
           parsedRef?.hasElementRef &&
           preMeta?.pid > 0 &&
@@ -1036,6 +1592,12 @@ export class BackgroundActionExecutor {
               isError: false,
               content: [{ type: "text", text: "Context menu triggered via AXShowMenu." }],
             };
+          } else if (menuRes?.deliveryState === "sent_unknown") {
+            actionRouteKey = formatDeliveryRoute("click", "ax_show_menu");
+            lastRes = sentUnknownError(
+              `Context menu trigger outcome unknown via AXShowMenu (${menuRes?.reason || "sent_unknown"}).`,
+              menuRes?.reason || "write_outcome_unknown"
+            );
           }
         }
         result = lastRes;
@@ -1108,17 +1670,47 @@ export class BackgroundActionExecutor {
             isError: false,
             content: [{ type: "text", text: "Text inserted via AXSelectedText." }],
           };
+        } else if (axRes?.deliveryState === "sent_unknown") {
+          actionRouteKey = formatDeliveryRoute("type_text", "ax_selected_text");
+          lastRes = sentUnknownError(
+            `Text insertion outcome unknown via AXSelectedText (${axRes?.reason || "sent_unknown"}).`,
+            axRes?.reason || "write_outcome_unknown"
+          );
         }
       }
 
       if (!lastRes) {
+        const windowKeyAvailable = await getJxaTrusted();
         const methods = this.focusPolicyGuard.planKey(name, cleanArgs, aliases, {
           routeScope: effectiveRouteScope,
+          windowKeyAvailable,
         });
-        for (const method of methods) {
-          actionRouteKey = formatDeliveryRoute(name, method);
-          lastRes = await this.#dispatchKeyMethod(name, method, ctx);
-          if (!lastRes?.isError || lastRes?.fatal) break;
+        if (methods.length === 0) {
+          actionRouteKey = requestedRoute || null;
+          lastRes = {
+            isError: true,
+            deliveryState: "not_sent",
+            fatal: true,
+            reason: !windowKeyAvailable ? "jxa_accessibility_untrusted" : "key_route_blocked",
+            content: [
+              {
+                type: "text",
+                text: !windowKeyAvailable
+                  ? `${name} blocked: sky_key caused focus steals on this window and window_key is unavailable (jxa_accessibility_untrusted).`
+                  : `${name} blocked: no compliant non-activating key Delivery Route available.`,
+              },
+            ],
+          };
+        } else {
+          for (const method of methods) {
+            actionRouteKey = formatDeliveryRoute(name, method);
+            lastRes = await this.#dispatchKeyMethod(name, method, ctx);
+            if (isWriteOutcomeUnknown(lastRes)) {
+              lastRes = normalizeUnknownOutcomeResult(lastRes);
+              break;
+            }
+            if (!lastRes?.isError || lastRes?.fatal) break;
+          }
         }
       }
 
@@ -1150,25 +1742,46 @@ export class BackgroundActionExecutor {
         preMeta?.pid > 0 &&
         typeof this.pointDragFn === "function"
       ) {
-        actionRouteKey = formatDeliveryRoute("drag", "app_post");
+        const ovProof = this.#evaluateTinyOverrideProof(preMeta, ov, liveWindowObs);
         if (
           !isWithinTinyOverrideBounds(ov, startX, startY) ||
           !isWithinTinyOverrideBounds(ov, cleanArgs.to_x, cleanArgs.to_y)
         ) {
-          result = {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: "Drag coordinates are outside the current window screenshot bounds.",
-              },
-            ],
-          };
+          actionRouteKey = requestedRoute || null;
+          result = this.#buildNotSentError(
+            "out_of_bounds",
+            "Drag coordinates are outside the current window screenshot bounds."
+          );
+        } else if (!ovProof.ovMatched) {
+          actionRouteKey = requestedRoute || null;
+          result = this.#buildNotSentError(
+            "unproven_same_window",
+            "Coordinate drag blocked (unproven_same_window): tiny-window override does not match current target window."
+          );
+        } else if (!ovProof.singleWindowOk) {
+          actionRouteKey = requestedRoute || null;
+          result = this.#buildNotSentError(
+            "unproven_single_window",
+            "Coordinate drag blocked (unproven_single_window): PID-level tiny-window drag requires a proven single-window screenshot match."
+          );
+        } else if (
+          windowDelivery?.route === "ocu_pixel" ||
+          this.focusPolicyGuard.isMethodBlocked(aliases, "drag", "app_post", {
+            routeScope: effectiveRouteScope,
+          })
+        ) {
+          actionRouteKey = requestedRoute || null;
+          result = this.#buildNotSentError(
+            windowDelivery?.route === "ocu_pixel" ? "ocu_pixel_drag_blocked" : "drag_route_blocked",
+            "Coordinate drag blocked: PID-level drag:app_post is unavailable or blocked for this window."
+          );
         } else {
-          this.#beforeWrite(operation, false);
+          actionRouteKey = formatDeliveryRoute("drag", "app_post");
+          const beforeWriteCheck = () => this.#beforeWrite(operation, false);
+          beforeWriteCheck();
           const fromPt = mapTinyOverridePoint(ov, startX, startY);
           const toPt = mapTinyOverridePoint(ov, cleanArgs.to_x, cleanArgs.to_y);
-          const ok = await this.#trackWrite(
+          const dragRes = await this.#trackWrite(
             operation,
             this.pointDragFn(
               preMeta.pid,
@@ -1176,19 +1789,31 @@ export class BackgroundActionExecutor {
               fromPt.screenY,
               toPt.screenX,
               toPt.screenY,
-              { syntheticTag: this.takeoverController?.syntheticEventTag || 0 }
+              {
+                syntheticTag: this.takeoverController?.syntheticEventTag || 0,
+                beforeWriteCheck,
+              }
             ),
             "drag:app_post"
-          );
-          result = ok
-            ? { isError: false, content: [{ type: "text", text: "Drag delivered via app_post" }] }
-            : { isError: true, content: [{ type: "text", text: "Background point drag failed." }] };
+          ).catch((err) => {
+            this.#rethrowIfAborted(err);
+            return { delivered: false, deliveryState: "not_sent", reason: err?.message || "point_drag_error" };
+          });
+          result = unpackPointDispatchResult(dragRes, "app_post", "drag").result;
         }
       } else {
         let handledViaBypass = false;
         if (name === "scroll" && windowDelivery?.route === "window_post" && typeof this.windowScrollFn === "function") {
+          const jxaTrusted = await getJxaTrusted();
           const targetPid = Number(windowDelivery.pid || preMeta?.pid || 0);
-          if (targetPid > 0) {
+          if (!jxaTrusted) {
+            actionRouteKey = formatDeliveryRoute("scroll", "window_post_scroll");
+            result = this.#buildJxaUntrustedError(
+              "Window-local scroll unavailable (jxa_accessibility_untrusted).",
+              { fatal: true }
+            );
+            handledViaBypass = true;
+          } else if (targetPid > 0) {
             const beforeWriteCheck = () => this.#beforeWrite(operation, false);
             beforeWriteCheck();
             const wb = windowDelivery.windowBoundsPt || null;
@@ -1224,15 +1849,22 @@ export class BackgroundActionExecutor {
             );
             result = winScroll?.delivered
               ? { isError: false, content: [{ type: "text", text: "Scrolled via window_post_scroll." }] }
-              : {
-                  isError: true,
-                  content: [
-                    {
-                      type: "text",
-                      text: `Window-local scroll failed (${winScroll?.reason || "unavailable"}).`,
-                    },
-                  ],
-                };
+              : isWriteOutcomeUnknown(winScroll)
+                ? normalizeUnknownOutcomeResult(
+                    winScroll,
+                    `Window-local scroll failed (${winScroll?.reason || "unavailable"}).`
+                  )
+                : {
+                    isError: true,
+                    ...(winScroll?.deliveryState ? { deliveryState: winScroll.deliveryState } : {}),
+                    ...(winScroll?.reason ? { reason: winScroll.reason } : {}),
+                    content: [
+                      {
+                        type: "text",
+                        text: `Window-local scroll failed (${winScroll?.reason || "unavailable"}).`,
+                      },
+                    ],
+                  };
             handledViaBypass = true;
           }
         }
@@ -1250,21 +1882,57 @@ export class BackgroundActionExecutor {
               actionRouteKey = formatDeliveryRoute("set_value", "sky_bypass");
               directDeliveryVerified = Boolean(bypass.verified);
               result = bypass.result;
+            } else if (bypass?.outcomeUnknown) {
+              handledViaBypass = true;
+              actionRouteKey = formatDeliveryRoute("set_value", "sky_bypass");
+              result = normalizeUnknownOutcomeResult(
+                bypass.result,
+                "Background set_value bypass outcome unknown; blocked native fallback.",
+                "set_value_bypass_unknown"
+              );
             }
           }
         }
 
         if (!handledViaBypass) {
-          result = await this.#callActionPeerWithRecovery(name, cleanArgs, app, {
-            shouldFollow,
-            allowAutoRefresh,
-            operation,
-          });
+          const hasAnyDragCoord =
+            Number.isFinite(startX) ||
+            Number.isFinite(startY) ||
+            Number.isFinite(cleanArgs.to_x) ||
+            Number.isFinite(cleanArgs.to_y);
+          const isCoordDragDispatch = name === "drag" && hasAnyDragCoord;
+          const coordDragAuth = isCoordDragDispatch
+            ? this.#authorizeCoordDispatch(preMeta, {
+                liveWindowObs,
+                actionLabel: "drag",
+              })
+            : { ok: true };
+          if (!coordDragAuth.ok) {
+            actionRouteKey = requestedRoute || null;
+            result = {
+              isError: true,
+              deliveryState: "not_sent",
+              fatal: true,
+              reason: coordDragAuth.reason,
+              content: [{ type: "text", text: coordDragAuth.message }],
+            };
+          } else {
+            result = await this.#callActionPeerWithRecovery(name, cleanArgs, app, {
+              shouldFollow,
+              allowAutoRefresh,
+              operation,
+              expectedAgentInstanceId: isCoordDragDispatch
+                ? coordDragAuth.proof?.peerInstanceId || preMeta?.actionScreenshotMeta?.peerInstanceId || null
+                : null,
+            });
+          }
         }
 
         if (
           name === "scroll" &&
           result?.isError &&
+          !result?.fatal &&
+          !isWriteOutcomeUnknown(result) &&
           preMeta?.pid > 0 &&
           (!windowDelivery || windowDelivery.allowAppPostFallback !== false) &&
           !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "ax_scrollbar", {
@@ -1300,6 +1968,12 @@ export class BackgroundActionExecutor {
               isError: false,
               content: [{ type: "text", text: "Scrolled via AXScrollBar." }],
             };
+          } else if (axScroll?.deliveryState === "sent_unknown") {
+            actionRouteKey = formatDeliveryRoute("scroll", "ax_scrollbar");
+            result = sentUnknownError(
+              `Scroll outcome unknown via AXScrollBar (${axScroll?.reason || "sent_unknown"}).`,
+              axScroll?.reason || "write_outcome_unknown"
+            );
           }
         }
       }
@@ -1348,7 +2022,12 @@ export class BackgroundActionExecutor {
       };
     }
 
-    if (parsedRef?.snapshotId && result?.isError && STALE_SNAPSHOT_RE.test(extractResultText(result))) {
+    if (
+      !isWriteOutcomeUnknown(result) &&
+      parsedRef?.snapshotId &&
+      result?.isError &&
+      STALE_SNAPSHOT_RE.test(extractResultText(result))
+    ) {
       const latestNow = this.registry.getLatestSnapshot(preAppKey);
       return {
         result: buildStaleRefToolResult({
@@ -1524,9 +2203,25 @@ export class BackgroundActionExecutor {
   }
 
   async #isJxaPostTrusted() {
-    if (typeof this.axBridge?.checkPermissions !== "function") return true;
-    const perms = await this.axBridge.checkPermissions().catch(() => null);
-    return perms?.accessibility !== false;
+    return resolveJxaPostTrust({
+      axBridge: this.axBridge,
+      hasCustomWindowTransport:
+        this.windowClickFn !== tryWindowPostClick ||
+        this.windowKeyFn !== tryWindowKey ||
+        this.windowTextFn !== tryWindowText ||
+        this.windowScrollFn !== tryWindowScroll,
+    });
+  }
+
+  async #resolveLiveWindowObs(pid, { liveWindowObs = null, windowTitle = "" } = {}) {
+    if (liveWindowObs) return liveWindowObs;
+    return resolveFocusedWindowObservation({
+      pid,
+      windowTitle,
+      desktopHelperClient: this.desktopHelperClient,
+      axBridge: this.axBridge,
+      allowListWindowsFallback: true,
+    });
   }
 
   async executeActScroll({
@@ -1538,6 +2233,7 @@ export class BackgroundActionExecutor {
     pages = 0.7,
     windowId = null,
     localPoint = null,
+    liveWindowObs = null,
     timeoutMs = null,
     operation = null,
   } = {}) {
@@ -1547,9 +2243,21 @@ export class BackgroundActionExecutor {
         ? Number(windowId)
         : meta?.tinyWindowOverride?.wid || meta?.windowId || null;
     const routeScope = this.#resolveRouteScope(meta, { windowId: wid });
+    const isPinnedWin = Number(windowId) > 0;
     const beforeWriteCheck = () => this.#beforeWrite(operation, false);
+    const unknownScrollResult = (routeMethod, reason) => ({
+      delivered: false,
+      outcomeUnknown: true,
+      code: "WRITE_OUTCOME_UNKNOWN",
+      deliveryState: "sent_unknown",
+      fatal: true,
+      reason: reason || "write_outcome_unknown",
+      route: formatDeliveryRoute("scroll", routeMethod),
+    });
+    let lastReason = null;
 
     if (
+      !isPinnedWin &&
       pid > 0 &&
       typeof this.axScrollFallbackFn === "function" &&
       !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "ax_scrollbar", { routeScope })
@@ -1571,17 +2279,31 @@ export class BackgroundActionExecutor {
       if (axRes?.delivered && axRes?.verified) {
         return { delivered: true, route: formatDeliveryRoute("scroll", "ax_scrollbar") };
       }
+      if (isWriteOutcomeUnknown(axRes)) {
+        return unknownScrollResult("ax_scrollbar", axRes?.reason);
+      }
+      if (axRes?.reason) lastReason = axRes.reason;
     }
 
     const jxaTrusted = await this.#isJxaPostTrusted();
     if (jxaTrusted && pid > 0 && typeof this.windowScrollFn === "function") {
+      const effectiveLiveObs = await this.#resolveLiveWindowObs(pid, {
+        liveWindowObs,
+        windowTitle: meta?.windowTitle || "",
+      });
       beforeWriteCheck();
-      const allowAppPostFallback = !this.focusPolicyGuard.isMethodBlocked(
-        aliases,
-        "click",
-        "app_post",
-        { routeScope }
-      );
+      const scrollProof = evaluateScreenshotMetaProof(meta, {
+        pid,
+        expectedPeerInstanceId: this.actionPeer?.agentInstanceId || null,
+        callerExplicitWindowId: isPinnedWin ? windowId : null,
+        targetWindowId: wid,
+        liveWindowObs: effectiveLiveObs,
+        requireSingleWindow: true,
+      });
+      const allowAppPostFallback =
+        scrollProof.proven &&
+        !this.focusPolicyGuard.isMethodBlocked(aliases, "scroll", "app_post_scroll", { routeScope }) &&
+        !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post", { routeScope });
       const winBounds =
         meta?.windowBounds || meta?.tinyWindowOverride?.bounds || null;
       const winRes = await this.#trackWrite(
@@ -1616,10 +2338,14 @@ export class BackgroundActionExecutor {
           route: formatDeliveryRoute("scroll", winRes.method || "window_post_scroll"),
         };
       }
+      if (isWriteOutcomeUnknown(winRes)) {
+        return unknownScrollResult(winRes?.method || "window_post_scroll", winRes?.reason);
+      }
+      if (winRes?.reason) lastReason = winRes.reason;
     }
 
     if (
-      !(Number(windowId) > 0) &&
+      !isPinnedWin &&
       !this.focusPolicyGuard.hasPriorStealForScope(
         aliases,
         ["scroll:native", "click:sky_click"],
@@ -1639,9 +2365,16 @@ export class BackgroundActionExecutor {
       if (nativeRes && !nativeRes.isError) {
         return { delivered: true, route: formatDeliveryRoute("scroll", "native") };
       }
+      if (isWriteOutcomeUnknown(nativeRes)) {
+        return unknownScrollResult("native", nativeRes?.reason);
+      }
     }
 
-    return { delivered: false, route: null };
+    return {
+      delivered: false,
+      route: null,
+      reason: lastReason || (isPinnedWin && !jxaTrusted ? "jxa_accessibility_untrusted" : "scroll_unavailable"),
+    };
   }
 
   async executeActClick({
@@ -1652,7 +2385,10 @@ export class BackgroundActionExecutor {
     match,
     resolvedTarget = null,
     explicitWindowId = null,
+    targetWindowId = null,
+    queryPeerInstanceId = null,
     windowTitle = "",
+    liveWindowObs = null,
     mouseButton = "left",
     clickCount = 1,
     signal = null,
@@ -1678,8 +2414,33 @@ export class BackgroundActionExecutor {
     const windowClipBox = windowSize ? { x: 0, y: 0, w: windowSize.width, h: windowSize.height } : null;
 
     const cardBounds = normalizeElementBounds(resolvedTarget?.localBounds);
+    const targetBoxForClip = cardBounds || rawBounds;
+    const clippedCenter = targetBoxForClip
+      ? clipBoxIntersectionCenter(targetBoxForClip, windowClipBox, {
+          requireOverlap: Boolean(windowClipBox),
+        })
+      : null;
+    const effectiveWid =
+      Number(explicitWindowId) > 0
+        ? Number(explicitWindowId)
+        : Number(targetWindowId) > 0
+          ? Number(targetWindowId)
+          : resolvedTarget?.wid || meta?.tinyWindowOverride?.wid || meta?.windowId || null;
+    const routeScope = this.#resolveRouteScope(meta, { windowId: effectiveWid });
+
+    if (targetBoxForClip && windowClipBox && !clippedCenter) {
+      return {
+        delivered: false,
+        clicksSent: 0,
+        aborted: false,
+        routeKey: null,
+        routeScope,
+        failureReason: "target_offscreen",
+      };
+    }
+
     const finalLocalPoint =
-      clipBoxIntersectionCenter(cardBounds || rawBounds, windowClipBox) ||
+      clippedCenter ||
       (resolvedTarget?.centerLocalPoint &&
       Number.isFinite(Number(resolvedTarget.centerLocalPoint.x)) &&
       Number.isFinite(Number(resolvedTarget.centerLocalPoint.y))
@@ -1687,32 +2448,63 @@ export class BackgroundActionExecutor {
         : null) ||
       initialLocalPoint;
 
-    const effectiveWid =
-      Number(explicitWindowId) > 0
-        ? Number(explicitWindowId)
-        : resolvedTarget?.wid || meta?.tinyWindowOverride?.wid || meta?.windowId || null;
-    const routeScope = this.#resolveRouteScope(meta, { windowId: effectiveWid });
+    if (
+      finalLocalPoint &&
+      windowClipBox &&
+      (finalLocalPoint.x < windowClipBox.x ||
+        finalLocalPoint.x > windowClipBox.x + windowClipBox.w ||
+        finalLocalPoint.y < windowClipBox.y ||
+        finalLocalPoint.y > windowClipBox.y + windowClipBox.h)
+    ) {
+      return {
+        delivered: false,
+        clicksSent: 0,
+        aborted: false,
+        routeKey: null,
+        routeScope,
+        failureReason: "target_offscreen",
+      };
+    }
 
-    const methods = this.focusPolicyGuard.planClick({ click_method: "auto" }, aliases, {
-      routeScope,
+    const effectiveLiveObs = await this.#resolveLiveWindowObs(pid, {
+      liveWindowObs,
+      windowTitle: windowTitle || meta?.windowTitle || "",
     });
+    const auth = authorizeActionScreenshotCoords(meta, {
+      pid,
+      callerExplicitWindowId: explicitWindowId,
+      targetWindowId: effectiveWid,
+      windowSize,
+      localPoint: finalLocalPoint,
+      actionPeerInstanceId: this.actionPeer?.agentInstanceId || null,
+      liveWindowObs: effectiveLiveObs,
+    });
+    const singleWindowOk = Boolean(auth.sameWindowProven && isSingleWindowProven(auth));
+
+    const jxaTrusted = await this.#isJxaPostTrusted();
+    const methods = this.focusPolicyGuard.planClick(
+      { click_method: "auto", mouse_button: mouseButton, click_count: clickCount },
+      aliases,
+      { routeScope, windowPostAvailable: jxaTrusted }
+    );
     const allowWindowPost = !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "window_post", {
       routeScope,
     });
-    const allowAppPostFallback = !this.focusPolicyGuard.isMethodBlocked(
-      aliases,
-      "click",
-      "app_post",
-      { routeScope }
-    );
+    const allowAppPostFallback =
+      singleWindowOk &&
+      !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post", { routeScope });
 
-    const jxaTrusted = await this.#isJxaPostTrusted();
-    let routeKey = formatDeliveryRoute("click", "window_post");
     let failureReason = null;
 
-    if (jxaTrusted && pid > 0 && allowWindowPost && typeof this.windowClickFn === "function" && finalLocalPoint) {
+    if (
+      jxaTrusted &&
+      allowWindowPost &&
+      pid > 0 &&
+      typeof this.windowClickFn === "function" &&
+      finalLocalPoint
+    ) {
       if (signal?.aborted) {
-        return { delivered: false, clicksSent: 0, aborted: true, routeKey, failureReason: "cancelled" };
+        return { delivered: false, clicksSent: 0, aborted: true, routeKey: null, routeScope, failureReason: "cancelled" };
       }
       beforeWriteCheck();
       const elemMeta =
@@ -1749,119 +2541,120 @@ export class BackgroundActionExecutor {
       });
 
       if (winRes?.delivered) {
-        routeKey = formatDeliveryRoute("click", winRes.method || "window_post");
         return {
           delivered: true,
           clicksSent: 1,
           aborted: false,
-          routeKey,
+          routeKey: formatDeliveryRoute("click", winRes.method || "window_post"),
+          routeScope,
           failureReason: null,
           localPoint: finalLocalPoint,
         };
       }
       failureReason = winRes?.reason || "window_post_unavailable";
+      if (isWriteOutcomeUnknown(winRes)) {
+        return {
+          delivered: false,
+          clicksSent: 1,
+          aborted: false,
+          code: "WRITE_OUTCOME_UNKNOWN",
+          deliveryState: "sent_unknown",
+          fatal: true,
+          routeKey: formatDeliveryRoute("click", "window_post"),
+          routeScope,
+          failureReason: winRes?.reason || "write_outcome_unknown",
+        };
+      }
       if (
         winRes?.reason === "window_resized" ||
         winRes?.reason === "out_of_bounds" ||
+        winRes?.reason === "element_window_mismatch" ||
         /^(?:element|window)_(?:destroyed|mutated|hidden|moved|changed)_in_background$|^modal_sheet_appeared$/u.test(
           String(winRes?.reason || "")
         )
       ) {
-        return { delivered: false, clicksSent: 0, aborted: false, routeKey, failureReason };
+        return { delivered: false, clicksSent: 0, aborted: false, routeKey: null, routeScope, failureReason };
       }
     }
 
     if (signal?.aborted) {
-      return { delivered: false, clicksSent: 0, aborted: true, routeKey, failureReason: "cancelled" };
+      return { delivered: false, clicksSent: 0, aborted: true, routeKey: null, routeScope, failureReason: "cancelled" };
     }
 
-    if (
-      methods.includes("sky_click") &&
-      !this.focusPolicyGuard.hasPriorStealForScope(aliases, ["click:sky_click"], routeScope)
-    ) {
-      const canMapPx =
-        !(Number(explicitWindowId) > 0) &&
-        finalLocalPoint &&
-        windowSize &&
-        meta?.actionFrameWidth > 0 &&
-        meta?.actionFrameHeight > 0;
-      const px = canMapPx
-        ? windowPointToScreenshotPixel(finalLocalPoint, {
-            windowWidth: windowSize.width,
-            windowHeight: windowSize.height,
-            imageWidth: meta.actionFrameWidth,
-            imageHeight: meta.actionFrameHeight,
-          })
-        : null;
-      const matchWid = Number(match?.window_id || 0);
-      const isPinned = Number(explicitWindowId) > 0;
-      const elemMeta =
-        match?.index !== undefined ? meta?.elements?.get(String(match.index)) : null;
-      const hasPinnedMatchWid =
-        matchWid === Number(explicitWindowId) ||
-        Number(elemMeta?.windowId || 0) === Number(explicitWindowId);
-      const hasSnapshotProvenance = Boolean(elemMeta && elemMeta.origin);
-      const canUseIdx =
-        match?.index !== undefined &&
-        (!isPinned || (hasPinnedMatchWid && hasSnapshotProvenance));
-      const preferCardPx = !isPinned && resolvedTarget?.reason === "ax_card" && Boolean(px);
-      const clickArgs = preferCardPx
-        ? {
-            app,
-            click_method: "sky_click",
-            x: Math.round(px.x),
-            y: Math.round(px.y),
-            mouse_button: mouseButton,
-            click_count: clickCount,
-          }
-        : canUseIdx
-          ? {
-              app,
-              click_method: "sky_click",
-              element_index: String(match.index),
-              mouse_button: mouseButton,
-              click_count: clickCount,
-            }
-          : px
-            ? {
-                app,
-                click_method: "sky_click",
-                x: Math.round(px.x),
-                y: Math.round(px.y),
-                mouse_button: mouseButton,
-                click_count: clickCount,
-              }
-            : null;
+    const ocuMethods = methods.filter((m) => m === "sky_click" || m === "app_post");
+    for (const ocuMethod of ocuMethods) {
+      const built = buildActNativeClickArgs({
+        app,
+        clickMethod: ocuMethod,
+        match,
+        resolvedTarget,
+        meta,
+        auth,
+        callerExplicitWindowId: explicitWindowId,
+        queryPeerInstanceId,
+        jxaTrusted,
+        mouseButton,
+        clickCount,
+      });
 
-      if (clickArgs) {
+      if (built?.clickArgs) {
+        if (signal?.aborted) {
+          return { delivered: false, clicksSent: 0, aborted: true, routeKey: null, routeScope, failureReason: "cancelled" };
+        }
         beforeWriteCheck();
-        routeKey = formatDeliveryRoute("click", "sky_click");
+        const candidateRoute = formatDeliveryRoute("click", ocuMethod);
         const callTimeout =
           Number(remainingBudgetMs) > 0 ? Math.max(50, Math.min(8000, remainingBudgetMs)) : undefined;
+        let stalePeerErr = null;
         const nativeClick = await this.#trackWrite(
           operation,
-          this.actionPeer.callTool("click", clickArgs, callTimeout, { beforeWriteCheck }),
-          "click:sky_click"
+          this.actionPeer.callTool("click", built.clickArgs, callTimeout, {
+            beforeWriteCheck,
+            expectedAgentInstanceId: built.expectedAgentInstanceId,
+          }),
+          candidateRoute
         ).catch((err) => {
           this.#rethrowIfAborted(err);
+          if (err?.code === "STALE_PEER_GENERATION") {
+            stalePeerErr = err;
+            return null;
+          }
           return null;
         });
+        if (stalePeerErr) {
+          return {
+            delivered: false,
+            clicksSent: 0,
+            aborted: false,
+            routeKey: null,
+            routeScope,
+            failureReason: "stale_peer_generation",
+          };
+        }
         if (nativeClick && !nativeClick.isError) {
           return {
             delivered: true,
             clicksSent: 1,
             aborted: false,
-            routeKey,
+            routeKey: candidateRoute,
+            routeScope,
             failureReason: null,
             localPoint: finalLocalPoint,
           };
         }
+        const isUnknown = isWriteOutcomeUnknown(nativeClick);
         return {
           delivered: false,
-          clicksSent: 1,
+          clicksSent: isUnknown ? 1 : nativeClick?.deliveryState === "not_sent" ? 0 : 1,
           aborted: false,
-          routeKey,
-          failureReason: extractResultText(nativeClick) || failureReason || "sky_click_failed",
+          ...(isUnknown
+            ? { code: "WRITE_OUTCOME_UNKNOWN", deliveryState: "sent_unknown", fatal: true }
+            : nativeClick?.deliveryState
+              ? { deliveryState: nativeClick.deliveryState }
+              : {}),
+          routeKey: candidateRoute,
+          routeScope,
+          failureReason: extractResultText(nativeClick) || failureReason || `${ocuMethod}_failed`,
         };
       }
     }
@@ -1870,8 +2663,11 @@ export class BackgroundActionExecutor {
       delivered: false,
       clicksSent: 0,
       aborted: false,
-      routeKey,
-      failureReason: failureReason || "click_route_blocked",
+      routeKey: null,
+      routeScope,
+      failureReason: !jxaTrusted
+        ? failureReason || "click_route_blocked (jxa_accessibility_untrusted)"
+        : failureReason || "click_route_blocked",
     };
   }
 }

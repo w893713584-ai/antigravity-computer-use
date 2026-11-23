@@ -198,12 +198,14 @@ export class SidecarWebAdapter {
     const nextWindowId = frameMeta
       ? (frameMeta.windowId ?? null)
       : (this.state.pinnedWindowId > 0 ? null : (this.state.windowId ?? null));
+    const nextAmbiguous = Boolean(frameMeta?.ambiguous);
     const lastHist = this.frameHistory[this.frameHistory.length - 1] || null;
     const identityChanged =
       !lastHist ||
       lastHist.targetKey !== nextTargetKey ||
       lastHist.geometryRev !== nextGeomRev ||
-      (lastHist.windowId ?? null) !== (nextWindowId ?? null);
+      (lastHist.windowId ?? null) !== (nextWindowId ?? null) ||
+      Boolean(lastHist.ambiguous) !== nextAmbiguous;
 
     const unchanged =
       !identityChanged &&
@@ -239,6 +241,7 @@ export class SidecarWebAdapter {
         targetKey: nextTargetKey,
         geometryRev: nextGeomRev,
         windowId: nextWindowId,
+        ambiguous: nextAmbiguous,
         frameRef,
       });
       if (this.frameHistory.length > MAX_FRAME_HISTORY) {

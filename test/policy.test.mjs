@@ -659,12 +659,22 @@ test("planBackgroundClickMethods & planBackgroundKeyMethods honor sky_click / sk
     assert.equal(danglingPlus.delivered, false);
     assert.equal(danglingPlus.reason, "unsupported_key");
 
-    // Valid chords including "Cmd+Z" and "cmd++" parse cleanly (non-existent pid 999998 is a safe kernel no-op)
+    // Valid chords including "Cmd+Z" and "cmd++" either succeed (when osascript has AX permission)
+    // or fail closed with jxa_accessibility_untrusted (never silently dropping events & returning delivered:true)
+    const perms = await bridge.checkPermissions().catch(() => null);
     const undoChord = await bridge.postWindowKey(999998, { key: "Cmd+Z" });
-    assert.equal(undoChord.delivered, true);
-
     const zoomInChord = await bridge.postWindowKey(999998, { key: "cmd++" });
-    assert.equal(zoomInChord.delivered, true);
+    if (perms?.accessibility === false) {
+      assert.equal(undoChord.delivered, false);
+      assert.equal(undoChord.deliveryState, "not_sent");
+      assert.equal(undoChord.reason, "jxa_accessibility_untrusted");
+      assert.equal(zoomInChord.delivered, false);
+      assert.equal(zoomInChord.deliveryState, "not_sent");
+      assert.equal(zoomInChord.reason, "jxa_accessibility_untrusted");
+    } else {
+      assert.equal(undoChord.delivered, true);
+      assert.equal(zoomInChord.delivered, true);
+    }
   } finally {
     await bridge.close();
   }

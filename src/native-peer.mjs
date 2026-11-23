@@ -91,6 +91,10 @@ export class NativeComputerUsePeer extends EventEmitter {
     this.queue = Promise.resolve();
   }
 
+  get agentInstanceId() {
+    return this.#currentAgentInstanceId;
+  }
+
   async ensureStarted() {
     if (this.disposed) {
       throw new Error(`${this.name} has been disposed`);
@@ -223,7 +227,18 @@ export class NativeComputerUsePeer extends EventEmitter {
     this.#currentAgentInstanceId = null;
     for (const entry of this.pending.values()) {
       if (entry.timer) clearTimeout(entry.timer);
-      entry.reject(reason);
+      if (entry.mutating && !reason?.deliveryState) {
+        const err = new Error(
+          reason instanceof Error ? reason.message : String(reason || "Peer closed while write in flight")
+        );
+        err.code = reason?.code || "WRITE_OUTCOME_UNKNOWN";
+        err.deliveryState = "sent_unknown";
+        err.dispatched = true;
+        err.fatal = true;
+        entry.reject(err);
+      } else {
+        entry.reject(reason);
+      }
     }
     this.pending.clear();
     if (pendingMutating && !deferAgentClear && clearedAgentId) {
@@ -288,7 +303,12 @@ export class NativeComputerUsePeer extends EventEmitter {
     } catch {}
   }
 
-  #rawRequest(method, params = {}, timeoutMs = DEFAULT_TIMEOUT_MS, { beforeWriteCheck = null } = {}) {
+  #rawRequest(
+    method,
+    params = {},
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    { beforeWriteCheck = null, expectedAgentInstanceId = null } = {}
+  ) {
     if (!this.child) {
       return Promise.reject(new Error(`${this.name} child process is not running`));
     }
@@ -301,6 +321,15 @@ export class NativeComputerUsePeer extends EventEmitter {
     }
     const id = this.nextId++;
     const agentInstanceId = this.#currentAgentInstanceId || `${this.name}-${this.#agentGenSeq}`;
+    if (expectedAgentInstanceId && agentInstanceId !== expectedAgentInstanceId) {
+      const staleErr = new Error(
+        `Stale native peer generation (expected ${expectedAgentInstanceId}, actual ${agentInstanceId})`
+      );
+      staleErr.code = "STALE_PEER_GENERATION";
+      staleErr.deliveryState = "not_sent";
+      staleErr.notSent = true;
+      return Promise.reject(staleErr);
+    }
     const mutating = !isReadOnlyMcpRequest(method, params);
     return new Promise((resolve, reject) => {
       const timer =
@@ -397,11 +426,15 @@ export class NativeComputerUsePeer extends EventEmitter {
   request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT_MS, options = {}) {
     const beforeWriteCheck =
       typeof options?.beforeWriteCheck === "function" ? options.beforeWriteCheck : null;
+    const expectedAgentInstanceId = options?.expectedAgentInstanceId || null;
     const task = this.queue.then(async () => {
       try {
         beforeWriteCheck?.();
         await this.ensureStarted();
-        const res = await this.#rawRequest(method, params, timeoutMs, { beforeWriteCheck });
+        const res = await this.#rawRequest(method, params, timeoutMs, {
+          beforeWriteCheck,
+          expectedAgentInstanceId,
+        });
         if (
           res?.isError &&
           isReadOnlyMcpRequest(method, params) &&
@@ -422,7 +455,10 @@ export class NativeComputerUsePeer extends EventEmitter {
           await new Promise((r) => setTimeout(r, 180));
           beforeWriteCheck?.();
           await this.ensureStarted();
-          return this.#rawRequest(method, params, timeoutMs, { beforeWriteCheck });
+          return this.#rawRequest(method, params, timeoutMs, {
+            beforeWriteCheck,
+            expectedAgentInstanceId,
+          });
         }
         throw err;
       }

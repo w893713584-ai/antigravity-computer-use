@@ -309,6 +309,7 @@ test("Codex #4, #12, #21, #22: JXA worker enforces bound target on sky_bypass fo
         }
         return -25205;
       },
+      AXIsProcessTrusted: () => true,
       NSFileHandle: {
         fileHandleWithStandardInput: { availableData: { length: 0 } },
         fileHandleWithStandardOutput: { writeData() {} },

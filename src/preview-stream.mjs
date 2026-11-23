@@ -195,6 +195,7 @@ export class PreviewStreamManager {
     actionPixelSize = null,
     scaleFactor = null,
     jxaTrusted = false,
+    singleWindowProven = false,
     ocuActionProven = false,
     readOnlyOverride = false,
     readOnlyReasonOverride = null,
@@ -227,26 +228,39 @@ export class PreviewStreamManager {
       }
     }
 
-    const next = createPreviewGeometry({
-      brokerBootId: this.brokerBootId,
-      pid,
-      processToken,
-      windowId,
-      windowGeneration: winGen,
-      targetKey,
-      explicitWindowId,
-      geometryRev,
-      windowBoundsPt: windowBoundsPt || prev?.windowBoundsPt || null,
-      previewContentRectPt: previewContentRectPt || prev?.previewContentRectPt || null,
-      previewPixelSize: previewPixelSize || prev?.previewPixelSize || null,
-      actionContentRectPt: actionContentRectPt || prev?.actionContentRectPt || null,
-      actionPixelSize: actionPixelSize || prev?.actionPixelSize || null,
-      scaleFactor: scaleFactor ?? prev?.scaleFactor ?? null,
-      jxaTrusted,
-      ocuActionProven,
-      readOnlyOverride,
-      readOnlyReasonOverride,
-    });
+    const buildGeometry = (rev) =>
+      createPreviewGeometry({
+        brokerBootId: this.brokerBootId,
+        pid,
+        processToken,
+        windowId,
+        windowGeneration: winGen,
+        targetKey,
+        explicitWindowId,
+        geometryRev: rev,
+        windowBoundsPt: windowBoundsPt || prev?.windowBoundsPt || null,
+        previewContentRectPt: previewContentRectPt || prev?.previewContentRectPt || null,
+        previewPixelSize: previewPixelSize || prev?.previewPixelSize || null,
+        actionContentRectPt: actionContentRectPt || prev?.actionContentRectPt || null,
+        actionPixelSize: actionPixelSize || prev?.actionPixelSize || null,
+        scaleFactor: scaleFactor ?? prev?.scaleFactor ?? null,
+        jxaTrusted,
+        singleWindowProven,
+        ocuActionProven,
+        readOnlyOverride,
+        readOnlyReasonOverride,
+      });
+
+    let next = buildGeometry(geometryRev);
+    if (
+      prev &&
+      geometryRev === (prev.geometryRev || 1) &&
+      (Boolean(prev.readOnly) !== Boolean(next.readOnly) ||
+        (prev.readOnlyReason ?? null) !== (next.readOnlyReason ?? null) ||
+        (prev.deliveryRoute ?? null) !== (next.deliveryRoute ?? null))
+    ) {
+      next = buildGeometry(geometryRev + 1);
+    }
 
     this.#geometries.set(targetKey, next);
     if (shouldSelectAsActive) {

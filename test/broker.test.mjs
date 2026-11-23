@@ -13,6 +13,30 @@ import { parseAppsList, extractResultText } from "../src/background-policy.mjs";
 const HAS_LIVE_OCU_BIN =
   path.isAbsolute(OPEN_COMPUTER_USE_BIN) && existsSync(OPEN_COMPUTER_USE_BIN);
 
+function createSingleWindowMockBridge({
+  wid = 31327,
+  title = "剪映专业版",
+  width = 1280,
+  height = 803,
+  accessibility = true,
+} = {}) {
+  return {
+    enabled: true,
+    async checkPermissions() {
+      return { accessibility, screenRecording: true };
+    },
+    async getFocusedWindowInfo() {
+      return {
+        wid,
+        title,
+        windowBounds: { x: 0, y: 0, w: width, h: height },
+        windowIds: [wid],
+      };
+    },
+    async close() {},
+  };
+}
+
 test("Broker HTTP token auth, pause brake, Raise interception, and live non-activating frame capture", async (t) => {
   if (!HAS_LIVE_OCU_BIN) {
     t.skip("Live desktop E2E requires an installed open-computer-use binary");
@@ -481,6 +505,14 @@ test("Mini-Window click-after-scroll preserves AX indexes and screenshot geometr
     socketPath: sock,
     actionPeer,
     streamPeer,
+    axBridge: createSingleWindowMockBridge({
+      wid: 901,
+      title: "WinA",
+      width: 1280,
+      height: 800,
+      accessibility: false,
+    }),
+    permissionsFn: async () => ({ platform: "darwin", accessibility: false, screenRecording: true }),
   });
   const { webPort } = await broker.start();
   const client = new BrokerRpcClient({ socketPath: sock });
@@ -622,6 +654,10 @@ test("BrokerRpcClient reconnects after broker restart without double-executing m
 test("Post-action read-back preserves drag diagnostic notes, /api/select-app surfaces windowless errors, and teardown isolates per-request dispatched flag", async () => {
   const sock = `/tmp/agy-cua-pass2-${process.pid}.sock`;
   const token = "pass2-token";
+  const miniJpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x03, 0x23, 0x05, 0x00, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xd9,
+  ]).toString("base64");
 
   const peer = {
     async listTools() {
@@ -648,7 +684,10 @@ test("Post-action read-back preserves drag diagnostic notes, /api/select-app sur
         }
         return {
           isError: false,
-          content: [{ type: "text", text: `App=com.example.AppA (pid ${process.pid})\nWindow: "WinA", App: AppA.` }],
+          content: [
+            { type: "text", text: `App=com.example.AppA (pid ${process.pid})\nWindow: "WinA", App: AppA.` },
+            { type: "image", mimeType: "image/jpeg", data: miniJpeg },
+          ],
         };
       }
       if (name === "drag") {
@@ -668,12 +707,24 @@ test("Post-action read-back preserves drag diagnostic notes, /api/select-app sur
     socketPath: sock,
     actionPeer: peer,
     streamPeer: peer,
+    axBridge: createSingleWindowMockBridge({
+      wid: 901,
+      title: "WinA",
+      width: 1280,
+      height: 803,
+      accessibility: false,
+    }),
   });
   const { webPort } = await broker.start();
   const client = new BrokerRpcClient({ socketPath: sock });
 
   try {
-    // 1. Drag diagnostic note must be preserved alongside post-action read-back state
+    // 1. Observe WinA with single-window screenshot proof, then drag diagnostic note must be preserved alongside post-action read-back state
+    await client.request("tools/call", {
+      name: "get_app_state",
+      arguments: { app: "com.example.AppA", include_ax: false, include_screenshot: true },
+      source: "ai",
+    });
     const dragRes = await client.request("tools/call", {
       name: "drag",
       arguments: { app: "com.example.AppA", from_x: 10, from_y: 10, to_x: 100, to_y: 100 },
@@ -724,6 +775,11 @@ test("Concurrent tool calls serialize cleanly, ai-repl gets safe read-back, and 
   let triggerImmediateSteal = false;
   let triggerDelayedStealMs = 0;
 
+  const miniJpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x03, 0x23, 0x05, 0x00, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xd9,
+  ]).toString("base64");
+
   const peer = {
     async listTools() {
       return {
@@ -753,6 +809,7 @@ test("Concurrent tool calls serialize cleanly, ai-repl gets safe read-back, and 
                 type: "text",
                 text: `App=com.lemon.lvpro (pid ${process.pid})\nWindow: "剪映专业版", App: 剪映专业版.`,
               },
+              { type: "image", mimeType: "image/jpeg", data: miniJpeg },
             ],
           };
         }
@@ -782,6 +839,8 @@ test("Concurrent tool calls serialize cleanly, ai-repl gets safe read-back, and 
     actionPeer: peer,
     streamPeer: peer,
     focusController,
+    axBridge: createSingleWindowMockBridge({ accessibility: false }),
+    permissionsFn: async () => ({ platform: "darwin", accessibility: false, screenRecording: true }),
   });
   await broker.start();
   const client = new BrokerRpcClient({ socketPath: sock });
@@ -2399,6 +2458,7 @@ test("Adaptive sky_click / sky_key blacklist stops repeated click:sky_click focu
     socketPath: sock,
     actionPeer: peer,
     streamPeer: peer,
+    axBridge: createSingleWindowMockBridge({ accessibility: true }),
     focusController: {
       async getFrontmostApp() {
         return currentFront;
@@ -2650,6 +2710,7 @@ test("Rapid <80ms delayed focus steal caught by next call's #captureProtectedFro
     socketPath: sock,
     actionPeer: peer,
     streamPeer: peer,
+    axBridge: createSingleWindowMockBridge({ accessibility: true }),
     focusController: {
       async getFrontmostApp() {
         return currentFront;

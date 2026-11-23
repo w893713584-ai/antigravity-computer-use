@@ -197,7 +197,12 @@ export class SelfActivationTracker {
 
 export function planBackgroundClickMethods(
   args = {},
-  { allowAccessibilityFallback = false, blockedMethods = [], avoidSkyFocus = false } = {}
+  {
+    allowAccessibilityFallback = false,
+    blockedMethods = [],
+    avoidSkyFocus = false,
+    windowPostAvailable = true,
+  } = {}
 ) {
   const blocked = new Set(
     Array.from(blockedMethods || []).map((m) => String(m || "").trim().toLowerCase())
@@ -206,6 +211,7 @@ export function planBackgroundClickMethods(
     blocked.delete(floorMethod);
   }
 
+  const floorAvailable = windowPostAvailable !== false;
   const skyBlocked = Boolean(avoidSkyFocus) || blocked.has("sky_click");
   const rawMethod = typeof args.click_method === "string" ? args.click_method.trim().toLowerCase() : "";
   const explicit = rawMethod && rawMethod !== "auto" && rawMethod !== "global" ? rawMethod : null;
@@ -215,20 +221,21 @@ export function planBackgroundClickMethods(
 
   const filterNonActivating = (candidates) => {
     const filtered = candidates.filter(
-      (m) => !blocked.has(m) && !(skyBlocked && m === "sky_click")
+      (m) =>
+        (floorAvailable || m !== "window_post") &&
+        !blocked.has(m) &&
+        !(skyBlocked && m === "sky_click")
     );
-    return filtered.length > 0 ? filtered : ["window_post"];
+    if (filtered.length > 0) return filtered;
+    return floorAvailable ? ["window_post"] : [];
   };
 
   if (explicit === "accessibility") {
-    const base =
-      button === "left" && (count === 1 || count === 2)
-        ? skyBlocked
-          ? ["window_post", "app_post"]
-          : ["sky_click", "app_post"]
-        : skyBlocked
-          ? ["window_post", "app_post"]
-          : ["app_post"];
+    const nonFloorBase =
+      button === "left" && (count === 1 || count === 2) && !skyBlocked
+        ? ["sky_click", "app_post"]
+        : ["app_post"];
+    const base = skyBlocked ? ["window_post", "app_post"] : nonFloorBase;
     const chain = filterNonActivating(base);
     if (!blocked.has("accessibility")) {
       chain.push("accessibility");
@@ -270,7 +277,7 @@ export function planBackgroundClickMethods(
 
 export function planBackgroundKeyMethods(
   args = {},
-  { blockedMethods = [], avoidSkyFocus = false } = {}
+  { blockedMethods = [], avoidSkyFocus = false, windowKeyAvailable = true } = {}
 ) {
   const blocked = new Set(
     Array.from(blockedMethods || []).map((m) => String(m || "").trim().toLowerCase())
@@ -278,6 +285,7 @@ export function planBackgroundKeyMethods(
   for (const floorMethod of WINDOW_LOCAL_DELIVERY_FLOOR) {
     blocked.delete(floorMethod);
   }
+  const floorAvailable = windowKeyAvailable !== false;
   const skyKeyDirectlyBlocked = blocked.has("sky_key");
   const preferWindowKey = Boolean(avoidSkyFocus) || skyKeyDirectlyBlocked;
   const rawMethod = typeof args.key_method === "string" ? args.key_method.trim().toLowerCase() : "";
@@ -287,14 +295,16 @@ export function planBackgroundKeyMethods(
   }
   if (explicit) {
     if (explicit === "sky_key" && preferWindowKey) {
+      if (!floorAvailable) return skyKeyDirectlyBlocked ? [] : ["sky_key"];
       return skyKeyDirectlyBlocked ? ["window_key"] : ["window_key", "sky_key"];
     }
     if (blocked.has(explicit)) {
-      return ["window_key"];
+      return floorAvailable ? ["window_key"] : [];
     }
     return [explicit];
   }
   if (preferWindowKey) {
+    if (!floorAvailable) return [];
     return skyKeyDirectlyBlocked ? ["window_key"] : ["window_key", "sky_key"];
   }
   return ["sky_key"];
@@ -321,6 +331,8 @@ export class FocusPolicyGuard {
   #sweepTimers = new Map();
   #humanFocusIntentVersion = 0;
   #humanFocusTargetPid = null;
+  #activeObservationScopes = new Set();
+  #globalObsVersion = 0;
 
   constructor({
     focusController,
@@ -364,6 +376,8 @@ export class FocusPolicyGuard {
     for (const [id, guard] of this.#activeGuards.entries()) {
       if (guard.epoch !== this.#epoch || now >= guard.expiresAt) {
         this.#activeGuards.delete(id);
+        this.#activeObservationScopes.delete(id);
+        if (guard.scopeState) guard.scopeState.inObservationPhase = false;
         this.#clearSweepTimersForScope(id);
       }
     }
@@ -407,11 +421,21 @@ export class FocusPolicyGuard {
 
   async #captureProtectedFrontmost(app) {
     if (!app || !this.#focusController) return null;
+    this.#pruneExpiredGuards();
+    const preGlobalObsVersion = this.#globalObsVersion;
+    const preGlobalObsActive = this.#activeObservationScopes.size > 0;
+    const preObsSnapshots = new Map();
+    for (const [id, guard] of this.#activeGuards.entries()) {
+      preObsSnapshots.set(id, {
+        obsVersion: guard.scopeState?.obsVersion || 0,
+        inObservationPhase: Boolean(guard.scopeState?.inObservationPhase),
+      });
+    }
     const frontNow = await this.#focusController.getFrontmostApp();
     if (!frontNow?.pid) return null;
 
     this.#pruneExpiredGuards();
-    for (const guard of this.#activeGuards.values()) {
+    for (const [id, guard] of this.#activeGuards.entries()) {
       const guardedApp = guard.app || app;
       const targetInfo = this.#resolveTargetInfo(guardedApp);
       if (didTargetStealFocus(guard.frontBefore, frontNow, targetInfo)) {
@@ -430,10 +454,19 @@ export class FocusPolicyGuard {
           }
           return refreshed;
         }
+        const preObs = preObsSnapshots.get(id) || {
+          obsVersion: guard.scopeState?.obsVersion || 0,
+          inObservationPhase: Boolean(guard.scopeState?.inObservationPhase),
+        };
         const penaltyAllowed =
           guard.recordRoutePenalty !== false &&
           guard.scopeState?.recordRoutePenalty !== false &&
-          !guard.scopeState?.inObservationPhase;
+          !preObs.inObservationPhase &&
+          !guard.scopeState?.inObservationPhase &&
+          (guard.scopeState?.obsVersion || 0) === preObs.obsVersion &&
+          !preGlobalObsActive &&
+          this.#activeObservationScopes.size === 0 &&
+          this.#globalObsVersion === preGlobalObsVersion;
         this.#recordScopeStealOutcome(guardedApp, guard.scopeState, guard.routeKey, {
           penaltyAllowed,
           routeScope: guard.routeScope ?? guard.scopeState?.routeScope ?? null,
@@ -474,10 +507,14 @@ export class FocusPolicyGuard {
     routeKey = null,
     { recordRoutePenalty = true, routeScope = undefined } = {}
   ) {
+    const preObsVersion = scopeState.obsVersion || 0;
+    const preGlobalObsVersion = this.#globalObsVersion;
+    const preGlobalObsActive = this.#activeObservationScopes.size > 0;
     const effectivePenalty =
       recordRoutePenalty !== false &&
       scopeState.recordRoutePenalty !== false &&
-      !scopeState.inObservationPhase;
+      !scopeState.inObservationPhase &&
+      !preGlobalObsActive;
     const effectiveScope =
       routeScope !== undefined ? routeScope : (scopeState.routeScope ?? null);
     if (!frontBefore?.pid || !app || epoch !== this.#epoch || !this.#focusController) return false;
@@ -502,9 +539,16 @@ export class FocusPolicyGuard {
       if (restored === false) {
         return false;
       }
+      const penaltyAllowedNow =
+        effectivePenalty &&
+        !scopeState.inObservationPhase &&
+        scopeState.recordRoutePenalty !== false &&
+        (scopeState.obsVersion || 0) === preObsVersion &&
+        this.#activeObservationScopes.size === 0 &&
+        this.#globalObsVersion === preGlobalObsVersion;
       const effectiveRoute = routeKey || scopeState.routeKey || null;
       this.#recordScopeStealOutcome(app, scopeState, effectiveRoute, {
-        penaltyAllowed: effectivePenalty,
+        penaltyAllowed: penaltyAllowedNow,
         routeScope: effectiveScope,
       });
       return true;
@@ -594,6 +638,7 @@ export class FocusPolicyGuard {
       routeScope,
       recordRoutePenalty: true,
       inObservationPhase: false,
+      obsVersion: 0,
     };
     return {
       scopeId,
@@ -601,10 +646,14 @@ export class FocusPolicyGuard {
       frontBefore,
       epoch,
       enterObservationPhase: () => {
+        scopeState.obsVersion += 1;
+        this.#globalObsVersion += 1;
         scopeState.inObservationPhase = true;
+        this.#activeObservationScopes.add(scopeId);
       },
       exitObservationPhase: () => {
         scopeState.inObservationPhase = false;
+        this.#activeObservationScopes.delete(scopeId);
       },
       enforceObservation: (routeScopeOverride = undefined) =>
         this.#enforce(frontBefore, app, epoch, scopeId, scopeState, "read_back", {
@@ -613,13 +662,16 @@ export class FocusPolicyGuard {
         }),
       enforce: (routeKey = null, opts = {}) =>
         this.#enforce(frontBefore, app, epoch, scopeId, scopeState, routeKey, opts),
-      finish: (routeKey = null, { alreadyRecorded = false, recordRoutePenalty = undefined, routeScope: finishScope = undefined } = {}) =>
-        this.#scheduleSweep(frontBefore, app, epoch, scopeId, scopeState, {
+      finish: (routeKey = null, { alreadyRecorded = false, recordRoutePenalty = undefined, routeScope: finishScope = undefined } = {}) => {
+        scopeState.inObservationPhase = false;
+        this.#activeObservationScopes.delete(scopeId);
+        return this.#scheduleSweep(frontBefore, app, epoch, scopeId, scopeState, {
           routeKey,
           alreadyRecorded,
           recordRoutePenalty,
           routeScope: finishScope,
-        }),
+        });
+      },
     };
   }
 
@@ -631,6 +683,10 @@ export class FocusPolicyGuard {
 
   cancelForExplicitRaise() {
     this.#epoch += 1;
+    for (const guard of this.#activeGuards.values()) {
+      if (guard.scopeState) guard.scopeState.inObservationPhase = false;
+    }
+    this.#activeObservationScopes.clear();
     this.#activeGuards.clear();
     this.#clearAllSweepTimers();
   }
@@ -650,6 +706,8 @@ export class FocusPolicyGuard {
     for (const [scopeId, guard] of this.#activeGuards.entries()) {
       const info = this.#resolveTargetInfo(guard.app);
       if (info?.pid === pidNum) {
+        if (guard.scopeState) guard.scopeState.inObservationPhase = false;
+        this.#activeObservationScopes.delete(scopeId);
         this.#activeGuards.delete(scopeId);
         this.#clearSweepTimersForScope(scopeId);
       }
@@ -668,21 +726,23 @@ export class FocusPolicyGuard {
   planClick(
     args = {},
     aliases = [],
-    { allowAccessibilityFallback = false, routeScope = null } = {}
+    { allowAccessibilityFallback = false, routeScope = null, windowPostAvailable = true } = {}
   ) {
     const list = uniqueAliases(aliases.length ? aliases : this.#aliasesFor(args?.app));
     return planBackgroundClickMethods(args, {
       allowAccessibilityFallback,
       blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, "click", { routeScope }),
       avoidSkyFocus: false,
+      windowPostAvailable,
     });
   }
 
-  planKey(toolName, args = {}, aliases = [], { routeScope = null } = {}) {
+  planKey(toolName, args = {}, aliases = [], { routeScope = null, windowKeyAvailable = true } = {}) {
     const list = uniqueAliases(aliases.length ? aliases : this.#aliasesFor(args?.app));
     return planBackgroundKeyMethods(args, {
       blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, toolName, { routeScope }),
       avoidSkyFocus: false,
+      windowKeyAvailable,
     });
   }
 

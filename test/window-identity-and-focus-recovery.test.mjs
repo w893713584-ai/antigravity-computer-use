@@ -110,6 +110,7 @@ test("Home -> Editor transition reclaims focus without blacklisting sky_click on
         wid: currentWid,
         title: currentWid === 4702 ? "Editor" : "Home",
         windowBounds: { x: 40, y: 40, w: 1280, h: 800 },
+        windowIds: [currentWid],
       };
     },
   };
@@ -440,6 +441,7 @@ test("handleWindowClick fails closed on 0-post and reports sent_unknown on parti
     },
     Ref: () => [null],
     $: Object.assign((s) => ({ __val: s }), {
+      AXIsProcessTrusted: () => true,
       CGWindowListCopyWindowInfo: () => cgWindows,
       AXUIElementCreateApplication: () => ({}),
       AXUIElementSetMessagingTimeout: () => 0,
@@ -707,6 +709,7 @@ test("JXA handleFocusedWindow strict AX matching, multi-click partial/exception/
     delay() {},
     Ref: () => [null],
     $: Object.assign((s) => ({ __val: s }), {
+      AXIsProcessTrusted: () => true,
       CGWindowListCopyWindowInfo: () => cgWindows,
       AXUIElementCreateApplication: () => ({}),
       AXUIElementSetMessagingTimeout: () => 0,

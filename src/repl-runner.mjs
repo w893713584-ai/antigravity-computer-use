@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { isWriteOutcomeUnknown } from "./ax-bridge.mjs";
 import { extractResultImage, extractResultText } from "./background-policy.mjs";
 import {
   REPL_MAX_BINDINGS_BYTES,
@@ -35,6 +36,22 @@ function extractImagesFromResult(result) {
 function classifyToolErrorCode(text) {
   const m = /^\[([A-Z0-9_]+)\]/u.exec(String(text || "").trim());
   return m ? m[1] : "TOOL_ERROR";
+}
+
+function formatWriteUnknownErrorText(message) {
+  const msg = String(message || "Write outcome unknown");
+  return /^\[WRITE_OUTCOME_UNKNOWN\]/u.test(msg)
+    ? `Error: ${msg}`
+    : `Error: [WRITE_OUTCOME_UNKNOWN] ${msg}`;
+}
+
+function buildWriteUnknownReplResult(collectedContent) {
+  return {
+    ...truncateMcpResultTo256KiB({ content: collectedContent, isError: true }),
+    deliveryState: "sent_unknown",
+    fatal: true,
+    code: "WRITE_OUTCOME_UNKNOWN",
+  };
 }
 
 function validateBindingsPayload(bindings, sessionData) {
@@ -364,8 +381,12 @@ export class StrictReplSessionManager {
 
     let slotAcquired = false;
     let child = null;
+    const isUnknownReason = (why) =>
+      Boolean(why && (why.code === "WRITE_OUTCOME_UNKNOWN" || why.deliveryState === "sent_unknown"));
     const killChildNow = (why) => {
-      if (!abortedReason && why) abortedReason = why;
+      if (why && (!abortedReason || (isUnknownReason(why) && !isUnknownReason(abortedReason)))) {
+        abortedReason = why;
+      }
       if (!runAbort.signal.aborted) {
         const reasonErr = new Error(why?.message || String(why || "REPL execution aborted"));
         if (why?.code) reasonErr.code = why.code;
@@ -421,7 +442,11 @@ export class StrictReplSessionManager {
     const onOpAbort = () => {
       const reason = operation.signal.reason;
       if (isTakeoverAbortedError(reason)) {
-        killChildNow({ code: reason.code || "PAUSED", message: reason.message });
+        killChildNow({
+          code: reason.code || "PAUSED",
+          message: reason.message,
+          ...(reason.deliveryState ? { deliveryState: reason.deliveryState } : {}),
+        });
       } else {
         killChildNow({ code: "CANCELLED", message: "js execution cancelled" });
       }
@@ -436,6 +461,20 @@ export class StrictReplSessionManager {
       });
     }, timeoutMs);
     wallTimer.unref?.();
+
+    const MUTATING_REPL_TOOLS = new Set([
+      "click",
+      "drag",
+      "type_text",
+      "press_key",
+      "scroll",
+      "perform_secondary_action",
+      "set_value",
+      "act",
+      "select_text",
+    ]);
+    let callInFlightPromise = null;
+    let callInFlightMutating = false;
 
     const sendToChild = (obj) => {
       if (child.stdin?.destroyed || !child.stdin?.writable) return false;
@@ -587,6 +626,7 @@ export class StrictReplSessionManager {
         }
 
         const { toolName, toolArgs } = buildBrokerToolCallForReplOp(op, args, handle.app);
+        callInFlightMutating = MUTATING_REPL_TOOLS.has(toolName);
         if (timedOut || runAbort.signal.aborted || operation.signal.aborted) {
           replyErr(timedOut ? "TIMEOUT" : "CANCELLED", "REPL execution aborted before broker dispatch");
           return;
@@ -603,6 +643,16 @@ export class StrictReplSessionManager {
           handle.processToken = postMeta.processToken || handle.processToken || null;
         }
 
+        if (isWriteOutcomeUnknown(toolRes)) {
+          const errText = extractResultText(toolRes) || `${toolName} outcome unknown`;
+          killChildNow({
+            code: "WRITE_OUTCOME_UNKNOWN",
+            message: errText,
+            deliveryState: "sent_unknown",
+          });
+          replyErr("WRITE_OUTCOME_UNKNOWN", errText);
+          return;
+        }
         if (toolRes?.isError) {
           const errText = extractResultText(toolRes) || `${toolName} failed`;
           replyErr(classifyToolErrorCode(errText), errText);
@@ -697,13 +747,20 @@ export class StrictReplSessionManager {
         });
       } catch (err) {
         if (isTakeoverAbortedError(err)) {
-          killChildNow({ code: err.code || "PAUSED", message: err.message });
+          const isWriteUnk =
+            err?.code === "WRITE_OUTCOME_UNKNOWN" || err?.deliveryState === "sent_unknown";
+          killChildNow({
+            code: err.code || "PAUSED",
+            message: err.message,
+            ...(isWriteUnk ? { deliveryState: "sent_unknown" } : {}),
+          });
           replyErr(err.code || "PAUSED", err.message);
           return;
         }
         replyErr("REPL_RPC_ERROR", err instanceof Error ? err.message : String(err));
       } finally {
         callInFlight = false;
+        callInFlightMutating = false;
       }
     };
 
@@ -798,7 +855,13 @@ export class StrictReplSessionManager {
             }
 
             if (msg.type === "call") {
-              void handleRpcCall(msg);
+              const rpcPromise = handleRpcCall(msg);
+              callInFlightPromise = rpcPromise;
+              rpcPromise.finally(() => {
+                if (callInFlightPromise === rpcPromise) {
+                  callInFlightPromise = null;
+                }
+              });
               continue;
             }
 
@@ -829,6 +892,7 @@ export class StrictReplSessionManager {
               kind: "aborted",
               code: abortedReason.code,
               message: abortedReason.message,
+              ...(abortedReason.deliveryState ? { deliveryState: abortedReason.deliveryState } : {}),
             });
           } else if (exitSignal === "SIGXCPU") {
             finish({
@@ -851,6 +915,41 @@ export class StrictReplSessionManager {
           }
         });
       });
+
+      if (callInFlightPromise) {
+        const wasMutating = callInFlightMutating;
+        let rpcSettled = false;
+        const trackedRpc = callInFlightPromise.catch(() => {}).finally(() => {
+          rpcSettled = true;
+        });
+        const waitMs = wasMutating ? 3500 : 250;
+        let waitTimer;
+        await Promise.race([
+          trackedRpc,
+          new Promise((resolve) => {
+            waitTimer = setTimeout(resolve, waitMs);
+            waitTimer.unref?.();
+          }),
+        ]);
+        clearTimeout(waitTimer);
+        if (!rpcSettled && wasMutating && outcome.kind === "aborted") {
+          killChildNow({
+            code: "WRITE_OUTCOME_UNKNOWN",
+            deliveryState: "sent_unknown",
+            message:
+              "REPL aborted while a mutating desktop tool call remained in flight; write outcome is unknown.",
+          });
+        }
+      }
+
+      if (abortedReason?.code === "WRITE_OUTCOME_UNKNOWN" || abortedReason?.deliveryState === "sent_unknown") {
+        this.#wipeSessionState(session);
+        collectedContent.push({
+          type: "text",
+          text: formatWriteUnknownErrorText(abortedReason.message),
+        });
+        return buildWriteUnknownReplResult(collectedContent);
+      }
 
       if (outcome.kind === "done" && outcome.ok) {
         if (callInFlight) {
@@ -893,29 +992,41 @@ export class StrictReplSessionManager {
       if (outcome.kind === "done" && !outcome.ok) {
         const errCode = String(outcome.error?.code || "JS_ERROR");
         const errMsg = String(outcome.error?.message || "Script failed");
+        const isWriteUnk = errCode === "WRITE_OUTCOME_UNKNOWN";
         const isTakeoverErr = errCode === "PAUSED" || errCode === "CANCELLED";
         const isCpuErr = errCode === "CPU_TIME_LIMIT";
-        if (isTakeoverErr || isCpuErr) {
-          // Wipe bindings & handles on CPU limit or takeover/cancel; preserve only on ordinary JS errors
+        if (isTakeoverErr || isCpuErr || isWriteUnk) {
+          // Wipe bindings & handles on CPU limit, write-unknown, or takeover/cancel; preserve only on ordinary JS errors
           this.#wipeSessionState(session);
         }
         collectedContent.push({
           type: "text",
-          text: isTakeoverErr ? `Error: [${errCode}] ${errMsg}` : `Error: ${errMsg}`,
+          text: isWriteUnk
+            ? formatWriteUnknownErrorText(errMsg)
+            : isTakeoverErr
+              ? `Error: [${errCode}] ${errMsg}`
+              : `Error: ${errMsg}`,
         });
-        return truncateMcpResultTo256KiB({ content: collectedContent, isError: true });
+        return isWriteUnk
+          ? buildWriteUnknownReplResult(collectedContent)
+          : truncateMcpResultTo256KiB({ content: collectedContent, isError: true });
       }
 
-      // Timeout, CPU kill, crash, fatal sandbox error, pause, or cancel -> ALWAYS wipe session!
+      // Timeout, CPU kill, crash, fatal sandbox error, pause, cancel, or write-unknown -> ALWAYS wipe session!
       this.#wipeSessionState(session);
-      const errText =
-        outcome.code === "SANDBOX_UNAVAILABLE" ||
-        outcome.code === "PAUSED" ||
-        outcome.code === "CANCELLED"
+      const isWriteUnkOutcome =
+        outcome.code === "WRITE_OUTCOME_UNKNOWN" || outcome.deliveryState === "sent_unknown";
+      const errText = isWriteUnkOutcome
+        ? formatWriteUnknownErrorText(outcome.message)
+        : outcome.code === "SANDBOX_UNAVAILABLE" ||
+            outcome.code === "PAUSED" ||
+            outcome.code === "CANCELLED"
           ? `Error: [${outcome.code}] ${outcome.message}`
           : `Error: ${outcome.message}`;
       collectedContent.push({ type: "text", text: errText });
-      return truncateMcpResultTo256KiB({ content: collectedContent, isError: true });
+      return isWriteUnkOutcome
+        ? buildWriteUnknownReplResult(collectedContent)
+        : truncateMcpResultTo256KiB({ content: collectedContent, isError: true });
     } finally {
       clearTimeout(wallTimer);
       operation.signal.removeEventListener("abort", onOpAbort);

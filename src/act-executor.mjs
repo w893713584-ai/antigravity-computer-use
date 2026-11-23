@@ -6,7 +6,11 @@ import {
   parseSnapshotMetadata,
   unhideAppWithoutActivating,
 } from "./background-policy.mjs";
-import { normalizeElementBounds } from "./app-snapshot-registry.mjs";
+import {
+  buildRouteScopeFromMeta,
+  evaluateScreenshotMetaProof,
+  normalizeElementBounds,
+} from "./app-snapshot-registry.mjs";
 import { dedupeSpatiallyOverlappingMatches } from "./action-executor.mjs";
 import { normalizeRectPt } from "./preview-geometry.mjs";
 import { isTakeoverAbortedError } from "./takeover-controller.mjs";
@@ -19,6 +23,7 @@ export function buildActToolResult({
   status = "ok",
   code = null,
   message = null,
+  deliveryState = null,
   verified = false,
   sent = false,
   clicksSent = 0,
@@ -31,6 +36,7 @@ export function buildActToolResult({
   const payload = {
     status,
     ...(code ? { code } : {}),
+    ...(deliveryState ? { deliveryState } : {}),
     verified: Boolean(verified),
     sent: Boolean(sent),
     clicksSent,
@@ -45,7 +51,12 @@ export function buildActToolResult({
   if (latestImage?.type === "image" && latestImage.data) {
     content.push(latestImage);
   }
-  return { isError: Boolean(isError), content };
+  return {
+    isError: Boolean(isError),
+    ...(deliveryState ? { deliveryState } : {}),
+    ...(deliveryState === "sent_unknown" ? { fatal: true } : {}),
+    content,
+  };
 }
 
 /**
@@ -93,6 +104,21 @@ export class AtomicActExecutor {
 
   #buildToolResult(opts = {}) {
     return buildActToolResult(opts);
+  }
+
+  #buildTakeoverAbortResult(err, steps = 0, matchCount = 0) {
+    const sentUnknown = err?.deliveryState === "sent_unknown";
+    return this.#buildToolResult({
+      isError: true,
+      status: "cancelled",
+      code: err?.code || "PAUSED",
+      deliveryState: err?.deliveryState || null,
+      message: err?.message || "操作已被暂停或取消。",
+      sent: sentUnknown,
+      clicksSent: sentUnknown && matchCount > 0 ? 1 : 0,
+      steps,
+      matchCount,
+    });
   }
 
   async #sleepWithSignal(ms, signal = null) {
@@ -314,6 +340,7 @@ export class AtomicActExecutor {
       limit: 25,
     };
 
+    let queryPeerInstanceId = null;
     const callQuery = async (extra = {}) => {
       const qArgs = { ...baseQueryArgs, ...extra };
       const callTimeout = Math.max(50, Math.min(8000, remainingBudgetMs));
@@ -321,6 +348,7 @@ export class AtomicActExecutor {
         this.takeoverController.assertMayDispatch(operation, { isRead: true });
       }
       let rawRes = await actionPeer.callTool("query", qArgs, callTimeout);
+      queryPeerInstanceId = actionPeer?.agentInstanceId || null;
       if (rawRes?.isError && /target app is hidden/iu.test(extractResultText(rawRes))) {
         if (!operation?.isAi || !this.takeoverController.paused) {
           if (operation?.isAi) {
@@ -337,6 +365,7 @@ export class AtomicActExecutor {
             this.takeoverController.assertMayDispatch(operation, { isRead: true });
           }
           rawRes = await actionPeer.callTool("query", qArgs, callTimeout);
+          queryPeerInstanceId = actionPeer?.agentInstanceId || null;
         }
       }
       await focusScope?.enforce("act:query");
@@ -401,7 +430,15 @@ export class AtomicActExecutor {
             ? Number(evaluated.deduped[0].window_id)
             : null,
       windowTitle: processed.parsed?.window_title || null,
+      peerInstanceId: queryPeerInstanceId,
     };
+  }
+
+  async #reclaimObservationFocus(focusScope) {
+    if (typeof focusScope?.enforceObservation === "function") {
+      return focusScope.enforceObservation();
+    }
+    return focusScope?.enforce?.("read_back", { recordRoutePenalty: false });
   }
 
   async #captureViewportSignature(
@@ -414,65 +451,71 @@ export class AtomicActExecutor {
     const rem = () => Math.max(50, Math.min(4000, deadlineAt - Date.now()));
     let winTitle = "";
     let body = "";
-
-    if (wantWid === 0 && Date.now() < deadlineAt) {
-      const stateRes = await this.safeGetAppState(
-        actionPeer,
-        {
-          app,
-          include_ax: true,
-          include_screenshot: false,
-          text_limit: 4000,
-          window_placement: "keep",
-        },
-        {
-          updateActiveApp: false,
-          allowLaunch: false,
-          preserveScreenshotState: true,
-          timeoutMs: rem(),
-          operation,
-        }
-      ).catch(() => null);
-      await focusScope?.enforce("act:sig");
-      if (stateRes && !stateRes.isError) {
-        const rawText = extractResultText(stateRes);
-        const meta = parseSnapshotMetadata(rawText);
-        winTitle = meta.windowTitle || "";
-        body = this.#extractAxBodyText(rawText).trim();
-      }
-    }
-
     let itemsSig = "";
-    const probeRes =
-      Date.now() < deadlineAt
-        ? await actionPeer
-            .callTool(
-              "query",
-              {
-                app,
-                ...(wantWid > 0 ? { window_id: wantWid } : {}),
-                ...(target?.role ? { role: target.role } : {}),
-                limit: 8,
-              },
-              rem()
-            )
-            .catch(() => null)
-        : null;
-    await focusScope?.enforce("act:sig_query");
-    if (probeRes && !probeRes.isError) {
-      try {
-        const parsed = JSON.parse(extractResultText(probeRes));
-        if (!winTitle && parsed?.window_title) winTitle = String(parsed.window_title);
-        if (Array.isArray(parsed?.matches) && parsed.matches.length > 0) {
-          itemsSig = parsed.matches
-            .map((m) => {
-              const b = normalizeElementBounds(m?.bounds || m?.frame);
-              const pos = b ? `${Math.round(b.x)},${Math.round(b.y)},${Math.round(b.w)},${Math.round(b.h)}` : "";
-              return `${m.index ?? ""}:${m.title || m.label || m.identifier || ""}:${pos}`;
-            })
-            .join("|");
+
+    focusScope?.enterObservationPhase?.();
+    try {
+      if (wantWid === 0 && Date.now() < deadlineAt) {
+        const stateRes = await this.safeGetAppState(
+          actionPeer,
+          {
+            app,
+            include_ax: true,
+            include_screenshot: false,
+            text_limit: 4000,
+            window_placement: "keep",
+          },
+          {
+            updateActiveApp: false,
+            allowLaunch: false,
+            preserveScreenshotState: true,
+            observationalOnly: true,
+            timeoutMs: rem(),
+            operation,
+          }
+        ).catch(() => null);
+        await this.#reclaimObservationFocus(focusScope);
+        if (stateRes && !stateRes.isError) {
+          const rawText = extractResultText(stateRes);
+          const meta = parseSnapshotMetadata(rawText);
+          winTitle = meta.windowTitle || "";
+          body = this.#extractAxBodyText(rawText).trim();
         }
-      } catch {}
+      }
+
+      const probeRes =
+        Date.now() < deadlineAt
+          ? await actionPeer
+              .callTool(
+                "query",
+                {
+                  app,
+                  ...(wantWid > 0 ? { window_id: wantWid } : {}),
+                  ...(target?.role ? { role: target.role } : {}),
+                  limit: 8,
+                },
+                rem()
+              )
+              .catch(() => null)
+          : null;
+      await this.#reclaimObservationFocus(focusScope);
+      if (probeRes && !probeRes.isError) {
+        try {
+          const parsed = JSON.parse(extractResultText(probeRes));
+          if (!winTitle && parsed?.window_title) winTitle = String(parsed.window_title);
+          if (Array.isArray(parsed?.matches) && parsed.matches.length > 0) {
+            itemsSig = parsed.matches
+              .map((m) => {
+                const b = normalizeElementBounds(m?.bounds || m?.frame);
+                const pos = b ? `${Math.round(b.x)},${Math.round(b.y)},${Math.round(b.w)},${Math.round(b.h)}` : "";
+                return `${m.index ?? ""}:${m.title || m.label || m.identifier || ""}:${pos}`;
+              })
+              .join("|");
+          }
+        } catch {}
+      }
+    } finally {
+      focusScope?.exitObservationPhase?.();
     }
 
     return `${winTitle}::${body}::${itemsSig}`;
@@ -502,141 +545,184 @@ export class AtomicActExecutor {
     const rem = () => Math.max(50, Math.min(8000, deadlineAt - Date.now()));
 
     let stateReadOk = false;
+    let stateAmbiguousMultiWindow = false;
     let image = null;
     let winTitle = "";
     let bodyText = "";
 
-    if (!isPinnedNonDefaultWin && Date.now() < deadlineAt && !signal?.aborted) {
-      const stateRes = await this.safeGetAppState(
-        actionPeer,
-        {
-          app,
-          include_ax: true,
-          include_screenshot: true,
-          text_limit: 8000,
-          window_placement: "keep",
-        },
-        {
-          updateActiveApp: false,
-          allowLaunch: false,
-          preserveScreenshotState: true,
-          timeoutMs: rem(),
-          operation,
-        }
-      ).catch(() => null);
-      await focusScope?.enforce("act:expect_state");
-      stateReadOk = Boolean(stateRes && !stateRes.isError);
-      image = extractResultImage(stateRes);
-      if (stateReadOk) {
-        const rawText = extractResultText(stateRes);
-        const meta = parseSnapshotMetadata(rawText);
-        winTitle = String(meta.windowTitle || "");
-        bodyText = this.#extractAxBodyText(rawText);
-      }
-    }
-
-    const inspectTerm = async (term) => {
-      if (!term) return "inconclusive";
-      if (!isPinnedNonDefaultWin && stateReadOk && bodyText.includes(term)) {
-        return "present";
-      }
-      if (signal?.aborted || Date.now() > deadlineAt) return "inconclusive";
-      const qRes = await actionPeer
-        .callTool(
-          "query",
+    focusScope?.enterObservationPhase?.();
+    try {
+      if (!isPinnedNonDefaultWin && Date.now() < deadlineAt && !signal?.aborted) {
+        const prevShotMeta = this.registry.getMeta(app)?.actionScreenshotMeta || null;
+        const stateRes = await this.safeGetAppState(
+          actionPeer,
           {
             app,
-            text: term,
-            ...(wantWid > 0 ? { window_id: wantWid } : {}),
-            limit: 5,
+            include_ax: true,
+            include_screenshot: true,
+            text_limit: 8000,
+            window_placement: "keep",
           },
-          rem()
-        )
-        .catch(() => null);
-      await focusScope?.enforce("act:expect_query");
-      if (!qRes || qRes.isError) return "inconclusive";
-      try {
-        const parsed = JSON.parse(extractResultText(qRes));
-        if (!winTitle && parsed?.window_title) {
-          winTitle = String(parsed.window_title);
-        }
-        const matches = Array.isArray(parsed?.matches) ? parsed.matches : [];
-        const matched = matches.some((m) => {
-          if (wantWid > 0) {
-            return Number(m?.window_id || parsed?.window_id || 0) === wantWid;
+          {
+            updateActiveApp: false,
+            allowLaunch: false,
+            preserveScreenshotState: true,
+            observationalOnly: true,
+            timeoutMs: rem(),
+            operation,
           }
-          return true;
-        });
-        if (matched) return "present";
-        if (parsed?.truncated === true) return "inconclusive";
-        return "absent";
-      } catch {
-        return "inconclusive";
+        ).catch(() => null);
+        await this.#reclaimObservationFocus(focusScope);
+        stateReadOk = Boolean(stateRes && !stateRes.isError);
+        const extractedImg = stateReadOk ? extractResultImage(stateRes) : null;
+        const afterMeta = this.registry.getMeta(app);
+        const proof =
+          typeof this.registry?.evaluateActionScreenshotProof === "function"
+            ? this.registry.evaluateActionScreenshotProof(afterMeta, {
+                targetWindowId: wantWid > 0 ? wantWid : null,
+                requirePositiveWid: true,
+              })
+            : evaluateScreenshotMetaProof(afterMeta, {
+                targetWindowId: wantWid > 0 ? wantWid : null,
+                requirePositiveWid: true,
+              });
+        const freshShotCaptured = Boolean(extractedImg && proof.shotMeta && proof.shotMeta !== prevShotMeta);
+        const stateWindowProven = Boolean(freshShotCaptured && proof.sameWindowProven);
+        stateAmbiguousMultiWindow = Boolean(
+          !stateWindowProven || Number(proof.windowCount) > 1
+        );
+        image = stateWindowProven ? extractedImg : null;
+        if (stateReadOk && stateWindowProven) {
+          const rawText = extractResultText(stateRes);
+          const meta = parseSnapshotMetadata(rawText);
+          winTitle = String(meta.windowTitle || "");
+          bodyText = this.#extractAxBodyText(rawText);
+        }
       }
-    };
 
-    const normalizeList = (v) =>
-      Array.isArray(v)
-        ? v.map((s) => String(s || "").trim()).filter(Boolean)
-        : typeof v === "string" && v.trim()
-          ? [v.trim()]
-          : [];
+      const inspectTerm = async (term) => {
+        if (!term) return "inconclusive";
+        if (!isPinnedNonDefaultWin && stateReadOk && bodyText && bodyText.includes(term)) {
+          return "present";
+        }
+        if (!(wantWid > 0) && stateAmbiguousMultiWindow) {
+          return "inconclusive";
+        }
+        if (signal?.aborted || Date.now() > deadlineAt) return "inconclusive";
+        const qRes = await actionPeer
+          .callTool(
+            "query",
+            {
+              app,
+              text: term,
+              ...(wantWid > 0 ? { window_id: wantWid } : {}),
+              limit: 5,
+            },
+            rem()
+          )
+          .catch(() => null);
+        await this.#reclaimObservationFocus(focusScope);
+        if (!qRes || qRes.isError) return "inconclusive";
+        try {
+          const parsed = JSON.parse(extractResultText(qRes));
+          const responseWid = Number(parsed?.window_id || 0);
+          if (
+            !winTitle &&
+            parsed?.window_title &&
+            (wantWid > 0 ? responseWid === wantWid : responseWid > 0 && !stateAmbiguousMultiWindow)
+          ) {
+            winTitle = String(parsed.window_title);
+          }
+          if (wantWid > 0 && responseWid > 0 && responseWid !== wantWid) {
+            return "inconclusive";
+          }
+          const matches = Array.isArray(parsed?.matches) ? parsed.matches : [];
+          if (wantWid > 0 && responseWid === 0) {
+            if (matches.some((m) => Number(m?.window_id || 0) === wantWid)) {
+              return "present";
+            }
+            return "inconclusive";
+          }
+          const matched = matches.some((m) => {
+            if (wantWid > 0) {
+              return Number(m?.window_id || responseWid || 0) === wantWid;
+            }
+            return true;
+          });
+          if (matched) return "present";
+          if (parsed?.truncated === true) return "inconclusive";
+          return "absent";
+        } catch {
+          return "inconclusive";
+        }
+      };
 
-    const titleTerms = normalizeList(expectSpec.window_title_contains);
-    const allTerms = normalizeList(expectSpec.all_text);
-    const anyTerms = normalizeList(expectSpec.any_text);
-    const vanishTerms = normalizeList(expectSpec.text_disappears);
+      const normalizeList = (v) =>
+        Array.isArray(v)
+          ? v.map((s) => String(s || "").trim()).filter(Boolean)
+          : typeof v === "string" && v.trim()
+            ? [v.trim()]
+            : [];
 
-    if (wantWid > 0 && titleTerms.length > 0 && !winTitle && pid > 0 && typeof axBridge?.resolveActionTarget === "function") {
-      const resolvedWin = await axBridge.resolveActionTarget(pid, { wid: wantWid }).catch(() => null);
-      if (resolvedWin?.windowTitle) {
-        winTitle = String(resolvedWin.windowTitle);
+      const titleTerms = normalizeList(expectSpec.window_title_contains);
+      const allTerms = normalizeList(expectSpec.all_text);
+      const anyTerms = normalizeList(expectSpec.any_text);
+      const vanishTerms = normalizeList(expectSpec.text_disappears);
+
+      if (wantWid > 0 && titleTerms.length > 0 && !winTitle && pid > 0 && typeof axBridge?.resolveActionTarget === "function") {
+        const resolvedWin = await axBridge.resolveActionTarget(pid, { wid: wantWid }).catch(() => null);
+        await this.#reclaimObservationFocus(focusScope);
+        if (Number(resolvedWin?.wid || 0) === wantWid && resolvedWin?.windowTitle) {
+          winTitle = String(resolvedWin.windowTitle);
+        }
       }
-    }
 
-    let ok = true;
-    if (titleTerms.length > 0) {
-      if ((!isPinnedNonDefaultWin && !stateReadOk) || !winTitle || !titleTerms.every((t) => winTitle.includes(t))) {
-        ok = false;
-      }
-    }
-    if (ok && allTerms.length > 0) {
-      for (const term of allTerms) {
-        if (signal?.aborted || (await inspectTerm(term)) !== "present") {
+      let ok = true;
+      if (titleTerms.length > 0) {
+        if (!winTitle || !titleTerms.every((t) => winTitle.includes(t))) {
           ok = false;
-          break;
         }
       }
-    }
-    if (ok && anyTerms.length > 0) {
-      let anyMatched = false;
-      for (const term of anyTerms) {
-        if (signal?.aborted) break;
-        if ((await inspectTerm(term)) === "present") {
-          anyMatched = true;
-          break;
-        }
-      }
-      if (!anyMatched) ok = false;
-    }
-    if (ok && vanishTerms.length > 0) {
-      if (!isPinnedNonDefaultWin && !stateReadOk) {
-        ok = false;
-      } else {
-        for (const term of vanishTerms) {
-          if (signal?.aborted || (await inspectTerm(term)) !== "absent") {
+      if (ok && allTerms.length > 0) {
+        for (const term of allTerms) {
+          if (signal?.aborted || (await inspectTerm(term)) !== "present") {
             ok = false;
             break;
           }
         }
       }
-    }
+      if (ok && anyTerms.length > 0) {
+        let anyMatched = false;
+        for (const term of anyTerms) {
+          if (signal?.aborted) break;
+          if ((await inspectTerm(term)) === "present") {
+            anyMatched = true;
+            break;
+          }
+        }
+        if (!anyMatched) ok = false;
+      }
+      if (ok && vanishTerms.length > 0) {
+        if ((!isPinnedNonDefaultWin && !stateReadOk) || (wantWid === 0 && stateAmbiguousMultiWindow)) {
+          ok = false;
+        } else {
+          for (const term of vanishTerms) {
+            if (signal?.aborted || (await inspectTerm(term)) !== "absent") {
+              ok = false;
+              break;
+            }
+          }
+        }
+      }
 
-    return {
-      matched: ok,
-      windowTitle: winTitle || null,
-      image,
-    };
+      return {
+        matched: ok,
+        windowTitle: winTitle || null,
+        image,
+      };
+    } finally {
+      focusScope?.exitObservationPhase?.();
+    }
   }
 
   async execute(
@@ -709,7 +795,7 @@ export class AtomicActExecutor {
     const clickCount = Number.isFinite(parsedClicks)
       ? Math.max(1, Math.min(3, Math.round(parsedClicks)))
       : 1;
-    const explicitWindowId = Number(args?.window_id) > 0 ? Number(args.window_id) : null;
+    const callerExplicitWindowId = Number(args?.window_id) > 0 ? Number(args.window_id) : null;
     const parsedTimeout = Number(args?.timeout_ms);
     const timeoutMs = Number.isFinite(parsedTimeout)
       ? Math.max(40, Math.min(25_000, parsedTimeout))
@@ -785,8 +871,9 @@ export class AtomicActExecutor {
     let resolvedTarget = null;
     let selectedMatch = null;
     let selectedMerged = null;
-    let selectedWindowId = explicitWindowId;
+    let selectedWindowId = callerExplicitWindowId;
     let selectedWindowTitle = null;
+    let selectedQueryPeerInstanceId = null;
     let scrollStepsDone = 0;
     let stagnantCount = 0;
 
@@ -798,7 +885,7 @@ export class AtomicActExecutor {
         focusScope,
         signal: effectiveSignal,
         operation,
-        explicitWindowId,
+        explicitWindowId: callerExplicitWindowId,
         deadlineAt,
         markOsTouched,
       });
@@ -874,8 +961,12 @@ export class AtomicActExecutor {
           if (!offscreen || step === maxScrollSteps) {
             selectedMatch = candidate;
             selectedMerged = qOut.merged;
-            selectedWindowId = Number(candidate.window_id) > 0 ? Number(candidate.window_id) : qOut.windowId;
+            selectedWindowId =
+              Number(candidate.window_id) > 0
+                ? Number(candidate.window_id)
+                : qOut.windowId || callerExplicitWindowId;
             selectedWindowTitle = qOut.windowTitle || snapMeta?.windowTitle || null;
+            selectedQueryPeerInstanceId = qOut.peerInstanceId || null;
             this.registerOperationTarget(operation, app, snapMeta, selectedWindowId);
             break;
           }
@@ -914,9 +1005,32 @@ export class AtomicActExecutor {
           timeoutMs: Math.max(50, deadlineAt - Date.now()),
         });
         await focusScope?.enforce(scrollRes.route || "act:scroll");
-        if (scrollRes.delivered) {
-          await this.#sleepWithSignal(90, effectiveSignal);
+        if (scrollRes.outcomeUnknown || scrollRes.deliveryState === "sent_unknown") {
+          return this.#buildToolResult({
+            isError: true,
+            status: "cancelled",
+            code: "WRITE_OUTCOME_UNKNOWN",
+            deliveryState: "sent_unknown",
+            message: "滚动揭示写入结果未知，已中止后续滚动与点击以防重复触发。",
+            sent: true,
+            clicksSent: 0,
+            steps: scrollStepsDone,
+            route: scrollRes.route || null,
+          });
         }
+        if (!scrollRes.delivered) {
+          return this.#buildToolResult({
+            isError: true,
+            status: "no_progress",
+            code: "SCROLL_FAILED",
+            message: `滚动揭示未能发送 (${scrollRes.reason || "unavailable"})，已中止操作。`,
+            sent: false,
+            clicksSent: 0,
+            steps: scrollStepsDone,
+            route: scrollRes.route || null,
+          });
+        }
+        await this.#sleepWithSignal(90, effectiveSignal);
         scrollStepsDone += 1;
 
         const abortAfterScroll = cancelledState();
@@ -1010,15 +1124,7 @@ export class AtomicActExecutor {
       }
     } catch (err) {
       if (isTakeoverAbortedError(err)) {
-        return this.#buildToolResult({
-          isError: true,
-          status: "cancelled",
-          code: err.code || "PAUSED",
-          message: err.message,
-          sent: err.deliveryState === "sent_unknown",
-          clicksSent: 0,
-          steps: scrollStepsDone,
-        });
+        return this.#buildTakeoverAbortResult(err, scrollStepsDone, 0);
       }
       if (this.#isPeerTimeoutError(err)) {
         return this.#buildToolResult({
@@ -1042,7 +1148,9 @@ export class AtomicActExecutor {
         snapshotId: selectedMerged?.snapshotId || null,
         match: selectedMatch,
         resolvedTarget,
-        explicitWindowId: selectedWindowId,
+        explicitWindowId: callerExplicitWindowId,
+        targetWindowId: selectedWindowId,
+        queryPeerInstanceId: selectedQueryPeerInstanceId,
         windowTitle: selectedWindowTitle || curMeta?.windowTitle || "",
         mouseButton,
         clickCount,
@@ -1052,16 +1160,7 @@ export class AtomicActExecutor {
       });
     } catch (err) {
       if (isTakeoverAbortedError(err)) {
-        return this.#buildToolResult({
-          isError: true,
-          status: "cancelled",
-          code: err.code || "PAUSED",
-          message: err.message,
-          sent: err.deliveryState === "sent_unknown",
-          clicksSent: 0,
-          steps: scrollStepsDone,
-          matchCount: 1,
-        });
+        return this.#buildTakeoverAbortResult(err, scrollStepsDone, 1);
       }
       throw err;
     }
@@ -1085,15 +1184,10 @@ export class AtomicActExecutor {
     const clicksSent = clickRes.clicksSent;
     const actWid = selectedWindowId || curMeta?.windowId || null;
     const actRouteScope =
-      typeof this.registry?.buildRouteScope === "function"
+      clickRes.routeScope ||
+      (typeof this.registry?.buildRouteScope === "function"
         ? this.registry.buildRouteScope(curMeta, { windowId: actWid })
-        : curMeta?.pid || actWid
-          ? {
-              pid: Number(curMeta?.pid) > 0 ? Number(curMeta.pid) : null,
-              processToken: curMeta?.processToken || null,
-              windowId: Number(actWid) > 0 ? Number(actWid) : null,
-            }
-          : null;
+        : buildRouteScopeFromMeta(curMeta, { windowId: actWid }));
 
     const stolenOnClick = await focusScope?.enforce(clickRoute, { routeScope: actRouteScope });
     focusScope?.finish(clickRoute, {
@@ -1126,19 +1220,33 @@ export class AtomicActExecutor {
     }
 
     if (!clickRes.delivered) {
+      const sentUnknown = clickRes.deliveryState === "sent_unknown";
       return this.#buildToolResult({
         isError: true,
-        status: "click_failed",
-        code: "ACT_CLICK_FAILED",
-        message: `目标点击未能发送 (${clickRes.failureReason || "unavailable"})。`,
-        sent: clicksSent > 0,
-        clicksSent,
+        status: sentUnknown ? "cancelled" : "click_failed",
+        code: sentUnknown ? "WRITE_OUTCOME_UNKNOWN" : "ACT_CLICK_FAILED",
+        ...(clickRes.deliveryState ? { deliveryState: clickRes.deliveryState } : {}),
+        message: sentUnknown
+          ? `目标点击写入结果未知 (${clickRes.failureReason || "write_outcome_unknown"})，已阻断后续操作。`
+          : `目标点击未能发送 (${clickRes.failureReason || "unavailable"})。`,
+        sent: sentUnknown || clicksSent > 0,
+        clicksSent: sentUnknown ? Math.max(1, clicksSent) : clicksSent,
         steps: scrollStepsDone,
         matchCount: 1,
         route: clickRoute,
       });
     }
 
+    const dispatchWindowId =
+      Number(selectedWindowId) > 0
+        ? Number(selectedWindowId)
+        : Number(callerExplicitWindowId) > 0
+          ? Number(callerExplicitWindowId)
+          : Number(clickRes.routeScope?.windowId || 0) > 0
+            ? Number(clickRes.routeScope.windowId)
+            : Number(resolvedTarget?.wid || 0) > 0
+              ? Number(resolvedTarget.wid)
+              : null;
     const pollGapsMs = [60, 130, 240, 400];
     let pollIdx = 0;
     let latestEval = null;
@@ -1153,9 +1261,9 @@ export class AtomicActExecutor {
       }
 
       latestEval = await this.#evaluateExpect(app, pid, expectSpec, {
-        windowId: selectedWindowId,
+        windowId: dispatchWindowId,
         defaultWindowId: curMeta?.windowId || null,
-        explicitWindowPinned: Boolean(explicitWindowId > 0),
+        explicitWindowPinned: Boolean(callerExplicitWindowId > 0),
         focusScope,
         signal: effectiveSignal,
         operation,

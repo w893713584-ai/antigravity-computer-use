@@ -1,7 +1,11 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
-import { throwIfSentUnknown } from "./ax-bridge.mjs";
+import {
+  AX_SCROLLBAR_PERFORM_JXA,
+  rethrowIfWriteOutcomeUnknown,
+  throwIfSentUnknown,
+} from "./ax-bridge.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -811,6 +815,62 @@ export function shouldAttemptSelectedTextFastPath(appKey, text) {
   return true;
 }
 
+function classifyOneShotOsascriptError(err) {
+  if (err?.killed || err?.signal) {
+    return { delivered: false, verified: false, deliveryState: "sent_unknown", reason: "exec_timed_out" };
+  }
+  return { delivered: false, verified: false, reason: "exec_failed" };
+}
+
+async function runOneShotJxa(script, { timeout = 2500, beforeWriteCheck = null } = {}) {
+  if (typeof beforeWriteCheck === "function") {
+    beforeWriteCheck();
+  }
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
+      timeout,
+    });
+    return JSON.parse(String(stdout || "{}").trim() || '{"delivered":false,"verified":false}');
+  } catch (err) {
+    return classifyOneShotOsascriptError(err);
+  }
+}
+
+/**
+ * Evaluate whether `window_post` (JXA Accessibility) can execute from cached permission state.
+ */
+export function evaluateJxaPostTrust({
+  axBridge = null,
+  cachedAccessibility = undefined,
+  hasCustomWindowTransport = false,
+} = {}) {
+  const bridgeActive = Boolean(axBridge && axBridge.enabled !== false);
+  if (cachedAccessibility !== undefined) {
+    return Boolean(
+      cachedAccessibility === true && (bridgeActive || hasCustomWindowTransport)
+    );
+  }
+  return Boolean(hasCustomWindowTransport);
+}
+
+/**
+ * Query live Accessibility permission trust for `window_post` / `window_key` transports.
+ */
+export async function resolveJxaPostTrust({
+  axBridge = null,
+  hasCustomWindowTransport = false,
+} = {}) {
+  if (!axBridge || axBridge.enabled === false || typeof axBridge.checkPermissions !== "function") {
+    return Boolean(hasCustomWindowTransport);
+  }
+  try {
+    const perms = await axBridge.checkPermissions();
+    return Boolean(perms && perms.accessibility === true);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Headless macOS `AXSelectedText` insertion (inspired by `agent-desktop`'s `type_text.rs`).
  * Only succeeds when the target PID's `AXFocusedUIElement` is an editable, non-secure text control
@@ -829,7 +889,7 @@ export async function tryHeadlessSelectedTextInsert(pid, text, { axBridge = null
       const res = await axBridge.insertSelectedText(pid, text, { beforeWriteCheck });
       if (res) return res;
     } catch (err) {
-      if (err?.aborted) throw err;
+      rethrowIfWriteOutcomeUnknown(err);
     }
   }
   const textLiteral = JSON.stringify(text);
@@ -878,14 +938,7 @@ export async function tryHeadlessSelectedTextInsert(pid, text, { axBridge = null
       }
     }
   `;
-  try {
-    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
-      timeout: 2500,
-    });
-    return JSON.parse(String(stdout || "{}").trim() || '{"delivered":false,"verified":false}');
-  } catch {
-    return { delivered: false, verified: false, reason: "exec_failed" };
-  }
+  return runOneShotJxa(script, { timeout: 2500, beforeWriteCheck });
 }
 
 /**
@@ -919,7 +972,7 @@ export async function tryHeadlessBackgroundScroll(
       });
       if (res) return res;
     } catch (err) {
-      if (err?.aborted) throw err;
+      rethrowIfWriteOutcomeUnknown(err);
     }
   }
   const dir = String(direction || "down").toLowerCase();
@@ -985,6 +1038,7 @@ export async function tryHeadlessBackgroundScroll(
       return matchedArea || anyAreaBar;
     }
 
+    ${AX_SCROLLBAR_PERFORM_JXA}
     var win = readAttr(appEl, "AXMainWindow") || readAttr(appEl, "AXFocusedWindow");
     if (!win) {
       var wins = readAttr(appEl, "AXWindows");
@@ -994,38 +1048,10 @@ export async function tryHeadlessBackgroundScroll(
     if (!bar) {
       JSON.stringify({ delivered: false, verified: false, reason: "no_scrollbar" });
     } else {
-      var beforeObj = readAttr(bar, "AXValue");
-      var beforeNum = beforeObj !== null ? Number(ObjC.unwrap(beforeObj)) : null;
-      var didShift = false;
-      if (Number.isFinite(beforeNum)) {
-        var settableRef = Ref();
-        if ($.AXUIElementIsAttributeSettable(bar, $("AXValue"), settableRef) === 0 && settableRef[0]) {
-          var nextVal = Math.max(0, Math.min(1, beforeNum + sign * 0.1 * pageAmount));
-          if (Math.abs(nextVal - beforeNum) > 1e-6 && $.AXUIElementSetAttributeValue(bar, $("AXValue"), $(nextVal)) === 0) {
-            didShift = true;
-          }
-        }
-      }
-      if (!didShift) {
-        var steps = Math.max(1, Math.min(8, Math.round(pageAmount * 3)));
-        for (var s = 0; s < steps; s++) {
-          if ($.AXUIElementPerformAction(bar, $(stepAction)) === 0) didShift = true;
-        }
-      }
-      var afterObj = readAttr(bar, "AXValue");
-      var afterNum = afterObj !== null ? Number(ObjC.unwrap(afterObj)) : null;
-      var verified = Number.isFinite(beforeNum) && Number.isFinite(afterNum) && Math.abs(afterNum - beforeNum) > 1e-5;
-      JSON.stringify({ delivered: didShift, verified: verified, reason: didShift ? "ok" : "inert_scrollbar" });
+      JSON.stringify(performAxScrollOnBar(bar, sign, pageAmount, stepAction));
     }
   `;
-  try {
-    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
-      timeout: 3000,
-    });
-    return JSON.parse(String(stdout || "{}").trim() || '{"delivered":false,"verified":false}');
-  } catch {
-    return { delivered: false, verified: false, reason: "exec_failed" };
-  }
+  return runOneShotJxa(script, { timeout: 3000, beforeWriteCheck });
 }
 
 /**
@@ -1065,7 +1091,7 @@ export async function tryHeadlessContextMenu(
       });
       if (res) return res;
     } catch (err) {
-      if (err?.aborted) throw err;
+      rethrowIfWriteOutcomeUnknown(err);
     }
   }
   const hasCriterion = Boolean(
@@ -1161,14 +1187,27 @@ export async function tryHeadlessContextMenu(
       }
     }
   `;
-  try {
-    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
-      timeout: 2500,
-    });
-    return JSON.parse(String(stdout || "{}").trim() || '{"delivered":false,"verified":false}');
-  } catch {
-    return { delivered: false, verified: false, reason: "exec_failed" };
+  return runOneShotJxa(script, { timeout: 2500, beforeWriteCheck });
+}
+
+async function callAxBridgeWindowMethod(
+  axBridge,
+  methodName,
+  pid,
+  params,
+  { label, fallbackResult }
+) {
+  if (axBridge && axBridge.enabled !== false && typeof axBridge[methodName] === "function") {
+    try {
+      const res = await axBridge[methodName](pid, params);
+      throwIfSentUnknown(res, label);
+      if (res) return res;
+    } catch (err) {
+      rethrowIfWriteOutcomeUnknown(err);
+      return { ...fallbackResult, reason: err?.message || "bridge_error" };
+    }
   }
+  return { ...fallbackResult, reason: "bridge_unavailable" };
 }
 
 /**
@@ -1181,19 +1220,10 @@ export async function tryWindowPostClick(pid, options = {}) {
     return { delivered: false, reason: "invalid_pid" };
   }
   const { axBridge = null, ...rest } = options || {};
-  if (axBridge && axBridge.enabled !== false && typeof axBridge.postWindowClick === "function") {
-    try {
-      const res = await axBridge.postWindowClick(pid, rest);
-      throwIfSentUnknown(res, "Window click partial delivery");
-      if (res) return res;
-    } catch (err) {
-      if (err?.aborted || err?.deliveryState === "sent_unknown" || err?.code === "WRITE_OUTCOME_UNKNOWN") {
-        throw err;
-      }
-      return { delivered: false, reason: err?.message || "bridge_error" };
-    }
-  }
-  return { delivered: false, reason: "bridge_unavailable" };
+  return callAxBridgeWindowMethod(axBridge, "postWindowClick", pid, rest, {
+    label: "Window click partial delivery",
+    fallbackResult: { delivered: false },
+  });
 }
 
 /**
@@ -1204,18 +1234,10 @@ export async function tryWindowKey(pid, key, options = {}) {
     return { delivered: false, reason: "invalid_args" };
   }
   const { axBridge = null, ...rest } = options || {};
-  if (axBridge && axBridge.enabled !== false && typeof axBridge.postWindowKey === "function") {
-    try {
-      const res = await axBridge.postWindowKey(pid, { key, ...rest });
-      if (res) return res;
-    } catch (err) {
-      if (err?.aborted || err?.deliveryState === "sent_unknown" || err?.code === "WRITE_OUTCOME_UNKNOWN") {
-        throw err;
-      }
-      return { delivered: false, reason: err?.message || "bridge_error" };
-    }
-  }
-  return { delivered: false, reason: "bridge_unavailable" };
+  return callAxBridgeWindowMethod(axBridge, "postWindowKey", pid, { key, ...rest }, {
+    label: "Window key partial delivery",
+    fallbackResult: { delivered: false },
+  });
 }
 
 /**
@@ -1226,18 +1248,10 @@ export async function tryWindowText(pid, text, options = {}) {
     return { delivered: false, reason: "invalid_args" };
   }
   const { axBridge = null, ...rest } = options || {};
-  if (axBridge && axBridge.enabled !== false && typeof axBridge.postWindowText === "function") {
-    try {
-      const res = await axBridge.postWindowText(pid, { text, ...rest });
-      if (res) return res;
-    } catch (err) {
-      if (err?.aborted || err?.deliveryState === "sent_unknown" || err?.code === "WRITE_OUTCOME_UNKNOWN") {
-        throw err;
-      }
-      return { delivered: false, reason: err?.message || "bridge_error" };
-    }
-  }
-  return { delivered: false, reason: "bridge_unavailable" };
+  return callAxBridgeWindowMethod(axBridge, "postWindowText", pid, { text, ...rest }, {
+    label: "Window text partial delivery",
+    fallbackResult: { delivered: false },
+  });
 }
 
 export async function tryWindowScroll(pid, options = {}) {
@@ -1245,16 +1259,8 @@ export async function tryWindowScroll(pid, options = {}) {
     return { delivered: false, verified: false, reason: "invalid_args" };
   }
   const { axBridge = null, ...rest } = options || {};
-  if (axBridge && axBridge.enabled !== false && typeof axBridge.postWindowScroll === "function") {
-    try {
-      const res = await axBridge.postWindowScroll(pid, rest);
-      if (res) return res;
-    } catch (err) {
-      if (err?.aborted || err?.deliveryState === "sent_unknown" || err?.code === "WRITE_OUTCOME_UNKNOWN") {
-        throw err;
-      }
-      return { delivered: false, verified: false, reason: err?.message || "bridge_error" };
-    }
-  }
-  return { delivered: false, verified: false, reason: "bridge_unavailable" };
+  return callAxBridgeWindowMethod(axBridge, "postWindowScroll", pid, rest, {
+    label: "Window scroll partial delivery",
+    fallbackResult: { delivered: false, verified: false },
+  });
 }

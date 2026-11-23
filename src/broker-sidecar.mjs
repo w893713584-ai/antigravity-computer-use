@@ -16,7 +16,7 @@ import {
   bringAppToFrontExplicit,
   captureMainWindowFallbackJpeg,
   dispatchBackgroundPointClickDetailed,
-  dispatchBackgroundPointDrag,
+  dispatchBackgroundPointDragDetailed,
   extractResultImage,
   extractResultText,
   findRunningApp,
@@ -39,6 +39,7 @@ import {
   checkMacPermissions,
   computeFrameDigest,
   ensureRendererAccessibility,
+  evaluateJxaPostTrust,
   getProcessIdentity,
   matchAdvertisedAction,
   parseQualifiedElementRef,
@@ -54,8 +55,8 @@ import {
   verifyEditableTextFocus,
 } from "./headless-engine.mjs";
 import { PersistentAxBridge } from "./ax-bridge.mjs";
-import { FocusPolicyGuard } from "./focus-policy-guard.mjs";
 import { AppSnapshotRegistry, isSecureTextRole } from "./app-snapshot-registry.mjs";
+import { FocusPolicyGuard } from "./focus-policy-guard.mjs";
 import { BackgroundActionExecutor, appendResultFooter, attachDeliveryReceipt } from "./action-executor.mjs";
 import { AtomicActExecutor, buildActToolResult } from "./act-executor.mjs";
 import { BIND_HOST, SidecarWebAdapter } from "./sidecar-web-adapter.mjs";
@@ -64,6 +65,7 @@ import {
   mapToActionPixel,
   mapToWindowPoint,
   normalizeRectPt,
+  rectsEqualPt,
   validateFrameRef,
 } from "./preview-geometry.mjs";
 import { PreviewStreamManager } from "./preview-stream.mjs";
@@ -105,7 +107,7 @@ export class ComputerUseBrokerServer {
     promoteMainWindowFn = promoteMainWindowFocusInBackground,
     mainWindowFallbackFn = captureMainWindowFallbackJpeg,
     pointClickFn = dispatchBackgroundPointClickDetailed,
-    pointDragFn = dispatchBackgroundPointDrag,
+    pointDragFn = dispatchBackgroundPointDragDetailed,
     processIdentityFn = getProcessIdentity,
     runningAppIdentityFn = resolveRunningAppIdentity,
     permissionsFn = checkMacPermissions,
@@ -177,6 +179,7 @@ export class ComputerUseBrokerServer {
       this.axBridge.setSyntheticEventTag(this.takeoverController.syntheticEventTag);
     }
 
+    let lastActionPeerInstanceId = null;
     this.actionPeer =
       actionPeer ||
       new NativeComputerUsePeer({
@@ -191,8 +194,14 @@ export class ComputerUseBrokerServer {
         },
         onAgentInstanceCleared: (agentId) => {
           this.takeoverController.clearWriteOutcomeUnknown(agentId);
+          this.registry?.invalidateActionScreenshots?.(agentId);
         },
         onChildSpawned: () => {
+          const curId = this.actionPeer?.agentInstanceId || null;
+          if (lastActionPeerInstanceId && curId && curId !== lastActionPeerInstanceId) {
+            this.registry?.invalidateActionScreenshots?.(lastActionPeerInstanceId);
+          }
+          if (curId) lastActionPeerInstanceId = curId;
           this.#syncTrustedAutomationPids();
         },
       });
@@ -407,6 +416,7 @@ export class ComputerUseBrokerServer {
     this.actionExecutor = new BackgroundActionExecutor({
       actionPeer: this.actionPeer,
       axBridge: this.axBridge,
+      desktopHelperClient: this.desktopHelperClient,
       focusPolicyGuard: this.focusPolicyGuard,
       registry: this.registry,
       unhideAppFn: unhideAppWithoutActivating,
@@ -466,7 +476,10 @@ export class ComputerUseBrokerServer {
       brokerBootId: this.brokerBootId,
       state: this.state,
       getActiveActionCount: () => this.#activeActionCount,
-      shouldPollJpeg: () => this.previewStreamManager.needsJpegPolling(this.state.targetKey),
+      shouldPollJpeg: () =>
+        this.state.targetKey
+          ? this.previewStreamManager.needsJpegPolling(this.state.targetKey)
+          : Boolean(this.state.activeApp && !this.state.pinnedWindowId),
       isScreenLockedBackoff: () => this.#screenLockedBackoff,
       refreshPermissionsQuietly: () => this.#refreshPermissionsQuietly(),
       getPermissionsReport: () => this.getPermissionsReport(),
@@ -538,18 +551,24 @@ export class ComputerUseBrokerServer {
   }
 
   #isJxaWindowPostTrusted() {
-    return Boolean(
-      this.state.permissions.accessibility === true &&
-        (this.axBridge?.enabled !== false || this.windowClickFn !== tryWindowPostClick)
-    );
+    return evaluateJxaPostTrust({
+      axBridge: this.axBridge,
+      cachedAccessibility: this.state.permissions.accessibility,
+      hasCustomWindowTransport:
+        this.windowClickFn !== tryWindowPostClick || this.windowScrollFn !== tryWindowScroll,
+    });
   }
 
   async #refreshActivePreviewGeometry({
     app = this.state.activeApp,
+    pid: explicitPid = 0,
     windows = null,
     allowHelperQuery = true,
     selectAsActive = undefined,
     activate = undefined,
+    readOnlyOverride = false,
+    readOnlyReasonOverride = null,
+    resolveReadOnlyOverride = null,
   } = {}) {
     const shouldSelectAsActive =
       selectAsActive !== undefined ? Boolean(selectAsActive) : activate !== undefined ? Boolean(activate) : true;
@@ -563,7 +582,7 @@ export class ComputerUseBrokerServer {
     }
     const meta = this.registry.getMeta(app);
     const sameActive = this.#isSameActiveApp(app);
-    const pid = meta?.pid || (sameActive ? this.state.pid : 0) || 0;
+    const pid = Number(explicitPid || 0) || meta?.pid || (sameActive ? this.state.pid : 0) || 0;
     const processToken = meta?.processToken || null;
 
     let liveWindows = Array.isArray(windows) ? windows : null;
@@ -578,6 +597,9 @@ export class ComputerUseBrokerServer {
       windows: liveWindows || [],
     });
     if (selection.notFound) {
+      if (shouldSelectAsActive) {
+        this.previewStreamManager.clearActiveGeometry();
+      }
       this.#syncPreviewStateFields();
       return { geometry: null, notFound: true, selection };
     }
@@ -591,39 +613,52 @@ export class ComputerUseBrokerServer {
       (sameActive ? this.state.windowId : 0) ||
       0;
 
-    const jxaTrusted = this.#isJxaWindowPostTrusted();
-    const actionShot = meta?.actionScreenshotMeta || null;
-    const mainCount = selection.availableWindows.filter((w) => w.kind === "main").length;
-    let ocuActionProven = false;
-    if (
-      !selection.explicitWindowId &&
-      actionShot &&
-      actionShot.source === "ocu_action_peer" &&
-      actionShot.width > 0 &&
-      actionShot.height > 0
-    ) {
-      const multiMainRequiresWid = mainCount > 1 && !jxaTrusted;
-      const hasMatchedWid = actionShot.windowId > 0 && selectedWid > 0 && actionShot.windowId === selectedWid;
-      if (!multiMainRequiresWid || hasMatchedWid) {
-        ocuActionProven = {
-          pid: actionShot.pid || pid,
-          processToken: actionShot.processToken || processToken,
-          windowId: actionShot.windowId || 0,
-          pixelSize: { width: actionShot.width, height: actionShot.height },
-        };
-      }
-    }
-
     const windowBoundsPt =
       selected?.boundsPt ||
       normalizeRectPt(meta?.tinyWindowOverride?.bounds) ||
       normalizeRectPt(meta?.windowBounds) ||
-      (!selection.explicitWindowId &&
-      ocuActionProven &&
-      this.state.frameWidth > 0 &&
-      this.state.frameHeight > 0
-        ? { x: 0, y: 0, width: this.state.frameWidth, height: this.state.frameHeight }
-        : null);
+      null;
+
+    if (!windowBoundsPt) {
+      if (shouldSelectAsActive) {
+        this.previewStreamManager.clearActiveGeometry();
+      }
+      this.#syncPreviewStateFields();
+      return { geometry: this.previewStreamManager.getActiveGeometry(), notFound: false, selection };
+    }
+
+    const jxaTrusted = this.#isJxaWindowPostTrusted();
+    const actionShot = meta?.actionScreenshotMeta || null;
+    const shotProof = !selection.explicitWindowId
+      ? this.registry.evaluateActionScreenshotProof(meta, {
+          pid,
+          expectedPeerInstanceId: this.actionPeer?.agentInstanceId || null,
+          targetWindowId: selectedWid,
+          windowSize: windowBoundsPt,
+          requireSingleWindow: true,
+          requirePositiveWid: true,
+        })
+      : null;
+    const ocuActionProven = shotProof?.proven
+      ? {
+          pid: shotProof.shotMeta?.pid || pid,
+          processToken: shotProof.shotMeta?.processToken || processToken,
+          windowId: shotProof.shotWindowId || 0,
+          pixelSize: { width: shotProof.width, height: shotProof.height },
+        }
+      : false;
+    const helperWindows = selection.availableWindows || [];
+    const helperSingleWin = Boolean(
+      helperWindows.length === 1 && selectedWid > 0 && Number(helperWindows[0]?.windowId) === selectedWid
+    );
+    const singleWindowProven = Boolean(
+      helperWindows.length > 0
+        ? helperSingleWin &&
+            (!shotProof?.shotMeta ||
+              !Number.isInteger(shotProof.windowCount) ||
+              shotProof.windowCount === 1)
+        : shotProof?.sameWindowProven && shotProof?.singleWindowProven
+    );
 
     const previewPixelSize =
       this.state.frameWidth > 0 && this.state.frameHeight > 0
@@ -636,10 +671,22 @@ export class ComputerUseBrokerServer {
           ? { width: meta.actionFrameWidth, height: meta.actionFrameHeight }
           : null;
 
-    if (!windowBoundsPt) {
-      this.#syncPreviewStateFields();
-      return { geometry: this.previewStreamManager.getActiveGeometry(), notFound: false, selection };
-    }
+    const resolvedReadOnly =
+      typeof resolveReadOnlyOverride === "function"
+        ? resolveReadOnlyOverride({
+            selectedWid,
+            helperWinCount: helperWindows.length,
+            selection,
+          })
+        : null;
+    const effectiveReadOnlyOverride =
+      resolvedReadOnly && resolvedReadOnly.readOnlyOverride !== undefined
+        ? resolvedReadOnly.readOnlyOverride
+        : readOnlyOverride;
+    const effectiveReadOnlyReasonOverride =
+      resolvedReadOnly && resolvedReadOnly.readOnlyReasonOverride !== undefined
+        ? resolvedReadOnly.readOnlyReasonOverride
+        : readOnlyReasonOverride;
 
     const geom = this.previewStreamManager.syncActiveGeometry({
       pid,
@@ -650,7 +697,10 @@ export class ComputerUseBrokerServer {
       previewPixelSize,
       actionPixelSize,
       jxaTrusted,
+      singleWindowProven,
       ocuActionProven,
+      readOnlyOverride: effectiveReadOnlyOverride,
+      readOnlyReasonOverride: effectiveReadOnlyReasonOverride,
       selectAsActive: shouldSelectAsActive,
     });
     if (selected?.title && sameActive) {
@@ -928,15 +978,37 @@ export class ComputerUseBrokerServer {
       }
     }
 
+    const capturePreShotObs = async () => {
+      if (peer !== this.actionPeer || argsWithReadOnly.include_screenshot === false || !app) {
+        return { obs: null, hadPrePid: false };
+      }
+      let prePid =
+        this.registry.getMeta(app)?.pid || (this.#isSameActiveApp(app) ? this.state.pid : null) || 0;
+      if (!(prePid > 0) && typeof this.runningAppIdentityFn === "function") {
+        const preIdentity = await this.runningAppIdentityFn(app, { axBridge: this.axBridge }).catch(
+          () => null
+        );
+        prePid = Number(preIdentity?.pid || 0);
+      }
+      if (!(prePid > 0)) return { obs: null, hadPrePid: false };
+      const obs = await this.registry
+        .captureWindowObservation(app, { pid: prePid, desktopHelperClient: this.desktopHelperClient })
+        .catch(() => null);
+      return { obs, hadPrePid: true };
+    };
+
     if (operation?.isAi) {
       this.takeoverController.assertMayDispatch(operation, { isRead: true });
     }
 
     const t0 = Date.now();
     let result;
+    let capturedPeerInstanceId = null;
+    let preObsRes = await capturePreShotObs();
     const callTimeout = Number(timeoutMs) > 0 ? Math.max(50, Math.min(12_000, timeoutMs)) : undefined;
     try {
       result = await peer.callTool("get_app_state", argsWithReadOnly, callTimeout);
+      capturedPeerInstanceId = peer?.agentInstanceId || null;
     } catch (err) {
       if (LOCKED_SESSION_POSIX_RE.test(String(err?.message || ""))) {
         this.#screenLockedBackoff = true;
@@ -967,7 +1039,9 @@ export class ComputerUseBrokerServer {
           if (operation?.isAi) {
             this.takeoverController.assertMayDispatch(operation, { isRead: true });
           }
+          preObsRes = await capturePreShotObs();
           result = await peer.callTool("get_app_state", argsWithReadOnly);
+          capturedPeerInstanceId = peer?.agentInstanceId || null;
           text = extractResultText(result);
         }
       } else if (canMutateForRead) {
@@ -983,7 +1057,9 @@ export class ComputerUseBrokerServer {
         if (operation?.isAi) {
           this.takeoverController.assertMayDispatch(operation, { isRead: true });
         }
+        preObsRes = await capturePreShotObs();
         result = await peer.callTool("get_app_state", argsWithReadOnly);
+        capturedPeerInstanceId = peer?.agentInstanceId || null;
         text = extractResultText(result);
       }
     }
@@ -996,13 +1072,27 @@ export class ComputerUseBrokerServer {
         !observationalOnly &&
         peer === this.actionPeer &&
         fallbackPid > 0 &&
-        typeof this.promoteMainWindowFn === "function"
+        typeof this.promoteMainWindowFn === "function" &&
+        !(operation?.isAi && this.takeoverController.paused)
       ) {
-        const promoted = await this.promoteMainWindowFn(fallbackPid);
+        if (operation?.isAi) {
+          this.takeoverController.assertMayDispatch(operation, { isRead: false });
+        }
+        const promotePromise = this.promoteMainWindowFn(fallbackPid);
+        const promoted = await (operation
+          ? this.takeoverController.trackNativeWrite(operation, promotePromise, {
+              routeKey: "ax:promote_main_window",
+            })
+          : promotePromise);
         if (promoted) {
+          if (operation?.isAi) {
+            this.takeoverController.assertMayDispatch(operation, { isRead: true });
+          }
+          preObsRes = await capturePreShotObs();
           const retryRes = await peer.callTool("get_app_state", argsWithReadOnly);
           if (!retryRes?.isError) {
             result = retryRes;
+            capturedPeerInstanceId = peer?.agentInstanceId || null;
             text = extractResultText(result);
           }
         }
@@ -1052,8 +1142,13 @@ export class ComputerUseBrokerServer {
           : wakePromise);
         if (wake?.changed) {
           await new Promise((r) => setTimeout(r, 35));
+          if (operation?.isAi) {
+            this.takeoverController.assertMayDispatch(operation, { isRead: true });
+          }
+          preObsRes = await capturePreShotObs();
           const wokenRes = await peer.callTool("get_app_state", argsWithReadOnly).catch(() => null);
           if (wokenRes && !wokenRes.isError) {
+            capturedPeerInstanceId = peer?.agentInstanceId || null;
             if (argsWithReadOnly.include_screenshot !== false && this.#isTinyFloatingImage(wokenRes)) {
               const upgradedWake = await this.#upgradeTinyFloatingWindowResult(wokenRes, targetPid);
               result = upgradedWake.result;
@@ -1078,6 +1173,35 @@ export class ComputerUseBrokerServer {
       const imgBytes = img?.data ? Buffer.from(img.data, "base64") : null;
       const imgDims = imgBytes ? parseImageDimensions(imgBytes) : null;
       const imgDigest = imgBytes ? computeFrameDigest(imgBytes) : undefined;
+      meta.peerInstanceId = capturedPeerInstanceId;
+      if (
+        peer === this.actionPeer &&
+        argsWithReadOnly.include_screenshot !== false &&
+        !tinyWindowOverride &&
+        targetPid > 0 &&
+        imgDims?.width > 0 &&
+        imgDims?.height > 0 &&
+        typeof this.registry.proveScreenshotWindowObservation === "function"
+      ) {
+        const proof = await this.registry.proveScreenshotWindowObservation(app, {
+          pid: targetPid,
+          imgDims,
+          windowTitle: meta.windowTitle || "",
+          parsedWindowId: meta.windowId || null,
+          preObs: preObsRes?.obs || null,
+          hadPrePid: Boolean(preObsRes?.hadPrePid),
+          desktopHelperClient: this.desktopHelperClient,
+        });
+        meta.windowCount = proof.windowCount;
+        meta.singleWindowProven = proof.singleWindowProven;
+        if (proof.proven) {
+          meta.windowId = proof.windowId;
+          meta.windowBounds = proof.windowBounds;
+        } else {
+          meta.windowId = null;
+          meta.windowBounds = null;
+        }
+      }
       const merged = this.registry.recordMeta(app, meta, {
         fromActionPeer: peer === this.actionPeer,
         includeAx: argsWithReadOnly.include_ax !== false,
@@ -1118,12 +1242,19 @@ export class ComputerUseBrokerServer {
           this.state.frameWidth = dims.width;
           this.state.frameHeight = dims.height;
         }
-        await this.#refreshActivePreviewGeometry({
+        await this.#refreshAndPublishPreviewFrame({
           app: merged.bundleId || app,
-          allowHelperQuery: true,
-          selectAsActive: true,
+          pid: Number(merged.pid || this.state.pid || 0),
+          img,
+          latencyMs,
+          provenWid: tinyWindowOverride
+            ? Number(tinyWindowOverride.wid || 0) || null
+            : merged?.actionScreenshotMeta?.windowIdProven
+              ? Number(merged?.windowId || 0) || null
+              : null,
+          minWinCount: Number(merged?.actionScreenshotMeta?.windowCount || 0),
+          forceCheckMultiWindow: !tinyWindowOverride,
         }).catch(() => {});
-        this.webAdapter.updateFrameFromImageItem(img, latencyMs);
       } else if (updateActiveApp) {
         await this.#refreshActivePreviewGeometry({
           app: merged.bundleId || app,
@@ -1360,17 +1491,21 @@ export class ComputerUseBrokerServer {
   #buildOperationAbortedResult(name, err) {
     const code = err?.code || "PAUSED";
     const msg = err?.message || "Computer Use 已被暂停或取消。";
+    const deliveryState = err?.deliveryState || null;
     if (name === "act") {
       return buildActToolResult({
         isError: true,
         status: "cancelled",
         code,
         message: msg,
-        sent: err?.deliveryState === "sent_unknown",
+        sent: deliveryState === "sent_unknown",
+        ...(deliveryState ? { deliveryState } : {}),
       });
     }
     return {
       isError: true,
+      ...(deliveryState ? { deliveryState, fatal: true } : {}),
+      ...(code ? { reason: code } : {}),
       content: [{ type: "text", text: `[${code}] ${msg}` }],
     };
   }
@@ -1894,7 +2029,7 @@ export class ComputerUseBrokerServer {
         windowId: windowDelivery?.windowId || null,
       });
       const preFocusObs =
-        app && (name === "click" || !initialRouteScope?.windowId)
+        app && (name === "click" || name === "drag" || !initialRouteScope?.windowId)
           ? await this.registry.captureWindowObservation(app, {
               desktopHelperClient: this.desktopHelperClient,
               preferredTitle: preMeta?.windowTitle || "",
@@ -1924,6 +2059,7 @@ export class ComputerUseBrokerServer {
         windowDelivery,
         routeScope,
         focusScope,
+        liveWindowObs: preFocusObs,
       });
       lastRouteKey = dispatched.actionRouteKey || lastRouteKey;
 
@@ -2223,18 +2359,14 @@ export class ComputerUseBrokerServer {
             this.state.frameWidth = dims.width;
             this.state.frameHeight = dims.height;
           }
-          await this.#refreshActivePreviewGeometry({
+          await this.#refreshAndPublishPreviewFrame({
             app: targetApp,
-            allowHelperQuery: Boolean(this.desktopHelperClient?.available),
-            selectAsActive: true,
+            pid: this.state.pid,
+            img,
+            latencyMs: dt,
+            provenWid: Number(upgraded.override?.wid || meta.windowId || 0) || null,
+            forceCheckMultiWindow: true,
           }).catch(() => {});
-          this.webAdapter.updateFrameFromImageItem(img, dt, {
-            frameMeta: {
-              targetKey: this.state.targetKey,
-              geometryRev: this.state.geometryRev,
-              windowId: meta.windowId || this.state.windowId || null,
-            },
-          });
         }
       }
     } catch (err) {
@@ -2242,6 +2374,63 @@ export class ComputerUseBrokerServer {
     } finally {
       this.streamInFlight = false;
     }
+  }
+
+  /**
+   * Refresh preview geometry once with multi-window ambiguity evaluated up front,
+   * then publish the captured frame with matching metadata.
+   */
+  async #refreshAndPublishPreviewFrame({
+    app,
+    pid = 0,
+    img,
+    latencyMs = 0,
+    provenWid = null,
+    minWinCount = 0,
+    forceCheckMultiWindow = true,
+  }) {
+    let ambiguousEvaluated = false;
+    let multiWindowAmbiguous = false;
+    await this.#refreshActivePreviewGeometry({
+      app,
+      pid,
+      allowHelperQuery: Boolean(this.desktopHelperClient?.available),
+      selectAsActive: true,
+      resolveReadOnlyOverride: ({ selectedWid, helperWinCount: liveHelperWinCount }) => {
+        ambiguousEvaluated = true;
+        const helperWinCount = Math.max(Number(minWinCount || 0), liveHelperWinCount);
+        multiWindowAmbiguous = Boolean(
+          forceCheckMultiWindow &&
+            helperWinCount > 1 &&
+            (!provenWid || (selectedWid > 0 && provenWid !== selectedWid))
+        );
+        return multiWindowAmbiguous
+          ? {
+              readOnlyOverride: true,
+              readOnlyReasonOverride: "ambiguous_multi_window_stream",
+            }
+          : null;
+      },
+    }).catch(() => {});
+    if (!ambiguousEvaluated && forceCheckMultiWindow) {
+      const helperWinCount = Math.max(
+        Number(minWinCount || 0),
+        this.previewStreamManager.availableWindows.length
+      );
+      const fallbackWid = Number(this.state.windowId || 0);
+      multiWindowAmbiguous = Boolean(
+        helperWinCount > 1 &&
+          (!provenWid || (fallbackWid > 0 && provenWid !== fallbackWid))
+      );
+    }
+    this.webAdapter.updateFrameFromImageItem(img, latencyMs, {
+      frameMeta: {
+        targetKey: this.state.targetKey,
+        geometryRev: this.state.geometryRev,
+        windowId: multiWindowAmbiguous ? provenWid : provenWid || this.state.windowId || null,
+        ambiguous: multiWindowAmbiguous,
+      },
+    });
   }
 
   async #handleGetWindows() {
@@ -2320,6 +2509,11 @@ export class ComputerUseBrokerServer {
     });
     if (reqWid && geomRes.notFound) {
       this.state.pinnedWindowId = prevPinned;
+      await this.#refreshActivePreviewGeometry({
+        app: target,
+        allowHelperQuery: true,
+        selectAsActive: true,
+      }).catch(() => {});
       this.#syncPreviewStateFields();
       return {
         ok: false,
@@ -2441,6 +2635,7 @@ export class ComputerUseBrokerServer {
       );
       if (
         !histHit ||
+        histHit.ambiguous === true ||
         (histHit.targetKey && histHit.targetKey !== curGeom.targetKey) ||
         (Number(histHit.geometryRev) > 0 && Number(histHit.geometryRev) !== Number(curGeom.geometryRev)) ||
         (curGeom.windowId > 0 && Number(histHit.windowId) > 0 && Number(histHit.windowId) !== curGeom.windowId) ||
@@ -2686,7 +2881,29 @@ export class ComputerUseBrokerServer {
                 };
               }
               meta = this.registry.getMeta(app);
-              geomForPixel = this.previewStreamManager.getActiveGeometry() || activeGeom;
+              geomForPixel = this.previewStreamManager.getActiveGeometry();
+              const boundsStillMatch = Boolean(
+                !geomForPixel?.windowBoundsPt ||
+                  !activeGeom.windowBoundsPt ||
+                  rectsEqualPt(geomForPixel.windowBoundsPt, activeGeom.windowBoundsPt, 4)
+              );
+              if (
+                !geomForPixel ||
+                geomForPixel.readOnly ||
+                geomForPixel.deliveryRoute !== "ocu_pixel" ||
+                geomForPixel.windowId !== activeGeom.windowId ||
+                (activeGeom.targetKey && geomForPixel.targetKey !== activeGeom.targetKey) ||
+                !boundsStillMatch
+              ) {
+                return {
+                  ok: false,
+                  statusCode: 409,
+                  code: "UNPROVEN_SAME_WINDOW",
+                  reason: geomForPixel?.readOnlyReason || "unproven_same_window",
+                  error: "OCU 动作截图与当前视频窗口几何不匹配或处于只读保护，已拦截点击",
+                  state: this.webAdapter.publicState(),
+                };
+              }
             }
             const px = mapToActionPixel(winPt, geomForPixel);
             if (!px) {
@@ -2705,6 +2922,7 @@ export class ComputerUseBrokerServer {
                 app,
                 x: px.x,
                 y: px.y,
+                click_method: "sky_click",
                 mouse_button: data.button || "left",
                 click_count: data.clickCount || 1,
               },
@@ -2714,6 +2932,7 @@ export class ComputerUseBrokerServer {
                   route: "ocu_pixel",
                   localPoint: { x: winPt.x, y: winPt.y },
                   windowId: geomForPixel.windowId,
+                  windowBoundsPt: geomForPixel.windowBoundsPt,
                   normX,
                   normY,
                   targetKey: geomForPixel.targetKey,

@@ -31,6 +31,251 @@ export function normalizeElementBounds(raw) {
 }
 
 /**
+ * Check whether two window/image aspect ratios agree within `maxDelta`.
+ */
+export function hasMatchingAspectRatio(w1, h1, w2, h2, maxDelta = 0.03) {
+  const aW = Number(w1);
+  const aH = Number(h1);
+  const bW = Number(w2);
+  const bH = Number(h2);
+  if (!(aW > 0) || !(aH > 0) || !(bW > 0) || !(bH > 0)) {
+    return false;
+  }
+  const r1 = aW / aH;
+  const r2 = bW / bH;
+  return Math.abs(r2 - r1) / Math.max(r1, 0.001) <= maxDelta;
+}
+
+/**
+ * Derive a `{ pid, processToken, windowId }` route scope from cached snapshot/meta records.
+ */
+export function buildRouteScopeFromMeta(meta, { snapshot = null, windowId = null } = {}) {
+  const pid = Number(meta?.pid || snapshot?.pid || 0) || null;
+  const processToken = meta?.processToken || snapshot?.processToken || null;
+  const explicitWid = Number(windowId);
+  const resolvedWid =
+    Number.isInteger(explicitWid) && explicitWid > 0
+      ? explicitWid
+      : Number(
+          snapshot?.windowId ||
+            meta?.windowId ||
+            meta?.actionScreenshotMeta?.windowId ||
+            meta?.tinyWindowOverride?.wid ||
+            0
+        ) || null;
+  if (!pid && !processToken && !resolvedWid) return null;
+  return {
+    pid,
+    processToken,
+    windowId: resolvedWid,
+  };
+}
+
+/**
+ * Resolve a live window observation for a running PID by combining desktop-helper
+ * focus metadata, AX focused-window queries, and optional window-list fallbacks.
+ */
+export async function resolveFocusedWindowObservation({
+  pid,
+  windowTitle = "",
+  desktopHelperClient = null,
+  axBridge = null,
+  allowListWindowsFallback = false,
+} = {}) {
+  const numPid = Number(pid || 0);
+  if (!(numPid > 0)) return null;
+  const toPositiveIds = (raw) =>
+    Array.isArray(raw) ? raw.map((x) => Number(x)).filter((x) => x > 0) : null;
+
+  let helperObs = null;
+  if (desktopHelperClient?.available && typeof desktopHelperClient.getFocusedWindow === "function") {
+    helperObs = await desktopHelperClient.getFocusedWindow(numPid).catch(() => null);
+    if (helperObs && Number(helperObs.wid) > 0) {
+      return {
+        wid: Number(helperObs.wid),
+        title: helperObs.title || null,
+        windowBounds: helperObs.windowBounds || null,
+        windowIds: toPositiveIds(helperObs.windowIds),
+        ...(helperObs.focusedExcludedWindow ? { focusedExcludedWindow: true } : {}),
+      };
+    }
+  }
+  const helperWindowIds = toPositiveIds(helperObs?.windowIds);
+  if (axBridge?.enabled !== false && typeof axBridge?.getFocusedWindowInfo === "function") {
+    const axObs = await axBridge
+      .getFocusedWindowInfo(numPid, { windowTitle: windowTitle || "" })
+      .catch(() => null);
+    if (axObs && typeof axObs === "object") {
+      const axIds = toPositiveIds(axObs.windowIds);
+      const focusedExcluded = Boolean(
+        axObs.focusedExcludedWindow || helperObs?.focusedExcludedWindow
+      );
+      return {
+        wid: Number(axObs.wid) > 0 ? Number(axObs.wid) : null,
+        title: axObs.title || null,
+        windowBounds: axObs.windowBounds || null,
+        windowIds: axIds?.length ? axIds : helperWindowIds,
+        ...(focusedExcluded ? { focusedExcludedWindow: true } : {}),
+      };
+    }
+  }
+  if (helperObs && (helperWindowIds?.length || helperObs.focusedExcludedWindow)) {
+    return {
+      wid: null,
+      title: helperObs.title || null,
+      windowBounds: helperObs.windowBounds || null,
+      windowIds: helperWindowIds || [],
+      ...(helperObs.focusedExcludedWindow ? { focusedExcludedWindow: true } : {}),
+    };
+  }
+  if (
+    allowListWindowsFallback &&
+    desktopHelperClient?.available &&
+    typeof desktopHelperClient.listWindows === "function"
+  ) {
+    const wins = await desktopHelperClient.listWindows(numPid).catch(() => null);
+    if (Array.isArray(wins) && wins.length > 0) {
+      const windowIds = toPositiveIds(wins.map((w) => w?.windowId || w?.wid));
+      if (windowIds?.length) {
+        return { wid: null, windowIds };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Determine whether an observation or proof guarantees a single visible window.
+ * Explicit boolean `singleWindowProven` takes precedence over cached `windowCount === 1`.
+ */
+export function isSingleWindowProven(shotOrAuth) {
+  if (typeof shotOrAuth?.singleWindowProven === "boolean") {
+    return shotOrAuth.singleWindowProven;
+  }
+  return shotOrAuth?.windowCount === 1;
+}
+
+/**
+ * Shared authoritative Same-Window Proof & Single-Window Shot evaluator on `actionScreenshotMeta`.
+ * Pixel coordinate scaling remains at the ActionExecutor seam (`windowPointToScreenshotPixel`).
+ */
+export function evaluateScreenshotMetaProof(
+  meta,
+  {
+    shotMeta = undefined,
+    pid = null,
+    expectedPeerInstanceId = null,
+    callerExplicitWindowId = null,
+    targetWindowId = null,
+    windowSize = null,
+    liveWindowObs = null,
+    requireSingleWindow = false,
+    requirePositiveWid = true,
+  } = {}
+) {
+  const shot = shotMeta !== undefined ? shotMeta : meta?.actionScreenshotMeta || null;
+  const imgW = Number(shot?.width || meta?.actionFrameWidth || 0);
+  const imgH = Number(shot?.height || meta?.actionFrameHeight || 0);
+  const effectivePid = Number(pid || meta?.pid || 0);
+  const shotWid = Number(shot?.windowId || 0);
+
+  const identityMatch = Boolean(
+    shot &&
+      shot.source === "ocu_action_peer" &&
+      imgW > 0 &&
+      imgH > 0 &&
+      (!expectedPeerInstanceId || !shot.peerInstanceId || shot.peerInstanceId === expectedPeerInstanceId) &&
+      (!(effectivePid > 0 && shot.pid > 0) || Number(shot.pid) === effectivePid) &&
+      (!meta?.processToken || !shot.processToken || shot.processToken === meta.processToken)
+  );
+
+  let boundsMatch = identityMatch;
+  const normW = Number(windowSize?.width ?? windowSize?.w ?? 0);
+  const normH = Number(windowSize?.height ?? windowSize?.h ?? 0);
+  if (boundsMatch && normW > 0 && normH > 0) {
+    if (shot.windowBounds) {
+      const sw = Number(shot.windowBounds.width ?? shot.windowBounds.w ?? 0);
+      const sh = Number(shot.windowBounds.height ?? shot.windowBounds.h ?? 0);
+      if (sw > 0 && sh > 0 && (Math.abs(sw - normW) > 4 || Math.abs(sh - normH) > 4)) {
+        boundsMatch = false;
+      }
+    }
+    if (boundsMatch && !hasMatchingAspectRatio(normW, normH, imgW, imgH, 0.03)) {
+      boundsMatch = false;
+    }
+  }
+
+  let liveMatch = true;
+  if (liveWindowObs && typeof liveWindowObs === "object") {
+    const liveWid = Number(liveWindowObs.wid || liveWindowObs.windowId || 0);
+    if (liveWid > 0 && shotWid > 0 && liveWid !== shotWid) {
+      liveMatch = false;
+    }
+    const lb = normalizeElementBounds(liveWindowObs.windowBounds || liveWindowObs.boundsPt || liveWindowObs.bounds);
+    if (liveMatch && lb) {
+      if (shot?.windowBounds) {
+        const sw = Number(shot.windowBounds.width ?? shot.windowBounds.w ?? 0);
+        const sh = Number(shot.windowBounds.height ?? shot.windowBounds.h ?? 0);
+        if (sw > 0 && sh > 0 && (Math.abs(sw - lb.w) > 4 || Math.abs(sh - lb.h) > 4)) {
+          liveMatch = false;
+        }
+      }
+      if (liveMatch && imgW > 0 && imgH > 0 && !hasMatchingAspectRatio(lb.w, lb.h, imgW, imgH, 0.03)) {
+        liveMatch = false;
+      }
+    }
+  }
+
+  const isPinned = Number(callerExplicitWindowId) > 0;
+  const effectiveWid = isPinned
+    ? Number(callerExplicitWindowId)
+    : Number(targetWindowId || meta?.tinyWindowOverride?.wid || meta?.windowId || 0);
+  const widMatch = Boolean(
+    shot?.windowIdProven === true &&
+      shotWid > 0 &&
+      (effectiveWid > 0 ? shotWid === effectiveWid : !requirePositiveWid)
+  );
+
+  const liveWindowIds = Array.isArray(liveWindowObs?.windowIds)
+    ? liveWindowObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
+    : null;
+  const liveWidObs = Number(liveWindowObs?.wid || liveWindowObs?.windowId || 0);
+  const liveFocusedExcluded = Boolean(
+    liveWindowObs?.focusedExcludedWindow === true ||
+      (!(liveWidObs > 0) &&
+        liveWindowIds?.length === 1 &&
+        liveWindowObs?.title &&
+        shot?.windowTitle &&
+        String(liveWindowObs.title).trim() !== String(shot.windowTitle).trim())
+  );
+  const liveMultiWindow = Boolean(
+    liveFocusedExcluded ||
+      (liveWindowIds &&
+        (liveWindowIds.length !== 1 || (shotWid > 0 && Number(liveWindowIds[0]) !== shotWid)))
+  );
+  const singleWindowProven = Boolean(isSingleWindowProven(shot) && !liveMultiWindow);
+  const sameWindowProven = Boolean(identityMatch && boundsMatch && liveMatch && widMatch);
+  const proven = Boolean(sameWindowProven && (!requireSingleWindow || singleWindowProven));
+
+  return {
+    proven,
+    sameWindowProven,
+    identityMatch,
+    boundsMatch,
+    liveMatch,
+    widMatch,
+    singleWindowProven,
+    effectiveWid: effectiveWid > 0 ? effectiveWid : shotWid > 0 ? shotWid : null,
+    shotWindowId: shotWid > 0 ? shotWid : null,
+    windowCount: shot?.windowCount ?? null,
+    width: imgW,
+    height: imgH,
+    peerInstanceId: shot?.peerInstanceId || null,
+    shotMeta: shot,
+  };
+}
+
+/**
  * Single authoritative builder for Snapshot & `query` element descriptors.
  * Enforces identical password redaction (`isSecure`), `identifier`-stable fingerprinting,
  * bounds/window provenance (`origin`, `windowId`), and human-readable labels across
@@ -200,17 +445,19 @@ export class AppSnapshotRegistry {
         (parsedWinId && prev.windowId && parsedWinId !== prev.windowId)
     );
     const identityChanged = windowChanged || pidChanged || processChanged;
-    const queryCaptureMatchesPrev =
-      source !== "query" || !preserveScreenshotState
+    const captureMatchesPrev =
+      source !== "query" && !(fromActionPeer && !includeScreenshot)
         ? true
-        : parsedWinId !== null
-          ? Boolean(prev.windowId && prev.windowId === parsedWinId && !pidChanged && !processChanged)
-          : !prev.windowId && !pidChanged && !processChanged;
+        : !preserveScreenshotState
+          ? false
+          : parsedWinId !== null
+            ? Boolean(prev.windowId && prev.windowId === parsedWinId && !pidChanged && !processChanged)
+            : !prev.windowId && !pidChanged && !processChanged;
 
     let lastImageDigest =
       imageDigest !== undefined
         ? imageDigest
-        : identityChanged || !queryCaptureMatchesPrev
+        : identityChanged || !captureMatchesPrev
           ? null
           : prev.lastImageDigest || null;
     if (identityChanged) {
@@ -222,7 +469,7 @@ export class AppSnapshotRegistry {
       actionFrameHeight = 0;
       nextTinyOverride = null;
       snapshotId = null;
-    } else if (!queryCaptureMatchesPrev) {
+    } else if (!captureMatchesPrev) {
       actionHasScreenshot = false;
       actionFrameWidth = 0;
       actionFrameHeight = 0;
@@ -247,7 +494,10 @@ export class AppSnapshotRegistry {
         elementsPartial = false;
         actionHasAx = true;
       }
-      if (!includeScreenshot && (!preserveScreenshotState || !queryCaptureMatchesPrev)) {
+      if (
+        (includeScreenshot && !actionDims) ||
+        (!includeScreenshot && (!preserveScreenshotState || !captureMatchesPrev))
+      ) {
         actionHasScreenshot = false;
         actionFrameWidth = 0;
         actionFrameHeight = 0;
@@ -313,14 +563,28 @@ export class AppSnapshotRegistry {
     }
 
     let nextActionScreenshotMeta =
-      identityChanged || !queryCaptureMatchesPrev ? null : prev.actionScreenshotMeta || null;
-    if (fromActionPeer && !includeScreenshot && (!preserveScreenshotState || !queryCaptureMatchesPrev)) {
+      identityChanged || !captureMatchesPrev ? null : prev.actionScreenshotMeta || null;
+    if (
+      fromActionPeer &&
+      ((includeScreenshot && !actionDims) ||
+        (!includeScreenshot && (!preserveScreenshotState || !captureMatchesPrev)))
+    ) {
       nextActionScreenshotMeta = null;
     } else if (fromActionPeer && includeScreenshot && actionDims) {
+      const windowIdProven = Boolean(parsedWinId !== null || nextTinyOverride?.wid > 0);
+      const windowCount =
+        Number.isInteger(meta.windowCount) && meta.windowCount >= 0 ? meta.windowCount : null;
+      const singleWindowProven = Boolean(
+        meta.singleWindowProven || (nextTinyOverride?.wid > 0 && windowCount === 1)
+      );
       nextActionScreenshotMeta = {
         pid: pid || null,
         processToken: nextProcessToken || null,
         windowId: windowId || nextTinyOverride?.wid || null,
+        windowIdProven,
+        windowCount,
+        singleWindowProven,
+        peerInstanceId: meta.peerInstanceId || null,
         windowTitle: windowTitle || null,
         windowBounds: windowBounds || null,
         width: actionDims.width,
@@ -358,6 +622,37 @@ export class AppSnapshotRegistry {
       if (norm) this.#cache.set(norm, merged);
     }
     return merged;
+  }
+
+  /**
+   * Invalidate cached action-peer screenshots across apps or for a specific peer instance.
+   */
+  invalidateActionScreenshots(targetPeerInstanceId = null) {
+    const updated = new Map();
+    for (const [normKey, entry] of this.#cache.entries()) {
+      if (
+        targetPeerInstanceId &&
+        entry.actionScreenshotMeta?.peerInstanceId !== targetPeerInstanceId
+      ) {
+        continue;
+      }
+      let nextEntry = updated.get(entry);
+      if (!nextEntry) {
+        nextEntry = {
+          ...entry,
+          actionHasScreenshot: false,
+          actionFrameWidth: 0,
+          actionFrameHeight: 0,
+          actionScreenshotMeta: null,
+          singleWindowProven: false,
+          windowCount: null,
+          tinyWindowOverride: null,
+          lastImageDigest: null,
+        };
+        updated.set(entry, nextEntry);
+      }
+      this.#cache.set(normKey, nextEntry);
+    }
   }
 
   deleteMeta(appQuery) {
@@ -745,78 +1040,28 @@ export class AppSnapshotRegistry {
   }
 
   buildRouteScope(meta, { snapshot = null, windowId = null } = {}) {
-    const pid = Number(meta?.pid || snapshot?.pid || 0) || null;
-    const processToken = meta?.processToken || snapshot?.processToken || null;
-    const explicitWid = Number(windowId);
-    const resolvedWid =
-      Number.isInteger(explicitWid) && explicitWid > 0
-        ? explicitWid
-        : Number(
-            snapshot?.windowId ||
-              meta?.windowId ||
-              meta?.actionScreenshotMeta?.windowId ||
-              meta?.tinyWindowOverride?.wid ||
-              0
-          ) || null;
-    if (!pid && !processToken && !resolvedWid) return null;
-    return {
-      pid,
-      processToken,
-      windowId: resolvedWid,
-    };
+    return buildRouteScopeFromMeta(meta, { snapshot, windowId });
   }
 
-  async captureWindowObservation(app, { desktopHelperClient = null, preferredTitle = "" } = {}) {
+  /**
+   * Capture a live focused-window observation for an app, forwarding helper
+   * and AX signals including excluded small/auxiliary window focus flags.
+   */
+  async captureWindowObservation(app, { pid: explicitPid = null, desktopHelperClient = null, preferredTitle = "" } = {}) {
     const meta = this.getMeta(app);
-    const pid = Number(meta?.pid || 0);
-    if (!(pid > 0)) return null;
-    let helperObs = null;
-    if (desktopHelperClient?.available && typeof desktopHelperClient.getFocusedWindow === "function") {
-      helperObs = await desktopHelperClient.getFocusedWindow(pid).catch(() => null);
-      if (helperObs && Number(helperObs.wid) > 0) {
-        return {
-          wid: Number(helperObs.wid),
-          title: helperObs.title || null,
-          windowBounds: helperObs.windowBounds || null,
-          windowIds: Array.isArray(helperObs.windowIds)
-            ? helperObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
-            : null,
-        };
-      }
-    }
-    const helperWindowIds = Array.isArray(helperObs?.windowIds)
-      ? helperObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
-      : null;
-    if (
-      this.#axBridge?.enabled !== false &&
-      typeof this.#axBridge?.getFocusedWindowInfo === "function"
-    ) {
-      const axObs = await this.#axBridge
-        .getFocusedWindowInfo(pid, { windowTitle: preferredTitle || meta?.windowTitle || "" })
-        .catch(() => null);
-      if (axObs && typeof axObs === "object") {
-        const axIds = Array.isArray(axObs.windowIds)
-          ? axObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
-          : null;
-        return {
-          wid: Number(axObs.wid) > 0 ? Number(axObs.wid) : null,
-          title: axObs.title || null,
-          windowBounds: axObs.windowBounds || null,
-          windowIds: axIds?.length ? axIds : helperWindowIds,
-        };
-      }
-    }
-    if (helperObs && helperWindowIds?.length) {
-      return {
-        wid: null,
-        title: helperObs.title || null,
-        windowBounds: helperObs.windowBounds || null,
-        windowIds: helperWindowIds,
-      };
-    }
-    return null;
+    return resolveFocusedWindowObservation({
+      pid: explicitPid || meta?.pid || 0,
+      windowTitle: preferredTitle || meta?.windowTitle || "",
+      desktopHelperClient,
+      axBridge: this.#axBridge,
+      allowListWindowsFallback: false,
+    });
   }
 
+  /**
+   * Compare pre- and post-action window observations to detect whether an action
+   * opened or shifted focus to a previously unseen window ID.
+   */
   detectNewWindowTransition(preObs, postObs) {
     const preWid = Number(preObs?.wid || 0);
     const postWid = Number(postObs?.wid || 0);
@@ -827,6 +1072,89 @@ export class AppSnapshotRegistry {
       return !preObs.windowIds.includes(postWid);
     }
     return true;
+  }
+
+  /**
+   * Evaluate cached screenshot Same-Window Proof for an app name/key or meta record.
+   */
+  evaluateActionScreenshotProof(appOrMeta, options = {}) {
+    const meta =
+      typeof appOrMeta === "string" ? this.getMeta(appOrMeta) : appOrMeta || null;
+    return evaluateScreenshotMetaProof(meta, options);
+  }
+
+  /**
+   * Verify post-screenshot window observation against pre-shot state, image aspect ratio, and single-window invariance.
+   */
+  async proveScreenshotWindowObservation(
+    app,
+    {
+      pid = null,
+      imgDims = null,
+      windowTitle = "",
+      parsedWindowId = null,
+      preObs = null,
+      hadPrePid = false,
+      desktopHelperClient = null,
+    } = {}
+  ) {
+    const iw = Number(imgDims?.width || 0);
+    const ih = Number(imgDims?.height || 0);
+    if (!(Number(pid) > 0) || !(iw > 0) || !(ih > 0)) {
+      return { proven: false, windowId: null, windowBounds: null, windowCount: null, singleWindowProven: false };
+    }
+    const obs = await this.captureWindowObservation(app, {
+      pid,
+      desktopHelperClient,
+      preferredTitle: windowTitle || "",
+    }).catch(() => null);
+    const windowCount = Array.isArray(obs?.windowIds) ? obs.windowIds.length : null;
+    const obsWid = Number(obs?.wid || 0);
+    const parsedWid = Number(parsedWindowId || 0);
+    const preWid = Number(preObs?.wid || 0);
+    const preIds = Array.isArray(preObs?.windowIds)
+      ? preObs.windowIds.map((x) => Number(x)).filter((x) => x > 0)
+      : null;
+    const preStable = Boolean(
+      !(hadPrePid && !preWid && parsedWid === 0) &&
+      !(preWid > 0 && obsWid > 0 && preWid !== obsWid) &&
+        !(preIds && preIds.length > 0 && (preIds.length !== 1 || (obsWid > 0 && preIds[0] !== obsWid)))
+    );
+    const parsedWidMatches = !(parsedWid > 0 && obsWid > 0 && parsedWid !== obsWid);
+    const cleanExpectedTitle = String(windowTitle || "").trim();
+    const cleanObservedTitle = String(obs?.title || "").trim();
+    const titleConsistent =
+      !cleanExpectedTitle || !cleanObservedTitle || cleanExpectedTitle === cleanObservedTitle;
+    if (obsWid > 0 && obs?.windowBounds) {
+      const obW = Number(obs.windowBounds.width ?? obs.windowBounds.w ?? 0);
+      const obH = Number(obs.windowBounds.height ?? obs.windowBounds.h ?? 0);
+      if (
+        obW > 0 &&
+        obH > 0 &&
+        hasMatchingAspectRatio(obW, obH, iw, ih, 0.03) &&
+        windowCount === 1 &&
+        Number(obs.windowIds[0]) === obsWid &&
+        preStable &&
+        obs?.focusedExcludedWindow !== true &&
+        parsedWidMatches &&
+        titleConsistent
+      ) {
+        return {
+          proven: true,
+          windowId: obsWid,
+          windowBounds: obs.windowBounds,
+          windowCount: 1,
+          singleWindowProven: true,
+        };
+      }
+    }
+    return {
+      proven: false,
+      windowId: null,
+      windowBounds: null,
+      windowCount,
+      singleWindowProven: false,
+    };
   }
 
   recordObservedWindowTransition(app, meta, postObs) {

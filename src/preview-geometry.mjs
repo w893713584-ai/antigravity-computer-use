@@ -125,6 +125,7 @@ export function pointerToNormalizedContent(offsetX, offsetY, visibleRect) {
 export function evaluateArbitraryPointCapability({
   geometry,
   jxaTrusted = false,
+  singleWindowProven = false,
   ocuActionProven = false,
 } = {}) {
   if (!geometry || !geometry.windowBoundsPt || !geometry.previewContentRectPt) {
@@ -140,7 +141,7 @@ export function evaluateArbitraryPointCapability({
     return {
       allowed: true,
       route: "window_post",
-      allowAppPostFallback: !explicitWindowId,
+      allowAppPostFallback: Boolean(!explicitWindowId && singleWindowProven),
       readOnlyReason: null,
     };
   }
@@ -207,6 +208,7 @@ export function createPreviewGeometry({
   actionPixelSize = null,
   scaleFactor = null,
   jxaTrusted = false,
+  singleWindowProven = false,
   ocuActionProven = false,
   readOnlyOverride = false,
   readOnlyReasonOverride = null,
@@ -258,6 +260,7 @@ export function createPreviewGeometry({
   const cap = evaluateArbitraryPointCapability({
     geometry: base,
     jxaTrusted,
+    singleWindowProven,
     ocuActionProven,
   });
 

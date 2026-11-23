@@ -9,7 +9,7 @@ import {
   isSecureTextRole,
   buildElementDescriptor,
 } from "./app-snapshot-registry.mjs";
-import { throwIfSentUnknown } from "./ax-bridge.mjs";
+import { rethrowIfWriteOutcomeUnknown, throwIfSentUnknown } from "./ax-bridge.mjs";
 
 export { SECURE_ROLE_RE, isSecureTextRole };
 
@@ -653,6 +653,49 @@ export async function captureMainWindowFallbackJpeg(pid) {
 }
 
 const CG_EVENT_SOURCE_USER_DATA_FIELD = 42;
+const JXA_TRUST_GUARD_PREAMBLE =
+  'if (typeof $.AXIsProcessTrusted !== "function" || !$.AXIsProcessTrusted()) { return "untrusted"; }';
+
+async function runJxaPointScript(script, { partialReason, unknownReason, timeoutMs = 2500 }) {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
+      timeout: timeoutMs,
+    });
+    const out = String(stdout || "").trim();
+    if (out === "untrusted") {
+      return {
+        delivered: false,
+        deliveryState: "not_sent",
+        method: "app_post",
+        reason: "jxa_accessibility_untrusted",
+      };
+    }
+    if (out === "ok") {
+      return { delivered: true, deliveryState: "delivered", method: "app_post" };
+    }
+    if (out === "sent_unknown") {
+      return {
+        delivered: false,
+        deliveryState: "sent_unknown",
+        method: "app_post",
+        reason: partialReason,
+      };
+    }
+    return {
+      delivered: false,
+      deliveryState: "not_sent",
+      method: "app_post",
+      reason: "event_create_failed",
+    };
+  } catch {
+    return {
+      delivered: false,
+      deliveryState: "sent_unknown",
+      method: "app_post",
+      reason: unknownReason,
+    };
+  }
+}
 
 /**
  * Non-activating PID/window-targeted background coordinate click used when a
@@ -703,13 +746,28 @@ export async function dispatchBackgroundPointClickDetailed(
           method: res.method === "app_post" ? "app_post" : "window_post",
         };
       }
-      if (Number(wid) > 0 && res?.reason === "window_not_found") {
-        return { delivered: false, method: "window_post", reason: "window_not_found" };
+      if (res?.reason === "jxa_accessibility_untrusted") {
+        return {
+          delivered: false,
+          deliveryState: "not_sent",
+          method: "window_post",
+          reason: "jxa_accessibility_untrusted",
+        };
+      }
+      if (
+        res?.reason &&
+        res.reason !== "skylight_unavailable" &&
+        res.reason !== "window_id_unavailable"
+      ) {
+        return {
+          delivered: false,
+          deliveryState: res.deliveryState || "not_sent",
+          method: res.method || "window_post",
+          reason: res.reason,
+        };
       }
     } catch (err) {
-      if (err?.aborted || err?.code === "WRITE_OUTCOME_UNKNOWN" || err?.deliveryState === "sent_unknown") {
-        throw err;
-      }
+      rethrowIfWriteOutcomeUnknown(err);
     }
   }
 
@@ -743,16 +801,23 @@ export async function dispatchBackgroundPointClickDetailed(
   const ptY = Number(screenY.toFixed(2));
   const tagNum = Number(syntheticTag) > 0 ? Number(syntheticTag) : 0;
   const script = [
+    "(function () {",
+    'ObjC.import("ApplicationServices");',
     'ObjC.import("CoreGraphics");',
     'ObjC.bindFunction("CFRelease", ["void", ["void*"]]);',
+    JXA_TRUST_GUARD_PREAMBLE,
     `var pt = { x: ${ptX}, y: ${ptY} };`,
     `var tag = ${tagNum};`,
+    "var anyPosted = false;",
+    "try {",
     `for (var c = 1; c <= ${count}; c++) {`,
     `  var down = $.CGEventCreateMouseEvent(null, ${downConst}, pt, ${btnConst});`,
     `  var up = $.CGEventCreateMouseEvent(null, ${upConst}, pt, ${btnConst});`,
+    '  if (!down || !up) { if (down) $.CFRelease(down); if (up) $.CFRelease(up); return anyPosted ? "sent_unknown" : "not_sent"; }',
     `  if (tag) { $.CGEventSetIntegerValueField(down, ${CG_EVENT_SOURCE_USER_DATA_FIELD}, tag); $.CGEventSetIntegerValueField(up, ${CG_EVENT_SOURCE_USER_DATA_FIELD}, tag); }`,
     "  $.CGEventSetIntegerValueField(down, $.kCGMouseEventClickState, c);",
     "  $.CGEventSetIntegerValueField(up, $.kCGMouseEventClickState, c);",
+    "  anyPosted = true;",
     `  $.CGEventPostToPid(${pid}, down);`,
     "  $.CFRelease(down);",
     "  $.usleep(18000);",
@@ -760,15 +825,16 @@ export async function dispatchBackgroundPointClickDetailed(
     "  $.CFRelease(up);",
     "  if (c < " + count + ") $.usleep(28000);",
     "}",
-    '"ok";',
+    'return "ok";',
+    '} catch (e) { return anyPosted ? "sent_unknown" : "not_sent"; }',
+    "})();",
   ].join(" ");
 
-  try {
-    await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeout: 2500 });
-    return { delivered: true, method: "app_post" };
-  } catch {
-    return { delivered: false, method: "app_post" };
-  }
+  return runJxaPointScript(script, {
+    partialReason: "partial_point_click_post",
+    unknownReason: "point_click_outcome_unknown",
+    timeoutMs: 2500,
+  });
 }
 
 export async function dispatchBackgroundPointClick(pid, screenX, screenY, options = {}) {
@@ -779,23 +845,27 @@ export async function dispatchBackgroundPointClick(pid, screenX, screenY, option
 /**
  * Non-activating PID-targeted background drag (`CGEventPostToPid`) mapped directly in screen points.
  */
-export async function dispatchBackgroundPointDrag(
+export async function dispatchBackgroundPointDragDetailed(
   pid,
   fromScreenX,
   fromScreenY,
   toScreenX,
   toScreenY,
-  { syntheticTag = 0 } = {}
+  { syntheticTag = 0, beforeWriteCheck = null } = {}
 ) {
-  if (process.platform !== "darwin") return false;
-  if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) return false;
+  if (process.platform !== "darwin") {
+    return { delivered: false, deliveryState: "not_sent", method: null, reason: "unsupported_platform" };
+  }
+  if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) {
+    return { delivered: false, deliveryState: "not_sent", method: null, reason: "process_not_alive" };
+  }
   if (
     !Number.isFinite(fromScreenX) ||
     !Number.isFinite(fromScreenY) ||
     !Number.isFinite(toScreenX) ||
     !Number.isFinite(toScreenY)
   ) {
-    return false;
+    return { delivered: false, deliveryState: "not_sent", method: null, reason: "invalid_coordinates" };
   }
 
   const x0 = Number(fromScreenX.toFixed(2));
@@ -804,35 +874,83 @@ export async function dispatchBackgroundPointDrag(
   const y1 = Number(toScreenY.toFixed(2));
   const tagNum = Number(syntheticTag) > 0 ? Number(syntheticTag) : 0;
   const script = [
+    "(function () {",
+    'ObjC.import("ApplicationServices");',
     'ObjC.import("CoreGraphics");',
     'ObjC.bindFunction("CFRelease", ["void", ["void*"]]);',
+    JXA_TRUST_GUARD_PREAMBLE,
     `var p0 = { x: ${x0}, y: ${y0} }, p1 = { x: ${x1}, y: ${y1} };`,
     `var tag = ${tagNum};`,
+    "var anyPosted = false;",
+    "var upPosted = false;",
+    "var lastDragPt = p0;",
+    "var postRescueUp = function () {",
+    "  if (!anyPosted || upPosted) return;",
+    "  try {",
+    "    var rUp = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, lastDragPt, $.kCGMouseButtonLeft);",
+    "    if (rUp) {",
+    `      if (tag) $.CGEventSetIntegerValueField(rUp, ${CG_EVENT_SOURCE_USER_DATA_FIELD}, tag);`,
+    `      $.CGEventPostToPid(${pid}, rUp);`,
+    "      $.CFRelease(rUp);",
+    "      upPosted = true;",
+    "    }",
+    "  } catch (eu) {}",
+    "};",
+    "try {",
     "var down = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown, p0, $.kCGMouseButtonLeft);",
+    'if (!down) { return "not_sent"; }',
     `if (tag) $.CGEventSetIntegerValueField(down, ${CG_EVENT_SOURCE_USER_DATA_FIELD}, tag);`,
+    "anyPosted = true;",
     `$.CGEventPostToPid(${pid}, down);`,
     "$.CFRelease(down);",
     "for (var s = 1; s <= 5; s++) {",
     "  $.usleep(14000);",
     "  var t = s / 5;",
     "  var pm = { x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t };",
+    "  lastDragPt = pm;",
     "  var drag = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDragged, pm, $.kCGMouseButtonLeft);",
+    '  if (!drag) { postRescueUp(); return "sent_unknown"; }',
     `  if (tag) $.CGEventSetIntegerValueField(drag, ${CG_EVENT_SOURCE_USER_DATA_FIELD}, tag);`,
     `  $.CGEventPostToPid(${pid}, drag);`,
     "  $.CFRelease(drag);",
     "}",
     "$.usleep(18000);",
+    "lastDragPt = p1;",
     "var up = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, p1, $.kCGMouseButtonLeft);",
+    'if (!up) { return "sent_unknown"; }',
     `if (tag) $.CGEventSetIntegerValueField(up, ${CG_EVENT_SOURCE_USER_DATA_FIELD}, tag);`,
+    "upPosted = true;",
     `$.CGEventPostToPid(${pid}, up);`,
     "$.CFRelease(up);",
-    '"ok";',
+    'return "ok";',
+    '} catch (e) { postRescueUp(); return anyPosted ? "sent_unknown" : "not_sent"; }',
+    "})();",
   ].join(" ");
 
-  try {
-    await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { timeout: 3000 });
-    return true;
-  } catch {
-    return false;
-  }
+  beforeWriteCheck?.();
+
+  return runJxaPointScript(script, {
+    partialReason: "partial_point_drag_post",
+    unknownReason: "point_drag_outcome_unknown",
+    timeoutMs: 3000,
+  });
+}
+
+export async function dispatchBackgroundPointDrag(
+  pid,
+  fromScreenX,
+  fromScreenY,
+  toScreenX,
+  toScreenY,
+  options = {}
+) {
+  const res = await dispatchBackgroundPointDragDetailed(
+    pid,
+    fromScreenX,
+    fromScreenY,
+    toScreenX,
+    toScreenY,
+    options
+  );
+  return Boolean(res?.delivered);
 }

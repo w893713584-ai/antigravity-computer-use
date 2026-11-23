@@ -21,7 +21,7 @@ Operating rules:
 export async function runMcpServer() {
   const broker = new BrokerRpcClient();
   runJsonRpcStdioServer({
-    serverInfo: { name: "codex-style-computer-use", version: "1.1.1" },
+    serverInfo: { name: "codex-style-computer-use", version: "1.1.2" },
     instructions: SERVER_INSTRUCTIONS,
     onListTools: () => broker.request("tools/list", {}),
     onCallTool: async (params, _req, { attachPillHint, signal }) => {

@@ -425,6 +425,7 @@ test("Slice 2 (P1): Coordinate seam, JXA batched traversal (>420 nodes / >80 chi
         }
         return -25212;
       },
+      AXIsProcessTrusted: () => true,
       NSBundle: { bundleWithPath: () => ({ load: true }) },
       NSProcessInfo: {
         processInfo: {
@@ -894,6 +895,7 @@ test("Slice 3 (P2): Atomic act tool (progressive scroll + overlap dedup + AXPare
       return {
         resolved: true,
         wid: 501,
+        windowTitle: editorOpen ? "剪映专业版 - 编辑器" : "剪映专业版",
         windowBounds: { x: 0, y: 0, w: 1280, h: 720 },
         role: "AXButton",
         hasAxPress: true,

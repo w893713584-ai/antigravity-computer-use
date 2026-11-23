@@ -165,7 +165,7 @@ export class TakeoverController {
     this.onResume = onResume;
 
     // Default black-box safety: untagged OCU routes cannot be distinguished from human HID events while in flight.
-    for (const routeKey of ["click:sky_click", "click:native", "drag:native"]) {
+    for (const routeKey of ["click:sky_click", "click:app_post", "click:native", "drag:native"]) {
       this.#routePolicies.set(routeKey, { autoClick: false, autoKey: true });
     }
     for (const routeKey of [
