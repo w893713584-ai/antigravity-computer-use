@@ -14,14 +14,15 @@ Live Side-Pane Mini-Window:
 Operating rules:
 - Begin by calling \`get_app_state\` to observe the target app before acting in a new turn.
 - Prefer \`act\` when locating and clicking UI targets that may require scrolling or verifying state changes (e.g. list items, cards, tabs, modals): it atomically locates, deduplicates nested matches, scrolls if needed, clicks once in the background, and verifies your \`expect\` condition.
-- Windows remain in the background automatically (via SkyLight \`sky_click\` / \`sky_key\`, \`window_post\`, and WindowServer occlusion keep-alive). NEVER run AppleScript \`activate\`, \`open -a\` (without \`-g\`), or \`perform_secondary_action(..., "Raise")\` unless the user explicitly asks to bring the window to the front.
+- Windows remain in the background automatically (via SkyLight \`sky_click\` / \`sky_key\`, \`window_post\`, and WindowServer occlusion keep-alive). For ordinary apps, NEVER run AppleScript \`activate\`, \`open -a\` (without \`-g\`), or \`perform_secondary_action(..., "Raise")\` unless the user explicitly asks to bring the window to the front.
+- 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。
 - Prefer element-targeted actions (\`act\`, \`element_index\`, or \`query\`) or \`set_value\` when available; coordinate clicks are also delivered in the background without moving the user's cursor.
 - Ask the user before destructive or externally visible actions such as sending messages, deleting files, or purchasing.`;
 
 export async function runMcpServer() {
   const broker = new BrokerRpcClient();
   runJsonRpcStdioServer({
-    serverInfo: { name: "codex-style-computer-use", version: "1.1.3" },
+    serverInfo: { name: "codex-style-computer-use", version: "1.1.4" },
     instructions: SERVER_INSTRUCTIONS,
     onListTools: () => broker.request("tools/list", {}),
     onCallTool: async (params, _req, { attachPillHint, signal }) => {

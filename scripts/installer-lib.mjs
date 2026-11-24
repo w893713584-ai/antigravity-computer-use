@@ -29,7 +29,8 @@ const GEMINI_RULE_END = "<!-- END CODEX-STYLE-COMPUTER-USE -->";
 const MANAGED_GEMINI_RULE_BLOCK = `${GEMINI_RULE_BEGIN}
 ## Codex-Style Computer Use 小窗规则
 - 当你在对话中首次使用 \`computer-use\` 或 \`computer-use-js\` 操作桌面应用时，必须在给用户的回复中附带一次 \`[Computer Use 小窗](sidecar://${SIDECAR_ID}/)\` 链接，方便用户在 Antigravity 右侧打开实时后台小窗。
-- 操作后台应用时严禁调用 AppleScript \`activate\`、不带 \`-g\` 的 \`open -a\` 或 \`Raise\`，保持被操作窗口在后台运行、不置顶抢焦点。
+- 操作普通后台应用时严禁调用 AppleScript \`activate\`、不带 \`-g\` 的 \`open -a\` 或 \`Raise\`，保持被操作窗口在后台运行、不置顶抢焦点。
+- 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。
 ${GEMINI_RULE_END}`;
 
 const STAGE_ITEMS = [
@@ -184,35 +185,19 @@ export async function syncLiveAntigravity({ enableSidecar }) {
     for (const port of ports) {
       for (const protocol of ["https:", "http:"]) {
         try {
-          try {
-            await postJsonLocal({
-              protocol,
-              port,
-              pathName: "/exa.language_server_pb.LanguageServerService/JetboxWriteState",
-              csrfToken,
-              body: {
-                userConfig: {
-                  sidecars: {
-                    [SIDECAR_ID]: { enabled: Boolean(enableSidecar), projectId: "" },
-                  },
+          await postJsonLocal({
+            protocol,
+            port,
+            pathName: "/exa.language_server_pb.LanguageServerService/JetboxWriteState",
+            csrfToken,
+            body: {
+              userConfig: {
+                sidecars: {
+                  [SIDECAR_ID]: { enabled: Boolean(enableSidecar) },
                 },
               },
-            });
-          } catch {
-            await postJsonLocal({
-              protocol,
-              port,
-              pathName: "/exa.language_server_pb.LanguageServerService/JetboxWriteState",
-              csrfToken,
-              body: {
-                userConfig: {
-                  sidecars: {
-                    [SIDECAR_ID]: { enabled: Boolean(enableSidecar) },
-                  },
-                },
-              },
-            });
-          }
+            },
+          });
           await postJsonLocal({
             protocol,
             port,
@@ -226,6 +211,22 @@ export async function syncLiveAntigravity({ enableSidecar }) {
     }
   } catch {}
   return false;
+}
+
+function isOwnSidecarProjectId(configDir, projectId) {
+  if (typeof projectId !== "string") return false;
+  const trimmed = projectId.trim();
+  if (!trimmed || path.basename(trimmed) !== trimmed || trimmed === "." || trimmed === "..") {
+    return false;
+  }
+  const projectMetaPath = path.join(configDir, "projects", `${trimmed}.json`);
+  if (!existsSync(projectMetaPath)) return false;
+  try {
+    const meta = JSON.parse(readFileSync(projectMetaPath, "utf8"));
+    return meta?.sidecar?.sidecarId === SIDECAR_ID;
+  } catch {
+    return false;
+  }
 }
 
 function updateOfflineConfigSidecar(configDir, enabled) {
@@ -244,8 +245,12 @@ function updateOfflineConfigSidecar(configDir, enabled) {
       ...(sidecars[SIDECAR_ID] || { resolvedPermissions: null, schemaVersion: 1 }),
       enabled: true,
     };
-    // Strip any stale workspace-scoped projectId so the sidecar is available globally in all projects.
-    delete nextEntry.projectId;
+    // Preserve host-assigned internal sidecar projectId, while stripping stale user-workspace projectIds.
+    if (isOwnSidecarProjectId(configDir, nextEntry.projectId)) {
+      nextEntry.projectId = nextEntry.projectId.trim();
+    } else {
+      delete nextEntry.projectId;
+    }
     sidecars[SIDECAR_ID] = nextEntry;
   } else {
     delete sidecars[SIDECAR_ID];

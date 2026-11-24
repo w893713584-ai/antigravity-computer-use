@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { FocusPolicyGuard } from "../src/focus-policy-guard.mjs";
@@ -571,14 +574,55 @@ test("SidecarWebAdapter enforces token auth (exempting /healthz & /preload.js), 
   });
 
   const port = await web.start();
+  const prevAgentApiExe = process.env.ANTIGRAVITY_AGENTAPI_EXE;
+  const tmpBinDir = mkdtempSync(path.join(tmpdir(), "agy-cua-agentapi-"));
   try {
-    // Public endpoints work without token
-    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
-    assert.equal(health.status, 200);
+    // Read-only static shell GET endpoints work without token (host readiness probe & script tag loads)
+    for (const pubPath of ["/", "/index.html", "/preload.js", "/preview-video.js", "/healthz"]) {
+      const res = await fetch(`http://127.0.0.1:${port}${pubPath}`);
+      assert.equal(res.status, 200, `Expected GET ${pubPath} to succeed without token`);
+    }
 
-    // Protected endpoints reject missing token with 401
-    const unauth = await fetch(`http://127.0.0.1:${port}/api/state`);
-    assert.equal(unauth.status, 401);
+    // POST on static shell paths and all /api/* + /_sidecar/* routes still enforce token auth (401)
+    const postRootUnauth = await fetch(`http://127.0.0.1:${port}/`, { method: "POST" });
+    assert.equal(postRootUnauth.status, 401);
+    for (const apiPath of ["/api/state", "/api/frame.jpg", "/api/events", "/api/windows", "/api/permissions"]) {
+      const unauth = await fetch(`http://127.0.0.1:${port}${apiPath}`);
+      assert.equal(unauth.status, 401, `Expected GET ${apiPath} without token to return 401`);
+    }
+    const postSettingsUnauth = await fetch(`http://127.0.0.1:${port}/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ followAi: true }),
+    });
+    assert.equal(postSettingsUnauth.status, 401);
+    const postMetaUnauth = await fetch(`http://127.0.0.1:${port}/_sidecar/get-conversation-metadata`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversationId: "conv-123" }),
+    });
+    assert.equal(postMetaUnauth.status, 401);
+
+    // /_sidecar/get-conversation-metadata passes ["get-conversation-metadata", convId] without "--"
+    const fakeAgentApi = path.join(tmpBinDir, "fake-agentapi.mjs");
+    writeFileSync(
+      fakeAgentApi,
+      `#!${process.execPath}\nconsole.log(JSON.stringify({ argv: process.argv.slice(2) }));\n`,
+      { mode: 0o755 }
+    );
+    chmodSync(fakeAgentApi, 0o755);
+    process.env.ANTIGRAVITY_AGENTAPI_EXE = fakeAgentApi;
+    const metaRes = await fetch(`http://127.0.0.1:${port}/_sidecar/get-conversation-metadata`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Sidecar-Token": "secret-test-token",
+      },
+      body: JSON.stringify({ conversationId: "conv-abc-123" }),
+    });
+    assert.equal(metaRes.status, 200);
+    const metaBody = await metaRes.json();
+    assert.deepEqual(metaBody.argv, ["agentapi", "get-conversation-metadata", "conv-abc-123"]);
 
     // Frame deduplication increments frameSeq once for identical bytes
     web.updateFrameFromImageItem({ data: onePxPngBase64, mimeType: "image/png" }, 12);
@@ -591,6 +635,12 @@ test("SidecarWebAdapter enforces token auth (exempting /healthz & /preload.js), 
     assert.equal(frameRes.status, 200);
     assert.equal(frameRes.headers.get("content-type"), "image/png");
   } finally {
+    if (prevAgentApiExe === undefined) {
+      delete process.env.ANTIGRAVITY_AGENTAPI_EXE;
+    } else {
+      process.env.ANTIGRAVITY_AGENTAPI_EXE = prevAgentApiExe;
+    }
+    rmSync(tmpBinDir, { recursive: true, force: true });
     await web.close();
   }
 });

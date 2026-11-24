@@ -2771,3 +2771,115 @@ test("Rapid <80ms delayed focus steal caught by next call's #captureProtectedFro
     await broker.close();
   }
 });
+
+
+test("Broker logs standard [sidecar] listening line and recovers screenshot + AX tree when 92x92 Qt6 `0 对话框` hijacks AXMainWindow", async () => {
+  const sock = `/tmp/agy-cua-minidlg-${process.pid}.sock`;
+  // 184x184 px (92x92 pt @ 2x Retina) JPEG vs 1280x705 px main editor JPEG
+  const dlg184Jpg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0xb8, 0x00, 0xb8, 0x01, 0x01, 0x11, 0x00, 0xff, 0xd9,
+  ]);
+  const main1280Jpg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x02, 0xc1, 0x05, 0x00, 0x01, 0x01, 0x11, 0x00, 0xff, 0xd9,
+  ]);
+
+  let promoted = false;
+  let promoteCalls = 0;
+  const peer = {
+    async listTools() {
+      return { tools: [] };
+    },
+    async callTool(name) {
+      if (name === "list_apps") {
+        return { isError: false, content: [{ type: "text", text: "剪映专业版 — com.lemon.lvpro [running]" }] };
+      }
+      if (name === "get_app_state") {
+        if (!promoted) {
+          return {
+            isError: false,
+            content: [
+              {
+                type: "text",
+                text: [`App=com.lemon.lvpro (pid ${process.pid})`, 'Window: "", App: 剪映专业版.', "0 对话框"].join(
+                  "\n"
+                ),
+              },
+              { type: "image", mimeType: "image/jpeg", data: dlg184Jpg.toString("base64") },
+            ],
+          };
+        }
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: [
+                `App=com.lemon.lvpro (pid ${process.pid})`,
+                'Window: "剪映专业版", App: 剪映专业版.',
+                "0 标准窗口 剪映专业版",
+                "\t1 按钮 开始创作",
+              ].join("\n"),
+            },
+            { type: "image", mimeType: "image/jpeg", data: main1280Jpg.toString("base64") },
+          ],
+        };
+      }
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+    close() {},
+  };
+
+  const loggedLines = [];
+  const origLog = console.log;
+  console.log = (...args) => {
+    loggedLines.push(args.join(" "));
+    origLog(...args);
+  };
+
+  const broker = new ComputerUseBrokerServer({
+    webPort: 0,
+    uiToken: "minidlg-tok",
+    socketPath: sock,
+    infoPath: null,
+    actionPeer: peer,
+    streamPeer: peer,
+    promoteMainWindowFn: async (pid) => {
+      assert.equal(pid, process.pid);
+      promoteCalls += 1;
+      promoted = true;
+      return true;
+    },
+  });
+
+  let webPort = 0;
+  try {
+    const started = await broker.start();
+    webPort = started.webPort;
+  } finally {
+    console.log = origLog;
+  }
+
+  const client = new BrokerRpcClient({ socketPath: sock });
+  try {
+    assert.ok(
+      loggedLines.some((line) => line === `[sidecar] listening on 127.0.0.1:${webPort}`),
+      `Expected official SDK readiness line in logs, got: ${JSON.stringify(loggedLines)}`
+    );
+
+    const res = await client.request("tools/call", {
+      name: "get_app_state",
+      arguments: { app: "com.lemon.lvpro" },
+      source: "ai",
+    });
+    assert.equal(Boolean(res?.isError), false);
+    assert.equal(promoteCalls, 1);
+    const outText = extractResultText(res);
+    assert.match(outText, /0 标准窗口 剪映专业版/);
+    assert.match(outText, /1 按钮 开始创作/);
+    assert.equal(broker.state.frameWidth, 1280);
+    assert.equal(broker.state.frameHeight, 705);
+  } finally {
+    await client.close();
+    await broker.close();
+  }
+});

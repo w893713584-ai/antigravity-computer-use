@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildPromoteMainWindowJxaScript,
   didTargetStealFocus,
   findRunningApp,
   isLikelyBundleId,
+  isMiniEmptyDialogSnapshot,
   isProcessAlive,
   isSecureTextRole,
   parseAppsList,
   parseImageDimensions,
   parseLsappinfoFront,
   parseSnapshotMetadata,
+  pickPromotableMainWindow,
   planBackgroundClickMethods,
   planBackgroundKeyMethods,
+  promoteMainWindowFocusInBackground,
 } from "../src/background-policy.mjs";
 import {
   SelfActivationTracker,
@@ -678,4 +682,99 @@ test("planBackgroundClickMethods & planBackgroundKeyMethods honor sky_click / sk
   } finally {
     await bridge.close();
   }
+});
+
+test("promoteMainWindowFocusInBackground & isMiniEmptyDialogSnapshot ignore 92x92 AXDialog and promote largest >=300x200 main window", async () => {
+  // 1. Pure window selector ignores AXDialog or <300x200 AXMainWindow and picks largest AXStandardWindow
+  const miniDialog = { id: "mini-dlg", subrole: "AXDialog", width: 92, height: 92 };
+  const largeDialog = { id: "large-dlg", subrole: "AXDialog", width: 520, height: 360 };
+  const smallStd = { id: "small-std", subrole: "AXStandardWindow", width: 640, height: 480 };
+  const mainStd = { id: "main-std", subrole: "AXStandardWindow", width: 1469, height: 810 };
+  const customMain = { id: "qt-custom", subrole: "AXUnknown", width: 1280, height: 720 };
+
+  assert.equal(pickPromotableMainWindow(miniDialog, [miniDialog, smallStd, mainStd])?.id, "main-std");
+  assert.equal(pickPromotableMainWindow(largeDialog, [largeDialog, smallStd, mainStd])?.id, "main-std");
+  assert.equal(pickPromotableMainWindow(miniDialog, [miniDialog, largeDialog, customMain])?.id, "qt-custom");
+  assert.equal(pickPromotableMainWindow(mainStd, [miniDialog, smallStd])?.id, "main-std");
+  assert.equal(pickPromotableMainWindow(miniDialog, [miniDialog]), null);
+
+  // 2. Execute generated JXA logic against mocked ApplicationServices AX table to verify JXA script behavior end-to-end
+  if (process.platform === "darwin") {
+    let executedScript = "";
+    const promotedAttrs = [];
+    const ok = await promoteMainWindowFocusInBackground(process.pid, {
+      settleMs: 0,
+      execFileFn: async (_bin, args) => {
+        executedScript = args[args.length - 1];
+        const body = executedScript
+          .replace('ObjC.import("ApplicationServices");', "")
+          .replace('ObjC.import("Foundation");', "");
+        const mockWindows = [
+          { id: "orb-92", subrole: "AXDialog", w: 92, h: 92 },
+          { id: "sub-std", subrole: "AXStandardWindow", w: 600, h: 400 },
+          { id: "editor-main", subrole: "AXStandardWindow", w: 1469, h: 810 },
+        ];
+        const fn = new Function("ObjC", "$", "Ref", `return ${body.trim()}`);
+        const $fn = (s) => s;
+        $fn.kCFBooleanTrue = true;
+        $fn.AXUIElementCreateApplication = () => ({ kind: "app" });
+        $fn.CFCopyDescription = (szObj) => `<AXValue {value = w:${szObj.w} h:${szObj.h} type = kAXValueCGSizeType}>`;
+        $fn.AXUIElementCopyAttributeValue = (el, attr, out) => {
+          if (el.kind === "app" && attr === "AXMainWindow") {
+            out[0] = mockWindows[0]; // Hijacked by 92x92 AXDialog!
+            return 0;
+          }
+          if (el.kind === "app" && attr === "AXWindows") {
+            out[0] = {
+              count: mockWindows.length,
+              objectAtIndex: (i) => mockWindows[i],
+            };
+            return 0;
+          }
+          if (attr === "AXSubrole") {
+            out[0] = el.subrole;
+            return 0;
+          }
+          if (attr === "AXSize") {
+            out[0] = { w: el.w, h: el.h };
+            return 0;
+          }
+          return -1;
+        };
+        $fn.AXUIElementSetAttributeValue = (el, attr, val) => {
+          promotedAttrs.push({ id: el.id, attr, val });
+          return 0;
+        };
+        const out = fn(
+          {
+            castRefToObject: (x) => x,
+            unwrap: (x) => x,
+          },
+          $fn,
+          () => [null]
+        );
+        return { stdout: `${out}\n` };
+      },
+    });
+    assert.equal(ok, true);
+    assert.match(buildPromoteMainWindowJxaScript(process.pid), /AXDialog/);
+    assert.deepEqual(promotedAttrs, [
+      { id: "editor-main", attr: "AXMain", val: true },
+      { id: "editor-main", attr: "AXFocused", val: true },
+    ]);
+  }
+
+  // 3. Mini childless `0 对话框` snapshot detection
+  const miniSnap = ['App=com.lemon.lvpro (pid 54321)', 'Window: "", App: 剪映专业版.', "0 对话框"].join("\n");
+  assert.equal(isMiniEmptyDialogSnapshot(miniSnap, null), true);
+  assert.equal(isMiniEmptyDialogSnapshot(miniSnap, { width: 184, height: 184 }), true);
+  assert.equal(isMiniEmptyDialogSnapshot(miniSnap, { width: 1280, height: 705 }), false);
+
+  const realDialogSnap = [
+    "App=com.lemon.lvpro (pid 54321)",
+    'Window: "剪映专业版", App: 剪映专业版.',
+    "0 对话框",
+    "\t1 文本 HomePageStartProjectDesp",
+  ].join("\n");
+  assert.equal(isMiniEmptyDialogSnapshot(realDialogSnap, { width: 184, height: 184 }), false);
 });

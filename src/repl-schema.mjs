@@ -37,7 +37,8 @@ Live Side-Pane Mini-Window:
 Usage:
 - Bind an app with \`var app = await cua.getApp("Example App")\` (or \`{ initialState: false }\` followed by \`app.query({ text, role })\` or \`app.act({ target, expect })\`).
 - Top-level bindings (\`var\`, \`let\`, \`const\`) and \`session\` persist across \`js\` turns until \`js_reset\` or error abort.
-- NEVER invoke AppleScript \`activate\` or \`open -a\` without \`-g\`. Ask the user before destructive or externally visible actions.`;
+- For ordinary apps, NEVER invoke AppleScript \`activate\` or \`open -a\` without \`-g\`. Ask the user before destructive or externally visible actions.
+- 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。`;
 
 export function getReplToolDefinitions() {
   const annotations = { destructiveHint: false, openWorldHint: false };

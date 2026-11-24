@@ -85,9 +85,18 @@ export class SidecarWebAdapter {
   }
 
   validateHttpToken(req, url) {
-    if (url.pathname === "/preload.js" || url.pathname === "/healthz") return true;
+    if (
+      req?.method === "GET" &&
+      (url.pathname === "/" ||
+        url.pathname === "/index.html" ||
+        url.pathname === "/preload.js" ||
+        url.pathname === "/preview-video.js" ||
+        url.pathname === "/healthz")
+    ) {
+      return true;
+    }
     if (!this.uiToken) return true;
-    const provided = req.headers["x-sidecar-token"] || url.searchParams.get("token");
+    const provided = req?.headers?.["x-sidecar-token"] || url.searchParams.get("token");
     return provided === this.uiToken;
   }
 
@@ -579,7 +588,7 @@ export class SidecarWebAdapter {
           if (!convId || convId.startsWith("-")) {
             throw new Error("valid conversationId is required");
           }
-          const out = await this.#execAgentApi(["get-conversation-metadata", "--", convId]);
+          const out = await this.#execAgentApi(["get-conversation-metadata", convId]);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(out));
           return;

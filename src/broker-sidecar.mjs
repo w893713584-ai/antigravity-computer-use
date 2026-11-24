@@ -21,6 +21,7 @@ import {
   extractResultText,
   findRunningApp,
   getFrontmostAppFast,
+  isMiniEmptyDialogSnapshot,
   isProcessAlive,
   launchAppInBackground,
   parseAppsList,
@@ -856,7 +857,15 @@ export class ComputerUseBrokerServer {
     const img = extractResultImage(result);
     if (!img?.data) return false;
     const dims = parseImageDimensions(Buffer.from(img.data, "base64"));
-    return Boolean(dims && (dims.width < 180 || dims.height < 180));
+    return Boolean(dims && (dims.width < 200 || dims.height < 200));
+  }
+
+  #isMiniDialogSnapshot(result, text = null) {
+    const snapText = typeof text === "string" ? text : extractResultText(result);
+    if (!snapText) return false;
+    const img = extractResultImage(result);
+    const dims = img?.data ? parseImageDimensions(Buffer.from(img.data, "base64")) : null;
+    return isMiniEmptyDialogSnapshot(snapText, dims);
   }
 
   async #upgradeTinyFloatingWindowResult(result, fallbackPid = null) {
@@ -864,7 +873,7 @@ export class ComputerUseBrokerServer {
       return { result, override: null };
     }
     const img = extractResultImage(result);
-    if (!img?.data || !this.#isTinyFloatingImage(result)) {
+    if (!img?.data || (!this.#isTinyFloatingImage(result) && !this.#isMiniDialogSnapshot(result))) {
       return { result, override: null };
     }
     const meta = parseSnapshotMetadata(extractResultText(result));
@@ -1065,7 +1074,11 @@ export class ComputerUseBrokerServer {
     }
 
     let tinyWindowOverride = null;
-    if (!result?.isError && argsWithReadOnly.include_screenshot !== false && this.#isTinyFloatingImage(result)) {
+    const needsTinyOrMiniDialogRecovery =
+      !result?.isError &&
+      ((argsWithReadOnly.include_screenshot !== false && this.#isTinyFloatingImage(result)) ||
+        this.#isMiniDialogSnapshot(result, text));
+    if (needsTinyOrMiniDialogRecovery) {
       const fallbackPid =
         parseSnapshotMetadata(text).pid || this.registry.getMeta(app)?.pid || this.state.pid;
       if (
@@ -1097,7 +1110,11 @@ export class ComputerUseBrokerServer {
           }
         }
       }
-      if (!observationalOnly && this.#isTinyFloatingImage(result)) {
+      if (
+        !observationalOnly &&
+        argsWithReadOnly.include_screenshot !== false &&
+        (this.#isTinyFloatingImage(result) || this.#isMiniDialogSnapshot(result, text))
+      ) {
         const upgraded = await this.#upgradeTinyFloatingWindowResult(result, fallbackPid);
         result = upgraded.result;
         text = extractResultText(result);
@@ -1149,7 +1166,10 @@ export class ComputerUseBrokerServer {
           const wokenRes = await peer.callTool("get_app_state", argsWithReadOnly).catch(() => null);
           if (wokenRes && !wokenRes.isError) {
             capturedPeerInstanceId = peer?.agentInstanceId || null;
-            if (argsWithReadOnly.include_screenshot !== false && this.#isTinyFloatingImage(wokenRes)) {
+            if (
+              argsWithReadOnly.include_screenshot !== false &&
+              (this.#isTinyFloatingImage(wokenRes) || this.#isMiniDialogSnapshot(wokenRes))
+            ) {
               const upgradedWake = await this.#upgradeTinyFloatingWindowResult(wokenRes, targetPid);
               result = upgradedWake.result;
               tinyWindowOverride = upgradedWake.override;
@@ -3587,6 +3607,7 @@ export class ComputerUseBrokerServer {
       } catch {}
     }
 
+    console.log(`[sidecar] listening on ${BIND_HOST}:${this.webPort}`);
     console.log(
       `[computer-use-preview] broker listening on http://${BIND_HOST}:${this.webPort} and ${this.socketPath}`
     );

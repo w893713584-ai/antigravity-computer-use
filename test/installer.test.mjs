@@ -132,13 +132,21 @@ test("One-click installer stages files to ~/.gemini/codex-style-computer-use, me
     );
     assert.equal(statSync(path.join(configDir, "config.json")).mode & 0o777, 0o600);
 
-    // Global GEMINI.md must contain user's existing rule PLUS managed sidecar pill rule
+    // Global GEMINI.md must contain user's existing rule PLUS managed sidecar pill rule & Qt6 exception
     const geminiMdAfterInstall = readFileSync(path.join(configDir, "GEMINI.md"), "utf8");
     assert.match(geminiMdAfterInstall, /# User Existing Rule/);
     assert.match(geminiMdAfterInstall, /sidecar:\/\/computer-use-preview\//);
+    assert.match(geminiMdAfterInstall, /com\.lemon\.lvpro/);
+    assert.match(geminiMdAfterInstall, /Qt6/);
 
     // 2. Second install (idempotency + liveRpcFn=true): must NOT clobber saved original `/old/open-computer-use` entry,
-    // AND must still strip stale projectId from config.json even when liveRpcFn succeeds!
+    // AND must still strip workspace-scoped projectId while preserving host-assigned own sidecar projectId!
+    const projectsDir = path.join(configDir, "projects");
+    mkdirSync(projectsDir, { recursive: true });
+    writeFileSync(
+      path.join(projectsDir, "stale-project-id-during-live-sync.json"),
+      JSON.stringify({ id: "stale-project-id-during-live-sync", rootPath: "/Users/demo/workspace" }, null, 2)
+    );
     writeFileSync(
       path.join(configDir, "config.json"),
       JSON.stringify(
@@ -170,7 +178,54 @@ test("One-click installer stages files to ~/.gemini/codex-style-computer-use, me
     assert.equal(
       cfgAfterLiveInstall.sidecars["computer-use-preview"].projectId,
       undefined,
-      "projectId must also be stripped from config.json when liveRpcFn returns true"
+      "User-workspace projectId must be stripped from config.json when liveRpcFn returns true"
+    );
+
+    // 2b. Host-assigned internal sidecar projectId (`sidecar.sidecarId === "computer-use-preview"`) MUST be preserved!
+    const ownSidecarProjectId = "b8c4e0f1-1111-4222-8333-abcdef123456";
+    writeFileSync(
+      path.join(projectsDir, `${ownSidecarProjectId}.json`),
+      JSON.stringify(
+        {
+          id: ownSidecarProjectId,
+          sidecar: { sidecarId: "computer-use-preview" },
+        },
+        null,
+        2
+      )
+    );
+    writeFileSync(
+      path.join(configDir, "config.json"),
+      JSON.stringify(
+        {
+          ...cfgAfterLiveInstall,
+          sidecars: {
+            "computer-use-preview": {
+              enabled: true,
+              projectId: ownSidecarProjectId,
+              schemaVersion: 1,
+            },
+          },
+        },
+        null,
+        2
+      ),
+      { mode: 0o600 }
+    );
+    await installCodexComputerUse({
+      sourceRoot: PROJECT_ROOT,
+      homeDir: fakeHome,
+      installDir,
+      nodeExecPath: "/custom/bin/node",
+      skipDoctor: true,
+      skipProcessKill: true,
+      liveRpcFn: async () => true,
+    });
+    const cfgWithOwnSidecarId = JSON.parse(readFileSync(path.join(configDir, "config.json"), "utf8"));
+    assert.equal(
+      cfgWithOwnSidecarId.sidecars["computer-use-preview"].projectId,
+      ownSidecarProjectId,
+      "Host-assigned internal sidecar projectId must be preserved across installs"
     );
 
     // Create simulated broker socket & info files to verify uninstall cleans them up

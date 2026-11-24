@@ -276,6 +276,37 @@ export function parseSnapshotMetadata(text) {
 }
 
 /**
+ * Detect Qt6 mini floating dialog subwindows (e.g. 剪映's 92x92 `0 对话框` with no business child nodes)
+ * that hijack `AXMainWindow` / `AXFocusedWindow`.
+ */
+export function isMiniEmptyDialogSnapshot(text, imgDims = null) {
+  if (!text || typeof text !== "string") return false;
+  if (imgDims && Number(imgDims.width) >= 600 && Number(imgDims.height) >= 400) {
+    return false;
+  }
+  const meta = parseSnapshotMetadata(text);
+  if (meta.elementsPartial) return false;
+  const root = meta.elements.get("0");
+  if (!root || !/^(?:对话框|系统对话框|(?:system\s+)?dialog)$/iu.test(String(root.role || "").trim())) {
+    return false;
+  }
+  for (const [idx, el] of meta.elements.entries()) {
+    if (idx === "0") continue;
+    const role = String(el.role || "").trim();
+    const isWindowChromeOnly =
+      !el.primaryText &&
+      !el.identifier &&
+      /^(?:关闭按钮|最小化按钮|缩放按钮|全屏按钮|close\s+button|minimize\s+button|zoom\s+button|full\s*screen\s+button)$/iu.test(
+        role
+      );
+    if (!isWindowChromeOnly) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Redact password/secret values, labels, and tooltips from raw `get_app_state` text lines
  * so outbound MCP tool results never leak secure field contents.
  */
@@ -503,53 +534,122 @@ export async function restoreFrontmostAppFast(
   }
 }
 
+export function pickPromotableMainWindow(mainWindow, windows = []) {
+  if (
+    mainWindow &&
+    String(mainWindow.subrole || "") !== "AXDialog" &&
+    Number(mainWindow.width) >= 300 &&
+    Number(mainWindow.height) >= 200
+  ) {
+    return mainWindow;
+  }
+  let bestStd = null;
+  let bestStdArea = 0;
+  let bestAny = null;
+  let bestAnyArea = 0;
+  for (const candidate of Array.isArray(windows) ? windows : []) {
+    if (!candidate) continue;
+    const width = Number(candidate.width || 0);
+    const height = Number(candidate.height || 0);
+    if (width < 300 || height < 200) continue;
+    const area = width * height;
+    if (String(candidate.subrole || "") === "AXStandardWindow" && area > bestStdArea) {
+      bestStdArea = area;
+      bestStd = candidate;
+    }
+    if (area > bestAnyArea) {
+      bestAnyArea = area;
+      bestAny = candidate;
+    }
+  }
+  return bestStd || bestAny || null;
+}
+
+export function buildPromoteMainWindowJxaScript(pid) {
+  return [
+    'ObjC.import("ApplicationServices");',
+    'ObjC.import("Foundation");',
+    '(function() {',
+    '  function getSubrole(el) {',
+    '    var subOut = Ref();',
+    '    if ($.AXUIElementCopyAttributeValue(el, $("AXSubrole"), subOut) === 0 && subOut[0]) {',
+    '      return String(ObjC.unwrap(ObjC.castRefToObject(subOut[0])) || "");',
+    '    }',
+    '    return "";',
+    '  }',
+    '  function getSize(el) {',
+    '    var sizeOut = Ref();',
+    '    if ($.AXUIElementCopyAttributeValue(el, $("AXSize"), sizeOut) === 0 && sizeOut[0]) {',
+    '      try {',
+    '        var desc = String(ObjC.unwrap($.CFCopyDescription(sizeOut[0])) || "");',
+    '        var wm = /w:\\s*(-?\\d+(?:\\.\\d+)?)/.exec(desc);',
+    '        var hm = /h:\\s*(-?\\d+(?:\\.\\d+)?)/.exec(desc);',
+    '        if (wm && hm) return { width: Number(wm[1]), height: Number(hm[1]) };',
+    '      } catch (e) {}',
+    '    }',
+    '    return null;',
+    '  }',
+    `  var appEl = $.AXUIElementCreateApplication(${pid});`,
+    '  var mainOut = Ref();',
+    '  var win = null;',
+    '  if ($.AXUIElementCopyAttributeValue(appEl, $("AXMainWindow"), mainOut) === 0 && mainOut[0]) {',
+    '    var mainSub = getSubrole(mainOut[0]);',
+    '    var mainSz = getSize(mainOut[0]);',
+    '    if (mainSub !== "AXDialog" && mainSz && mainSz.width >= 300 && mainSz.height >= 200) {',
+    '      win = mainOut[0];',
+    '    }',
+    '  }',
+    '  if (!win) {',
+    '    var listOut = Ref();',
+    '    if ($.AXUIElementCopyAttributeValue(appEl, $("AXWindows"), listOut) === 0 && listOut[0]) {',
+    '      var arr = ObjC.castRefToObject(listOut[0]);',
+    '      var n = arr ? arr.count : 0;',
+    '      var bestStd = null, bestStdArea = 0, bestAny = null, bestAnyArea = 0;',
+    '      for (var i = 0; i < n; i++) {',
+    '        var candidate = arr.objectAtIndex(i);',
+    '        var sub = getSubrole(candidate);',
+    '        var sz = getSize(candidate);',
+    '        if (!sz || sz.width < 300 || sz.height < 200) continue;',
+    '        var area = sz.width * sz.height;',
+    '        if (sub === "AXStandardWindow" && area > bestStdArea) { bestStdArea = area; bestStd = candidate; }',
+    '        if (area > bestAnyArea) { bestAnyArea = area; bestAny = candidate; }',
+    '      }',
+    '      win = bestStd || bestAny;',
+    '    }',
+    '  }',
+    '  if (win) {',
+    '    $.AXUIElementSetAttributeValue(win, $("AXMain"), $.kCFBooleanTrue);',
+    '    $.AXUIElementSetAttributeValue(win, $("AXFocused"), $.kCFBooleanTrue);',
+    '    return "ok";',
+    '  }',
+    '  return "none";',
+    '})();',
+  ].join(" ");
+}
+
 /**
- * Stage 1 fix for tiny floating widget/orb subwindows (e.g. 剪映's 42x42 pt AI assistant orb):
- * Promote the app's `AXMainWindow` (or first `AXStandardWindow`) to `AXMain` + `AXFocused` in the
- * background WITHOUT calling `AXRaise` or `activate`, so `OpenComputerUse` natively snapshots
- * the real main window (aligning screenshot, `windowBounds`, `targetWindowID`, and AX tree).
+ * Stage 1 fix for tiny floating widget/orb/dialog subwindows (e.g. 剪映's 42x42 orb or 92x92 Qt6 `AXDialog`):
+ * Validate `AXMainWindow` (`AXSubrole !== "AXDialog"` and `AXSize >= 300x200`); if invalid, scan `AXWindows`
+ * for the largest `>= 300x200` `AXStandardWindow` (or largest `>= 300x200` window if none is `AXStandardWindow`),
+ * and promote it to `AXMain` + `AXFocused` in the background WITHOUT calling `AXRaise` or `activate`.
  */
-export async function promoteMainWindowFocusInBackground(pid) {
+export async function promoteMainWindowFocusInBackground(
+  pid,
+  { execFileFn = execFileAsync, settleMs = 40 } = {}
+) {
   if (process.platform !== "darwin") return false;
   if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) return false;
 
-  const script = [
-    'ObjC.import("ApplicationServices");',
-    'ObjC.import("Foundation");',
-    `var appEl = $.AXUIElementCreateApplication(${pid});`,
-    'var mainOut = Ref();',
-    'var win = null;',
-    'if ($.AXUIElementCopyAttributeValue(appEl, $("AXMainWindow"), mainOut) === 0 && mainOut[0]) {',
-    '  win = mainOut[0];',
-    '} else {',
-    '  var listOut = Ref();',
-    '  if ($.AXUIElementCopyAttributeValue(appEl, $("AXWindows"), listOut) === 0 && listOut[0]) {',
-    '    var arr = ObjC.castRefToObject(listOut[0]);',
-    '    var n = arr ? arr.count : 0;',
-    '    for (var i = 0; i < n; i++) {',
-    '      var candidate = arr.objectAtIndex(i);',
-    '      var subOut = Ref();',
-    '      if ($.AXUIElementCopyAttributeValue(candidate, $("AXSubrole"), subOut) === 0 && subOut[0]) {',
-    '        if (ObjC.unwrap(ObjC.castRefToObject(subOut[0])) === "AXStandardWindow") { win = candidate; break; }',
-    '      }',
-    '    }',
-    '  }',
-    '}',
-    'if (win) {',
-    '  $.AXUIElementSetAttributeValue(win, $("AXMain"), $.kCFBooleanTrue);',
-    '  $.AXUIElementSetAttributeValue(win, $("AXFocused"), $.kCFBooleanTrue);',
-    '  "ok";',
-    '} else {',
-    '  "none";',
-    '}',
-  ].join(" ");
+  const script = buildPromoteMainWindowJxaScript(pid);
 
   try {
-    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
+    const { stdout } = await execFileFn("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], {
       timeout: 1500,
     });
     if (String(stdout || "").trim() === "ok") {
-      await new Promise((r) => setTimeout(r, 40));
+      if (settleMs > 0) {
+        await new Promise((r) => setTimeout(r, settleMs));
+      }
       return true;
     }
     return false;
