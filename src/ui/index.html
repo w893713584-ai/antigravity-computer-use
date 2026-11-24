@@ -739,10 +739,18 @@
         }, 4200);
       }
 
+      function isPaneHidden() {
+        return Boolean(document.hidden || window.innerWidth === 0 || window.innerHeight === 0);
+      }
+
       let viewGeneration = 1;
       let singleClickTimer = null;
       let displayedFrameApp = "";
       let displayedFrameBoot = "";
+      let activeEventSource = null;
+      let sseReconnectTimer = null;
+      let sseSuperseded = false;
+      let wasPaneHidden = isPaneHidden();
 
       function currentAppIdentity(s = currentState) {
         return String(s?.bundleId || s?.activeApp || "");
@@ -776,7 +784,7 @@
             onTransportChange: ({ mode, reason }) => {
               localVideoMode = mode || "jpeg";
               localVideoReason = reason || null;
-              if (mode === "jpeg" && currentState.frameSeq > 0) {
+              if (mode === "jpeg" && currentState.frameSeq > 0 && !isPaneHidden()) {
                 loadFrame(currentState.frameSeq);
               }
               renderStreamBadge();
@@ -830,7 +838,7 @@
       }
 
       function loadFrame(seq, expectedFrameRef = null) {
-        if (!seq) return;
+        if (!seq || isPaneHidden()) return;
         const expectedApp = currentAppIdentity();
         if (!expectedApp) return;
         const expectedTargetKey = expectedFrameRef?.targetKey || currentState.targetKey || "";
@@ -1190,6 +1198,11 @@
         renderWindowOptions(state.availableWindows || [], state.pinnedWindowId, state.windowId);
         renderActionLogs(state.recentActions || []);
 
+        if (isPaneHidden()) {
+          pauseBackgroundStreams("pane_hidden");
+          return;
+        }
+
         videoCtrl?.syncTarget({
           targetKey: currentState.targetKey,
           activeApp: currentState.activeApp,
@@ -1253,12 +1266,59 @@
         }
       }
 
+      function closeEvents({ markSuperseded = false } = {}) {
+        if (sseReconnectTimer) {
+          clearTimeout(sseReconnectTimer);
+          sseReconnectTimer = null;
+        }
+        if (activeEventSource) {
+          const es = activeEventSource;
+          activeEventSource = null;
+          es.onopen = null;
+          es.onerror = null;
+          try {
+            es.close();
+          } catch {}
+        }
+        if (markSuperseded) {
+          sseSuperseded = true;
+        }
+      }
+
+      function pauseBackgroundStreams(reason = "pane_hidden") {
+        closeEvents();
+        if (videoCtrl) {
+          videoCtrl.stop(reason);
+        }
+        localVideoMode = "jpeg";
+        localVideoReason = reason || null;
+        loadingFrameSeq = 0;
+      }
+
+      function refreshStateOnce() {
+        if (isPaneHidden()) return;
+        fetch(withToken("/api/state"))
+          .then((r) => (r.ok ? r.json() : null))
+          .then((s) => {
+            if (s && !isPaneHidden()) applyState(s);
+          })
+          .catch(() => {});
+      }
+
       function connectEvents() {
+        if (isPaneHidden() || sseSuperseded || activeEventSource) return;
+        if (sseReconnectTimer) {
+          clearTimeout(sseReconnectTimer);
+          sseReconnectTimer = null;
+        }
         const es = new EventSource(withToken("/api/events"));
+        activeEventSource = es;
         es.addEventListener("state", (e) => {
+          if (es !== activeEventSource || isPaneHidden()) return;
           try { applyState(JSON.parse(e.data)); } catch {}
         });
         es.addEventListener("frame", (e) => {
+          if (es !== activeEventSource || isPaneHidden()) return;
           try {
             const d = JSON.parse(e.data);
             syncBootId(d.brokerBootId);
@@ -1276,19 +1336,67 @@
           } catch {}
         });
         es.addEventListener("action", (e) => {
+          if (es !== activeEventSource || isPaneHidden()) return;
           try { handleActionEvent(JSON.parse(e.data)); } catch {}
         });
+        es.addEventListener("superseded", () => {
+          if (es !== activeEventSource) return;
+          closeEvents({ markSuperseded: true });
+          if (videoCtrl) {
+            videoCtrl.stop("superseded");
+          }
+          localVideoMode = "jpeg";
+          localVideoReason = "superseded";
+          renderStreamBadge();
+          renderWinMeta();
+        });
         es.onerror = () => {
-          es.close();
-          setTimeout(connectEvents, 1500);
+          if (es !== activeEventSource) return;
+          closeEvents();
+          if (!isPaneHidden() && !sseSuperseded && !sseReconnectTimer) {
+            sseReconnectTimer = setTimeout(() => {
+              sseReconnectTimer = null;
+              connectEvents();
+            }, 1500);
+          }
         };
       }
 
-      fetch(withToken("/api/state"))
-        .then((r) => (r.ok ? r.json() : null))
-        .then((s) => { if (s) applyState(s); })
-        .catch(() => {});
-      connectEvents();
+      function syncPaneVisibility() {
+        if (isPaneHidden()) {
+          wasPaneHidden = true;
+          pauseBackgroundStreams("pane_hidden");
+          return;
+        }
+        if (wasPaneHidden) {
+          wasPaneHidden = false;
+          sseSuperseded = false;
+          refreshStateOnce();
+          connectEvents();
+        }
+      }
+
+      function wakeIfSuperseded() {
+        if (sseSuperseded && !isPaneHidden()) {
+          sseSuperseded = false;
+          refreshStateOnce();
+          connectEvents();
+        }
+      }
+
+      document.addEventListener("visibilitychange", syncPaneVisibility);
+      window.addEventListener("resize", syncPaneVisibility);
+      if (typeof ResizeObserver === "function") {
+        new ResizeObserver(syncPaneVisibility).observe(document.documentElement);
+      }
+      window.addEventListener("pagehide", () => pauseBackgroundStreams("pagehide"));
+      window.addEventListener("focus", wakeIfSuperseded);
+      document.addEventListener("pointerdown", wakeIfSuperseded, { passive: true });
+
+      if (!isPaneHidden()) {
+        refreshStateOnce();
+        connectEvents();
+      }
 
       appSelect.addEventListener("change", async () => {
         const app = appSelect.value;

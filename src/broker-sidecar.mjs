@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { promisify } from "node:util";
 import {
   BROKER_INFO_PATH,
   BROKER_SOCKET_PATH,
@@ -78,6 +80,7 @@ import {
 } from "./takeover-controller.mjs";
 import { VideoWebSocketHub } from "./video-websocket.mjs";
 
+const execFileAsync = promisify(execFile);
 const DEFAULT_FOCUS_SWEEP_DELAYS_MS = [80, 220, 450];
 const SIDECAR_TOOL_NOTE = `\nSide-pane live view: include ${SIDECAR_PILL_MARKDOWN} once in your first reply using Computer Use so the user can open the right-hand live mini-window.`;
 const SIDECAR_REF_TOOL_NOTE = `\n${SNAPSHOT_REF_DOC}`;
@@ -130,6 +133,8 @@ export class ComputerUseBrokerServer {
     scriptRunnerBinPath = null,
     interactDrainTimeoutMs = 4000,
     bringToFrontDrainTimeoutMs = 250,
+    maxSseClients = 2,
+    reclaimStaleOwner = false,
   } = {}) {
     this.uiToken = uiToken;
     this.socketPath = socketPath;
@@ -139,6 +144,7 @@ export class ComputerUseBrokerServer {
     this.interactDrainTimeoutMs = interactDrainTimeoutMs;
     this.bringToFrontDrainTimeoutMs = bringToFrontDrainTimeoutMs;
     this.replManager = replManager;
+    this.reclaimStaleOwner = Boolean(reclaimStaleOwner);
 
     this.takeoverController =
       takeoverController ||
@@ -498,6 +504,7 @@ export class ComputerUseBrokerServer {
       onVideoControl: (data) => this.#handleVideoControl(data),
       wsHub: this.wsHub,
       captureStreamTick: () => this.#captureStreamFrameOnce(),
+      maxSseClients,
     });
   }
 
@@ -3551,10 +3558,71 @@ export class ComputerUseBrokerServer {
     });
   }
 
+  async #reclaimStaleSocketOwner() {
+    if (!this.reclaimStaleOwner || !this.infoPath || !existsSync(this.infoPath)) return false;
+    let info;
+    try {
+      info = JSON.parse(readFileSync(this.infoPath, "utf8"));
+    } catch {
+      return false;
+    }
+    const oldPid = Number(info?.pid);
+    if (!Number.isInteger(oldPid) || oldPid <= 0 || oldPid === process.pid) return false;
+    if (info?.socketPath !== this.socketPath) return false;
+
+    try {
+      const { stdout } = await execFileAsync("/bin/ps", ["-p", String(oldPid), "-o", "command="], {
+        timeout: 2000,
+      });
+      if (!String(stdout || "").includes("broker-sidecar.mjs")) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+
+    try {
+      process.kill(oldPid, "SIGTERM");
+    } catch (err) {
+      if (err?.code !== "ESRCH") return false;
+    }
+
+    const waitUntilFree = async (maxMs, requireDeadPid = true) => {
+      const deadline = Date.now() + maxMs;
+      while (true) {
+        const socketFree = !existsSync(this.socketPath) || !(await this.#probeLiveSocket(this.socketPath));
+        const pidDead = !isProcessAlive(oldPid);
+        if (socketFree && (!requireDeadPid || pidDead)) {
+          return true;
+        }
+        if (Date.now() >= deadline) {
+          return false;
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    };
+
+    if (await waitUntilFree(1200, true)) {
+      return true;
+    }
+    try {
+      process.kill(oldPid, "SIGKILL");
+    } catch (err) {
+      if (err?.code !== "ESRCH") return false;
+    }
+    return await waitUntilFree(300, false);
+  }
+
   async start() {
     mkdirSync(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
     if (existsSync(this.socketPath)) {
-      const liveOwner = await this.#probeLiveSocket(this.socketPath);
+      let liveOwner = await this.#probeLiveSocket(this.socketPath);
+      if (liveOwner && this.reclaimStaleOwner) {
+        const reclaimed = await this.#reclaimStaleSocketOwner();
+        if (reclaimed) {
+          liveOwner = existsSync(this.socketPath) ? await this.#probeLiveSocket(this.socketPath) : false;
+        }
+      }
       if (liveOwner) {
         throw new Error(`Another ComputerUseBrokerServer is already listening on ${this.socketPath}`);
       }
@@ -3662,7 +3730,9 @@ export class ComputerUseBrokerServer {
 }
 
 if (isMainModule(import.meta.url)) {
-  const server = new ComputerUseBrokerServer();
+  const server = new ComputerUseBrokerServer({
+    reclaimStaleOwner: Boolean(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT),
+  });
   server.start().catch((err) => {
     console.error("[computer-use-preview] fatal startup error:", err);
     process.exit(1);

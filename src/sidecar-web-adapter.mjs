@@ -51,6 +51,7 @@ export class SidecarWebAdapter {
     onVideoControl = async () => ({ ok: false }),
     wsHub = null,
     captureStreamTick = async () => {},
+    maxSseClients = 2,
   }) {
     this.webPort = webPort;
     this.uiToken = uiToken;
@@ -75,13 +76,40 @@ export class SidecarWebAdapter {
     this.onVideoControl = onVideoControl;
     this.wsHub = wsHub;
     this.captureStreamTick = captureStreamTick;
+    this.maxSseClients = Math.max(1, Number(maxSseClients) || 2);
 
     this.httpServer = null;
     this.sseClients = new Set();
+    this.sseClientTimers = new Map();
     this.streamTimer = null;
     this.latestFrameBytes = null;
     this.latestFrameMime = "image/jpeg";
     this.frameHistory = [];
+  }
+
+  #cleanupSseClient(res) {
+    const timer = this.sseClientTimers.get(res);
+    if (timer) {
+      clearInterval(timer);
+      this.sseClientTimers.delete(res);
+    }
+    this.sseClients.delete(res);
+  }
+
+  #evictSseClient(res, reason = "max_clients") {
+    this.#cleanupSseClient(res);
+    try {
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(`event: superseded\ndata: ${JSON.stringify({ reason })}\n\n`);
+        res.end();
+      }
+    } catch {}
+    const destroyTimer = setTimeout(() => {
+      try {
+        if (!res.destroyed) res.destroy();
+      } catch {}
+    }, 250);
+    destroyTimer.unref?.();
   }
 
   validateHttpToken(req, url) {
@@ -152,7 +180,7 @@ export class SidecarWebAdapter {
       try {
         res.write(packet);
       } catch {
-        this.sseClients.delete(res);
+        this.#cleanupSseClient(res);
       }
     }
   }
@@ -524,23 +552,35 @@ export class SidecarWebAdapter {
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
       });
+      res.flushHeaders?.();
+      while (this.sseClients.size >= this.maxSseClients) {
+        const oldestRes = this.sseClients.values().next().value;
+        if (!oldestRes) break;
+        this.#evictSseClient(oldestRes, "max_clients");
+      }
       res.write(`event: state\ndata: ${JSON.stringify(this.publicState())}\n\n`);
       this.sseClients.add(res);
       this.ensureStreamLoop();
 
       const keepAlive = setInterval(() => {
         try {
+          if (res.writableEnded || res.destroyed) {
+            this.#cleanupSseClient(res);
+            return;
+          }
           res.write(": ping\n\n");
         } catch {
-          clearInterval(keepAlive);
-          this.sseClients.delete(res);
+          this.#cleanupSseClient(res);
         }
       }, 15_000);
       keepAlive.unref?.();
+      this.sseClientTimers.set(res, keepAlive);
 
       req.on("close", () => {
-        clearInterval(keepAlive);
-        this.sseClients.delete(res);
+        this.#cleanupSseClient(res);
+      });
+      res.on("close", () => {
+        this.#cleanupSseClient(res);
       });
       return;
     }
@@ -775,12 +815,17 @@ export class SidecarWebAdapter {
   async close() {
     this.stopStreamTimer();
     this.wsHub?.closeAll();
-    for (const client of this.sseClients) {
+    for (const client of Array.from(this.sseClients)) {
+      this.#cleanupSseClient(client);
       try {
         client.end();
       } catch {}
     }
     this.sseClients.clear();
+    for (const timer of this.sseClientTimers.values()) {
+      clearInterval(timer);
+    }
+    this.sseClientTimers.clear();
     if (this.httpServer) {
       this.httpServer.closeAllConnections?.();
       await new Promise((resolve) => this.httpServer.close(() => resolve()));

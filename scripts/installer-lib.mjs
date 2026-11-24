@@ -387,6 +387,13 @@ async function terminateRunningBrokerAndAgents({ skipProcessKill = false } = {})
       { timeout: 3000 }
     );
   } catch {}
+  try {
+    await execFileAsync(
+      "/usr/bin/pkill",
+      ["-TERM", "-f", "OpenComputerUse __open-computer-use-app-agent"],
+      { timeout: 3000 }
+    );
+  } catch {}
   for (const ns of ["agy-action", "agy-stream"]) {
     const nsHash = crypto.createHash("sha256").update(ns).digest("hex").slice(0, 16);
     const sockName = `open-computer-use-agent-${nsHash}.sock`;

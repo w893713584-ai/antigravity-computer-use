@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -641,6 +642,115 @@ test("SidecarWebAdapter enforces token auth (exempting /healthz & /preload.js), 
       process.env.ANTIGRAVITY_AGENTAPI_EXE = prevAgentApiExe;
     }
     rmSync(tmpBinDir, { recursive: true, force: true });
+    await web.close();
+  }
+});
+
+test("SidecarWebAdapter enforces maxSseClients FIFO eviction with event: superseded while keeping / and /api/state responsive", async () => {
+  const state = {
+    activeApp: null,
+    appDisplayName: null,
+    bundleId: null,
+    pid: null,
+    windowTitle: null,
+    occludedNote: false,
+    activeSnapshotId: null,
+    followAi: true,
+    paused: false,
+    aiStatus: "idle",
+    lastAction: null,
+    actionSeq: 0,
+    frameSeq: 0,
+    frameWidth: 0,
+    frameHeight: 0,
+    frameLatencyMs: 0,
+    recentActions: [],
+    runningApps: [],
+    permissions: { platform: "darwin", accessibility: true, screenRecording: true },
+    headlessStats: { snapshotsIssued: 0, staleRefsBlocked: 0, focusStealsPrevented: 0 },
+  };
+  const web = new SidecarWebAdapter({
+    webPort: 0,
+    uiToken: "sse-cap-token",
+    brokerBootId: "boot-sse-cap",
+    state,
+    maxSseClients: 2,
+  });
+
+  const openSse = (port) =>
+    new Promise((resolve, reject) => {
+      let body = "";
+      let closed = false;
+      let settled = false;
+      const req = http.get(
+        `http://127.0.0.1:${port}/api/events?token=sse-cap-token`,
+        { agent: false },
+        (res) => {
+          res.setEncoding("utf8");
+          const closePromise = new Promise((resClose) => {
+            res.on("end", () => {
+              closed = true;
+              resClose();
+            });
+            res.on("close", () => {
+              closed = true;
+              resClose();
+            });
+          });
+          res.on("data", (chunk) => {
+            body += chunk;
+            if (!settled && body.includes("event: state\n")) {
+              settled = true;
+              resolve({
+                req,
+                res,
+                getBody: () => body,
+                isClosed: () => closed,
+                waitClosed: () => closePromise,
+              });
+            }
+          });
+        }
+      );
+      req.on("error", (err) => {
+        if (!settled) reject(err);
+      });
+    });
+
+  const port = await web.start();
+  const opened = [];
+  try {
+    const c1 = await openSse(port);
+    opened.push(c1);
+    const c2 = await openSse(port);
+    opened.push(c2);
+    assert.equal(web.sseClients.size, 2);
+
+    const c3 = await openSse(port);
+    opened.push(c3);
+    await Promise.race([
+      c1.waitClosed(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for oldest SSE eviction")), 1500)),
+    ]);
+
+    assert.equal(web.sseClients.size, 2);
+    assert.equal(c1.isClosed(), true);
+    assert.match(c1.getBody(), /event: superseded\ndata: \{"reason":"max_clients"\}/);
+    assert.equal(c2.isClosed(), false);
+    assert.equal(c3.isClosed(), false);
+
+    const [rootRes, stateRes] = await Promise.all([
+      fetch(`http://127.0.0.1:${port}/`),
+      fetch(`http://127.0.0.1:${port}/api/state?token=sse-cap-token`),
+    ]);
+    assert.equal(rootRes.status, 200);
+    assert.equal(stateRes.status, 200);
+  } finally {
+    for (const c of opened) {
+      try {
+        c.req.destroy();
+      } catch {}
+    }
     await web.close();
   }
 });

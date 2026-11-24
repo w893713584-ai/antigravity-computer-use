@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { BROKER_INFO_PATH, OPEN_COMPUTER_USE_BIN, PROJECT_ROOT, SIDECAR_PILL_MARKDOWN, UI_HTML_PATH } from "../src/constants.mjs";
@@ -2881,5 +2882,112 @@ test("Broker logs standard [sidecar] listening line and recovers screenshot + AX
   } finally {
     await client.close();
     await broker.close();
+  }
+});
+
+test("ComputerUseBrokerServer with reclaimStaleOwner gracefully terminates orphan broker-sidecar.mjs and takes over socket + infoPath", async () => {
+  const fakeHome = mkdtempSync(path.join(tmpdir(), "agy-cua-reclaim-home-"));
+  const ocuDir = path.join(fakeHome, ".config", "ocu");
+  mkdirSync(ocuDir, { recursive: true });
+  const sock = `/tmp/agy-cua-reclaim-${process.pid}-${Date.now()}.sock`;
+  const infoPath = path.join(ocuDir, "agy-cua-sidecar.json");
+  const brokerScript = path.join(PROJECT_ROOT, "src", "broker-sidecar.mjs");
+
+  const oldChild = spawn(process.execPath, [brokerScript], {
+    env: {
+      ...process.env,
+      HOME: fakeHome,
+      AGY_CUA_BROKER_SOCK: sock,
+      ANTIGRAVITY_SIDECAR_WEB_PORT: "0",
+      AGY_CUA_DISABLE_HELPER_AUTOSTART: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const dummyPeer = {
+    async listTools() {
+      return { tools: [] };
+    },
+    async callTool() {
+      return { isError: false, content: [{ type: "text", text: "ok" }] };
+    },
+    close() {},
+  };
+
+  let newBroker = null;
+  try {
+    await new Promise((resolve, reject) => {
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => {
+        reject(new Error(`Old broker-sidecar child timed out starting. stdout=${stdout} stderr=${stderr}`));
+      }, 8000);
+      oldChild.stdout.on("data", (d) => {
+        stdout += d.toString("utf8");
+        if (stdout.includes("[sidecar] listening on 127.0.0.1:")) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      oldChild.stderr.on("data", (d) => {
+        stderr += d.toString("utf8");
+      });
+      oldChild.once("exit", (code, sig) => {
+        clearTimeout(timer);
+        reject(new Error(`Old broker-sidecar exited early (${code}/${sig}): ${stderr}`));
+      });
+    });
+
+    assert.equal(existsSync(infoPath), true);
+    const oldInfo = JSON.parse(readFileSync(infoPath, "utf8"));
+    assert.equal(oldInfo.pid, oldChild.pid);
+    assert.equal(oldInfo.socketPath, sock);
+
+    const oldExitPromise = new Promise((resolve) => {
+      if (oldChild.exitCode !== null || oldChild.signalCode !== null) {
+        resolve({ code: oldChild.exitCode, signal: oldChild.signalCode });
+        return;
+      }
+      oldChild.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+
+    newBroker = new ComputerUseBrokerServer({
+      webPort: 0,
+      uiToken: "reclaim-tok",
+      socketPath: sock,
+      infoPath,
+      actionPeer: dummyPeer,
+      streamPeer: dummyPeer,
+      axBridge: null,
+      desktopHelperClient: null,
+      reclaimStaleOwner: true,
+    });
+    const { webPort } = await newBroker.start();
+    assert.ok(webPort > 0);
+
+    const exited = await Promise.race([
+      oldExitPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Old broker child did not exit")), 2000)),
+    ]);
+    assert.ok(exited.code === 0 || exited.signal === "SIGTERM" || exited.signal === "SIGKILL");
+
+    const newInfo = JSON.parse(readFileSync(infoPath, "utf8"));
+    assert.equal(newInfo.pid, process.pid);
+    assert.equal(newInfo.socketPath, sock);
+    assert.equal(newInfo.webPort, webPort);
+
+    const healthRes = await fetch(`http://127.0.0.1:${webPort}/healthz`);
+    assert.equal(healthRes.status, 200);
+  } finally {
+    if (newBroker) {
+      await newBroker.close().catch(() => {});
+    }
+    if (oldChild.exitCode === null && oldChild.signalCode === null) {
+      try {
+        oldChild.kill("SIGKILL");
+      } catch {}
+    }
+    rmSync(sock, { force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
   }
 });

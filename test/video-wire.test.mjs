@@ -617,6 +617,17 @@ test("UI preview-video.js and index.html are XSS-safe (.innerHTML free) and pars
   assert.equal(scriptMatches.length, 1);
   new vm.Script(scriptMatches[0][1], { filename: "src/ui/index.html" });
 
+  // Verify hidden-pane dormancy & superseded handling in index.html so background tabs never exhaust Chromium's 6-socket pool
+  const inlineJs = scriptMatches[0][1];
+  assert.match(inlineJs, /function isPaneHidden\(\)/);
+  assert.match(inlineJs, /window\.innerWidth === 0 \|\| window\.innerHeight === 0/);
+  assert.match(inlineJs, /addEventListener\("visibilitychange",\s*syncPaneVisibility\)/);
+  assert.match(inlineJs, /addEventListener\("resize",\s*syncPaneVisibility\)/);
+  assert.match(inlineJs, /ResizeObserver/);
+  assert.match(inlineJs, /addEventListener\("pagehide",\s*\(\)\s*=>\s*pauseBackgroundStreams\("pagehide"\)\)/);
+  assert.match(inlineJs, /addEventListener\("superseded"/);
+  assert.match(inlineJs, /videoCtrl\.stop\(reason\)/);
+
   // Verify renderPermissionsBanner avoids JXA Screen Recording false positives when DesktopHelper has SR
   const bannerFnMatch = scriptMatches[0][1].match(
     /function renderPermissionsBanner\([\s\S]*?\n      \}\n\n      function renderWinMeta/u
