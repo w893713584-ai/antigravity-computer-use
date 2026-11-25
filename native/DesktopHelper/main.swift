@@ -1,4 +1,6 @@
 import AppKit
+import ApplicationServices
+import CoreGraphics
 import CoreVideo
 import Foundation
 
@@ -116,8 +118,54 @@ private func runEncoderSelfTestAndExit() -> Never {
   exit(0)
 }
 
+private func runPermissionCliAndExit(registerMissing: Bool) -> Never {
+  var axGranted = AXIsProcessTrusted()
+  var srGranted = CGPreflightScreenCaptureAccess()
+  var imGranted = CGPreflightListenEventAccess()
+
+  if registerMissing {
+    if !axGranted {
+      let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+      axGranted = AXIsProcessTrustedWithOptions(opts)
+    }
+    if !srGranted {
+      srGranted = CGRequestScreenCaptureAccess()
+    }
+    if !imGranted {
+      imGranted = CGRequestListenEventAccess()
+    }
+  }
+
+  var missing: [String] = []
+  if !axGranted { missing.append("accessibility") }
+  if !srGranted { missing.append("screenRecording") }
+  if !imGranted { missing.append("inputMonitoring") }
+
+  let report: [String: Any] = [
+    "ok": true,
+    "registered": registerMissing,
+    "accessibility": axGranted,
+    "screenRecording": srGranted,
+    "inputMonitoring": imGranted,
+    "missing": missing,
+  ]
+  if let jsonData = try? JSONSerialization.data(withJSONObject: report, options: []),
+     let jsonStr = String(data: jsonData, encoding: .utf8) {
+    print(jsonStr)
+  } else {
+    print("{\"ok\":true,\"registered\":\(registerMissing),\"accessibility\":\(axGranted),\"screenRecording\":\(srGranted),\"inputMonitoring\":\(imGranted)}")
+  }
+  exit(0)
+}
+
 if CommandLine.arguments.contains("--self-test-encoder") {
   runEncoderSelfTestAndExit()
+}
+if CommandLine.arguments.contains("--check-permissions") {
+  runPermissionCliAndExit(registerMissing: false)
+}
+if CommandLine.arguments.contains("--register-permissions") {
+  runPermissionCliAndExit(registerMissing: true)
 }
 
 private func parseRendezvousArg() -> String? {

@@ -30,6 +30,7 @@ import {
 import {
   EXPECTED_NATIVE_MANIFEST_VERSION,
   inspectCodesign,
+  resolveCodesignIdentity,
   runDesktopHelperEncoderSelfTest,
   runScriptRunnerDenialSelfTest,
   sha256File,
@@ -116,6 +117,7 @@ async function canReuseBuiltComponent({
     role,
     expectedBundleId: existingEntry.bundleId || null,
     requiredTeamId: existingEntry.teamId || null,
+    signingMode: expectedSigningMode,
     skipSelfTest: true,
   });
   return Boolean(verify?.ok);
@@ -274,17 +276,17 @@ function renderAppInfoPlist({ templatePath, outPath, bundleId, version }) {
   writeFileSync(outPath, xml, "utf8");
 }
 
-function signBundle(appPath, { identity }) {
-  const isAdhoc = identity === "-";
+function signBundle(appPath, { identity, signingMode = null }) {
+  const resolvedMode = signingMode || (identity === "-" ? "adhoc" : "developer_id");
   const baseArgs = ["--force", "--sign", identity];
-  if (!isAdhoc) {
+  if (resolvedMode === "developer_id") {
     execFileSync(
       "/usr/bin/codesign",
       [...baseArgs, "--options", "runtime", "--timestamp", appPath],
       { stdio: "inherit" }
     );
   } else {
-    // Test whether local codesign supports --options runtime on ad-hoc `-`, fallback cleanly if unsupported
+    // Both ad-hoc (`-`) and local self-signed certificates sign offline without `--timestamp`.
     try {
       execFileSync("/usr/bin/codesign", [...baseArgs, "--options", "runtime", appPath], {
         stdio: "pipe",
@@ -402,15 +404,19 @@ export async function buildNativeBundles({
   payloadsDir = NATIVE_PAYLOADS_DIR,
   skipLiveSelfCheck = false,
   force = false,
+  codesignIdentity = null,
 } = {}) {
   if (process.platform !== "darwin") {
     return { skipped: true, reason: "non_darwin" };
   }
 
   const hostArch = os.arch() === "x64" ? "x86_64" : os.arch();
-  const codesignIdentity = process.env.AGY_CUA_CODESIGN_IDENTITY || "-";
-  const isDev = codesignIdentity === "-";
-  const expectedSigningMode = isDev ? "adhoc" : "developer_id";
+  const {
+    identity: resolvedIdentity,
+    signingMode: expectedSigningMode,
+    source: signingSource,
+  } = resolveCodesignIdentity({ explicitIdentity: codesignIdentity });
+  const isDev = expectedSigningMode !== "developer_id";
   const desiredArchs = process.env.AGY_CUA_NATIVE_ARCHS
     ? process.env.AGY_CUA_NATIVE_ARCHS.split(",").map((a) => a.trim()).filter(Boolean)
     : ["arm64", "x86_64"];
@@ -422,13 +428,13 @@ export async function buildNativeBundles({
   const scriptRunnerSrcDir = path.join(sourceRoot, "native", "ScriptRunner");
 
   // Intentionally omit pkgVersion from sourceSha256 so JS-only version bumps reuse
-  // unchanged native .app bundles and keep their ad-hoc CDHash / macOS TCC grants intact.
+  // unchanged native .app bundles and keep their CDHash / macOS TCC grants intact.
   const helperSourceSha = computeComponentSourceSha256(desktopHelperSrcDir, {
-    extraMeta: { role: "desktopHelper", codesignIdentity, desiredArchs },
+    extraMeta: { role: "desktopHelper", codesignIdentity: resolvedIdentity, desiredArchs },
   });
   const runnerSourceSha = computeComponentSourceSha256(scriptRunnerSrcDir, {
     excludeNames: ["GeneratedEmbeddedAssets.swift"],
-    extraMeta: { role: "scriptRunner", codesignIdentity, desiredArchs },
+    extraMeta: { role: "scriptRunner", codesignIdentity: resolvedIdentity, desiredArchs },
   });
 
   const manifestPath = path.join(payloadsDir, "manifest.json");
@@ -464,11 +470,19 @@ export async function buildNativeBundles({
   const runnerZipOut = path.join(payloadsDir, runnerZipName);
 
   try {
+    console.log(
+      `[build-native] Signing mode: ${expectedSigningMode} (identity=${resolvedIdentity}, source=${signingSource})`
+    );
     const existingHelper = existingManifest?.components?.desktopHelper || null;
     const helperLegacySourceShas = existingHelper
       ? extractLegacyPkgVersions(existingHelper, pkgVersion).map((legacyVersion) =>
           computeComponentSourceSha256(desktopHelperSrcDir, {
-            extraMeta: { role: "desktopHelper", codesignIdentity, desiredArchs, pkgVersion: legacyVersion },
+            extraMeta: {
+              role: "desktopHelper",
+              codesignIdentity: resolvedIdentity,
+              desiredArchs,
+              pkgVersion: legacyVersion,
+            },
           })
         )
       : [];
@@ -492,7 +506,12 @@ export async function buildNativeBundles({
       ? extractLegacyPkgVersions(existingRunner, pkgVersion).map((legacyVersion) =>
           computeComponentSourceSha256(scriptRunnerSrcDir, {
             excludeNames: ["GeneratedEmbeddedAssets.swift"],
-            extraMeta: { role: "scriptRunner", codesignIdentity, desiredArchs, pkgVersion: legacyVersion },
+            extraMeta: {
+              role: "scriptRunner",
+              codesignIdentity: resolvedIdentity,
+              desiredArchs,
+              pkgVersion: legacyVersion,
+            },
           })
         )
       : [];
@@ -548,7 +567,7 @@ export async function buildNativeBundles({
         bundleId: helperBundleId,
         version: bundleVersion,
       });
-      signBundle(helperAppOut, { identity: codesignIdentity });
+      signBundle(helperAppOut, { identity: resolvedIdentity, signingMode: expectedSigningMode });
       rmSync(helperZipOut, { force: true });
       await execFileAsync(
         "/usr/bin/ditto",
@@ -560,6 +579,8 @@ export async function buildNativeBundles({
         bundleId: helperBundleId,
         version: bundleVersion,
         teamId: helperSignInfo.teamId || null,
+        authority: helperSignInfo.authorities?.[0] || null,
+        cdhash: helperSignInfo.cdhash || null,
         signingMode: expectedSigningMode,
         archs: helperArchs,
         binSha256: sha256File(helperBinOut),
@@ -595,7 +616,7 @@ export async function buildNativeBundles({
         bundleId: runnerBundleId,
         version: bundleVersion,
       });
-      signBundle(runnerAppOut, { identity: codesignIdentity });
+      signBundle(runnerAppOut, { identity: resolvedIdentity, signingMode: expectedSigningMode });
       rmSync(runnerZipOut, { force: true });
       await execFileAsync(
         "/usr/bin/ditto",
@@ -607,6 +628,8 @@ export async function buildNativeBundles({
         bundleId: runnerBundleId,
         version: bundleVersion,
         teamId: runnerSignInfo.teamId || null,
+        authority: runnerSignInfo.authorities?.[0] || null,
+        cdhash: runnerSignInfo.cdhash || null,
         signingMode: expectedSigningMode,
         archs: runnerArchs,
         binSha256: sha256File(runnerBinOut),
@@ -666,22 +689,56 @@ export async function buildNativeBundles({
   }
 }
 
+function parseBuildNativeCliArgs(argv) {
+  const opts = {
+    ifMissing: false,
+    force: false,
+    skipLiveSelfCheck: false,
+    codesignIdentity: null,
+    runtimeDir: NATIVE_RUNTIME_DIR,
+    payloadsDir: NATIVE_PAYLOADS_DIR,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--if-missing") opts.ifMissing = true;
+    else if (arg === "--force") opts.force = true;
+    else if (arg === "--skip-self-check") opts.skipLiveSelfCheck = true;
+    else if (arg === "--identity" && i + 1 < argv.length) opts.codesignIdentity = argv[++i];
+    else if (arg === "--runtime-dir" && i + 1 < argv.length) opts.runtimeDir = path.resolve(argv[++i]);
+    else if (arg === "--payloads-dir" && i + 1 < argv.length) opts.payloadsDir = path.resolve(argv[++i]);
+  }
+  return opts;
+}
+
 if (isMainModule(import.meta.url)) {
-  const ifMissing = process.argv.includes("--if-missing");
-  const force = process.argv.includes("--force");
-  if (ifMissing && !force) {
+  const cli = parseBuildNativeCliArgs(process.argv.slice(2));
+  if (cli.ifMissing && !cli.force) {
     if (process.platform !== "darwin") {
       process.exit(0);
     }
+    const helperBinCheck =
+      cli.runtimeDir === NATIVE_RUNTIME_DIR
+        ? DESKTOP_HELPER_BIN_PATH
+        : path.join(cli.runtimeDir, "CUADesktopHelper.app", "Contents", "MacOS", "CUADesktopHelper");
+    const runnerBinCheck =
+      cli.runtimeDir === NATIVE_RUNTIME_DIR
+        ? SCRIPT_RUNNER_BIN_PATH
+        : path.join(cli.runtimeDir, "CUAScriptRunner.app", "Contents", "MacOS", "CUAScriptRunner");
     if (
-      existsSync(DESKTOP_HELPER_BIN_PATH) &&
-      existsSync(SCRIPT_RUNNER_BIN_PATH) &&
-      existsSync(path.join(NATIVE_PAYLOADS_DIR, "manifest.json"))
+      existsSync(helperBinCheck) &&
+      existsSync(runnerBinCheck) &&
+      existsSync(path.join(cli.payloadsDir, "manifest.json"))
     ) {
       process.exit(0);
     }
   }
-  buildNativeBundles({ force })
+  buildNativeBundles({
+    runtimeDir: cli.runtimeDir,
+    payloadsDir: cli.payloadsDir,
+    skipLiveSelfCheck: cli.skipLiveSelfCheck,
+    force: cli.force,
+    codesignIdentity: cli.codesignIdentity,
+  })
     .then((res) => {
       if (res.skipped) {
         console.log(`[build-native] skipped (${res.reason})`);

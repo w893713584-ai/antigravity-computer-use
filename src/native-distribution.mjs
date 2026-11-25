@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import {
   cpSync,
@@ -25,6 +25,147 @@ import {
 const execFileAsync = promisify(execFile);
 
 export const EXPECTED_NATIVE_MANIFEST_VERSION = 1;
+export const DEFAULT_LOCAL_CODESIGN_IDENTITY = "Codex CUA Local Code Signing";
+
+/**
+ * Parse `security find-identity -v -p codesigning` output into `{ hash, name }` entries.
+ */
+export function parseCodesignIdentities(rawOutput) {
+  const out = [];
+  const seen = new Set();
+  for (const line of String(rawOutput || "").split(/\r?\n/u)) {
+    const match = /^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"([^"]+)"/u.exec(line);
+    if (!match) continue;
+    const hash = match[1].toUpperCase();
+    const name = match[2];
+    const dedupeKey = `${hash}:${name}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push({ hash, name });
+  }
+  return out;
+}
+
+/**
+ * Classify a codesigning identity into `adhoc`, `developer_id`, or `local_cert`.
+ */
+export function classifyCodesignIdentity(identity, { env = process.env } = {}) {
+  const id = typeof identity === "string" ? identity.trim() : "";
+  if (!id || id === "-") return "adhoc";
+  const forcedMode = String(env?.AGY_CUA_SIGNING_MODE || "").trim().toLowerCase();
+  if (
+    forcedMode === "developer_id" ||
+    /^(Developer ID |Apple Development:|Apple Distribution:|Mac Developer:|3rd Party Mac Developer)/u.test(
+      id
+    )
+  ) {
+    return "developer_id";
+  }
+  return "local_cert";
+}
+
+/**
+ * Resolve the codesign identity to use for native bundles:
+ * explicit arg/env -> auto-discovered local keychain cert -> adhoc `-`.
+ */
+export function resolveCodesignIdentity({
+  env = process.env,
+  explicitIdentity = null,
+  findIdentitiesFn = null,
+  platform = process.platform,
+} = {}) {
+  const explicit =
+    typeof explicitIdentity === "string" && explicitIdentity.trim()
+      ? explicitIdentity.trim()
+      : null;
+  if (explicit) {
+    return {
+      identity: explicit,
+      signingMode: classifyCodesignIdentity(explicit, { env }),
+      source: "arg",
+    };
+  }
+
+  const envIdentity =
+    typeof env?.AGY_CUA_CODESIGN_IDENTITY === "string" && env.AGY_CUA_CODESIGN_IDENTITY.trim()
+      ? env.AGY_CUA_CODESIGN_IDENTITY.trim()
+      : null;
+  if (envIdentity) {
+    return {
+      identity: envIdentity,
+      signingMode: classifyCodesignIdentity(envIdentity, { env }),
+      source: "env",
+    };
+  }
+
+  if (platform === "darwin" && env?.AGY_CUA_ALLOW_AUTO_LOCAL_CERT !== "0") {
+    const preferredName =
+      typeof env?.AGY_CUA_LOCAL_CERT_NAME === "string" && env.AGY_CUA_LOCAL_CERT_NAME.trim()
+        ? env.AGY_CUA_LOCAL_CERT_NAME.trim()
+        : DEFAULT_LOCAL_CODESIGN_IDENTITY;
+    let rawIdentities = "";
+    try {
+      rawIdentities =
+        typeof findIdentitiesFn === "function"
+          ? String(findIdentitiesFn() || "")
+          : execFileSync("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"], {
+              encoding: "utf8",
+              timeout: 4000,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+    } catch {
+      rawIdentities = "";
+    }
+    const identities = parseCodesignIdentities(rawIdentities);
+    const match = identities.find((item) => item.name === preferredName);
+    if (match) {
+      return {
+        identity: match.name,
+        signingMode: "local_cert",
+        source: "auto_keychain",
+        certHash: match.hash,
+      };
+    }
+  }
+
+  return {
+    identity: "-",
+    signingMode: "adhoc",
+    source: "default",
+  };
+}
+
+/**
+ * Parse `codesign -dvvv` output into structured signing metadata.
+ */
+export function parseCodesignOutput(raw) {
+  const text = String(raw || "");
+  const idMatch = /^Identifier=(.+)$/mu.exec(text);
+  const teamMatch = /^TeamIdentifier=(.+)$/mu.exec(text);
+  const sigMatch = /^Signature=(.+)$/mu.exec(text);
+  const flagsMatch = /^CodeDirectory.*flags=([^\n]+)$/mu.exec(text);
+  const cdhashMatch = /^CDHash=(.+)$/mu.exec(text);
+  const authorities = [];
+  for (const match of text.matchAll(/^Authority=(.+)$/gmu)) {
+    const val = match[1]?.trim();
+    if (val) authorities.push(val);
+  }
+  const teamId = teamMatch && teamMatch[1].trim() !== "not set" ? teamMatch[1].trim() : null;
+  const adhoc =
+    Boolean(sigMatch && sigMatch[1].trim() === "adhoc") ||
+    Boolean(flagsMatch && flagsMatch[1].includes("adhoc")) ||
+    (authorities.length === 0 && (teamMatch ? teamMatch[1].trim() === "not set" : false));
+  const signingMode = adhoc ? "adhoc" : teamId ? "developer_id" : "local_cert";
+
+  return {
+    adhoc,
+    signingMode,
+    identifier: idMatch ? idMatch[1].trim() : null,
+    teamId,
+    authorities,
+    cdhash: cdhashMatch ? cdhashMatch[1].trim() : null,
+  };
+}
 
 export function sha256File(filePath) {
   return crypto.createHash("sha256").update(readFileSync(filePath)).digest("hex");
@@ -74,19 +215,10 @@ export async function inspectCodesign(appPath) {
       timeout: 5000,
     }).catch((e) => ({ stdout: e.stdout || "", stderr: e.stderr || "" }));
     const raw = `${stdout || ""}\n${stderr || ""}`;
-    const idMatch = /^Identifier=(.+)$/mu.exec(raw);
-    const teamMatch = /^TeamIdentifier=(.+)$/mu.exec(raw);
-    const sigMatch = /^Signature=(.+)$/mu.exec(raw);
-    const flagsMatch = /^CodeDirectory.*flags=([^\n]+)$/mu.exec(raw);
-    const adhoc =
-      Boolean(sigMatch && sigMatch[1].trim() === "adhoc") ||
-      Boolean(flagsMatch && flagsMatch[1].includes("adhoc")) ||
-      (teamMatch ? teamMatch[1].trim() === "not set" : false);
+    const parsed = parseCodesignOutput(raw);
     return {
       valid: true,
-      adhoc,
-      identifier: idMatch ? idMatch[1].trim() : null,
-      teamId: teamMatch && teamMatch[1].trim() !== "not set" ? teamMatch[1].trim() : null,
+      ...parsed,
       raw,
     };
   } catch (err) {
@@ -189,6 +321,7 @@ export async function verifyNativeAppBundle(
     expectedArchs = null,
     signingMode = null,
     skipSelfTest = false,
+    inspectCodesignFn = inspectCodesign,
   } = {}
 ) {
   const execName = role === "desktopHelper" ? "CUADesktopHelper" : "CUAScriptRunner";
@@ -210,7 +343,7 @@ export async function verifyNativeAppBundle(
     }
   }
 
-  const signInfo = await inspectCodesign(appPath);
+  const signInfo = await inspectCodesignFn(appPath);
   if (!signInfo.valid) {
     return { ok: false, reason: `codesign_invalid:${signInfo.error || "unknown"}` };
   }
@@ -236,7 +369,27 @@ export async function verifyNativeAppBundle(
     if (requiredTeamId && signInfo.teamId !== requiredTeamId) {
       return { ok: false, reason: `team_mismatch:${signInfo.teamId}!=${requiredTeamId}` };
     }
-    if (signingMode && signingMode !== "adhoc") {
+    if (signingMode === "developer_id") {
+      if (signInfo.adhoc) {
+        return { ok: false, reason: "expected_signed_not_adhoc" };
+      }
+      if (signInfo.signingMode === "local_cert") {
+        return { ok: false, reason: "expected_developer_id_not_local_cert" };
+      }
+      if (!requiredTeamId) {
+        return { ok: false, reason: "missing_required_team_id" };
+      }
+    } else if (signingMode === "local_cert") {
+      if (signInfo.adhoc) {
+        return { ok: false, reason: "expected_signed_not_adhoc" };
+      }
+      if (!Array.isArray(signInfo.authorities) || signInfo.authorities.length === 0) {
+        return { ok: false, reason: "missing_codesign_authority" };
+      }
+      if (actualBundleId === allowedProdId) {
+        return { ok: false, reason: "local_cert_must_not_use_prod_bundle_id" };
+      }
+    } else if (signingMode && signingMode !== "adhoc") {
       if (signInfo.adhoc) {
         return { ok: false, reason: "expected_signed_not_adhoc" };
       }
@@ -244,8 +397,11 @@ export async function verifyNativeAppBundle(
         return { ok: false, reason: "missing_required_team_id" };
       }
     }
+    if (signInfo.signingMode === "local_cert" && actualBundleId === allowedProdId) {
+      return { ok: false, reason: "local_cert_must_not_use_prod_bundle_id" };
+    }
     if (!signInfo.adhoc && actualBundleId === allowedDevId && !process.env.AGY_CUA_CODESIGN_IDENTITY) {
-      // signed with formal identity -> allowed only when using prod ID unless explicitly testing
+      // signed with formal or local dev identity -> allowed on dev bundle ID
     } else if (signInfo.adhoc && actualBundleId === allowedProdId) {
       return { ok: false, reason: "adhoc_must_not_use_prod_bundle_id" };
     }
@@ -286,7 +442,10 @@ export async function verifyNativeAppBundle(
     binPath,
     bundleId: actualBundleId,
     adhoc: Boolean(signInfo.adhoc),
+    signingMode: signInfo.signingMode || (signInfo.adhoc ? "adhoc" : "developer_id"),
     teamId: signInfo.teamId || null,
+    authorities: signInfo.authorities || [],
+    cdhash: signInfo.cdhash || null,
     archs,
   };
 }
@@ -436,8 +595,12 @@ export async function stageAndInstallNativePayloads({
       }
 
       const stagedApp = path.join(compStageDir, spec.appName);
-      // Only clear quarantine on explicit ad-hoc dev bundles; keep Gatekeeper intact on notarized Developer ID builds
-      if (process.platform === "darwin" && entry.signingMode === "adhoc" && existsSync(stagedApp)) {
+      // Clear quarantine on local/ad-hoc bundles; keep Gatekeeper intact on notarized Developer ID builds
+      if (
+        process.platform === "darwin" &&
+        (entry.signingMode === "adhoc" || entry.signingMode === "local_cert") &&
+        existsSync(stagedApp)
+      ) {
         await execFileAsync("/usr/bin/xattr", ["-dr", "com.apple.quarantine", stagedApp], {
           timeout: 5000,
         }).catch(() => {});
@@ -497,14 +660,17 @@ export async function stageAndInstallNativePayloads({
           skipSelfTest: true,
         });
         if (existingCheck.ok) {
-          log(
-            `已复用无变更原生组件 ${spec.appName} (${existingCheck.bundleId}${existingCheck.adhoc ? " · adhoc" : ""})`
-          );
+          const signLabel =
+            existingCheck.signingMode && existingCheck.signingMode !== "developer_id"
+              ? ` · ${existingCheck.signingMode}`
+              : "";
+          log(`已复用无变更原生组件 ${spec.appName} (${existingCheck.bundleId}${signLabel})`);
           report.components[spec.key] = {
             status: "installed",
             reusedInPlace: true,
             bundleId: existingCheck.bundleId,
             adhoc: existingCheck.adhoc,
+            signingMode: existingCheck.signingMode,
             archs: existingCheck.archs,
           };
           continue;
@@ -512,16 +678,22 @@ export async function stageAndInstallNativePayloads({
       }
 
       const swapRes = replaceBundleAtomically(stagedApp, targetApp);
-      if (process.platform === "darwin" && entry.signingMode === "adhoc") {
+      if (
+        process.platform === "darwin" &&
+        (entry.signingMode === "adhoc" || entry.signingMode === "local_cert")
+      ) {
         await execFileAsync("/usr/bin/xattr", ["-dr", "com.apple.quarantine", targetApp], {
           timeout: 5000,
         }).catch(() => {});
       }
-      log(`已验证并安装原生组件 ${spec.appName} (${check.bundleId}${check.adhoc ? " · adhoc" : ""})`);
+      const installSignLabel =
+        check.signingMode && check.signingMode !== "developer_id" ? ` · ${check.signingMode}` : "";
+      log(`已验证并安装原生组件 ${spec.appName} (${check.bundleId}${installSignLabel})`);
       report.components[spec.key] = {
         status: swapRes.installed ? "installed" : "preserved_previous",
         bundleId: check.bundleId,
         adhoc: check.adhoc,
+        signingMode: check.signingMode,
         archs: check.archs,
       };
     }

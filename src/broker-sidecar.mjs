@@ -73,6 +73,11 @@ import {
   validateFrameRef,
 } from "./preview-geometry.mjs";
 import { PreviewStreamManager } from "./preview-stream.mjs";
+import {
+  collectMissingPermissions,
+  getPermissionSettingsUrl,
+  openMacOsPermissionSettings,
+} from "./macos-permissions.mjs";
 import { StrictReplSessionManager } from "./repl-runner.mjs";
 import {
   TakeoverAbortedError,
@@ -164,6 +169,7 @@ export class ComputerUseBrokerServer {
     processIdentityFn = getProcessIdentity,
     runningAppIdentityFn = resolveRunningAppIdentity,
     permissionsFn = checkMacPermissions,
+    openPermissionSettingsFn = openMacOsPermissionSettings,
     rendererAccessibilityFn = ensureRendererAccessibility,
     editableFocusFn = verifyEditableTextFocus,
     selectedTextInsertFn = tryHeadlessSelectedTextInsert,
@@ -192,6 +198,7 @@ export class ComputerUseBrokerServer {
     this.scriptRunnerBinPath = scriptRunnerBinPath || SCRIPT_RUNNER_BIN_PATH;
     this.interactDrainTimeoutMs = interactDrainTimeoutMs;
     this.bringToFrontDrainTimeoutMs = bringToFrontDrainTimeoutMs;
+    this.openPermissionSettingsFn = openPermissionSettingsFn;
     this.replManager = replManager;
     this.reclaimStaleOwner = Boolean(reclaimStaleOwner);
 
@@ -545,7 +552,8 @@ export class ComputerUseBrokerServer {
       isScreenLockedBackoff: () => this.#screenLockedBackoff,
       refreshPermissionsQuietly: () => this.#refreshPermissionsQuietly(),
       getPermissionsReport: () => this.getPermissionsReport(),
-      onRequestPermission: (kind) => this.#handleRequestPermission(kind),
+      onRequestPermission: (kind, opts) => this.#handleRequestPermission(kind, opts),
+      onOpenPermissionSettings: (kind) => this.#handleOpenPermissionSettings(kind),
       refreshAppsList: () => this.refreshAppsList(),
       onGetWindows: () => this.#handleGetWindows(),
       runSerializedAction: (fn) => this.#runSerializedAction(fn),
@@ -1557,17 +1565,72 @@ export class ComputerUseBrokerServer {
     };
   }
 
-  async #handleRequestPermission(kind) {
-    if (!["screenRecording", "inputMonitoring"].includes(kind)) {
+  async #handleRequestPermission(kind, { openSettings = false } = {}) {
+    if (!["accessibility", "screenRecording", "inputMonitoring", "all"].includes(kind)) {
       return { ok: false, error: "Unsupported permission kind" };
     }
-    if (!this.desktopHelperClient || !this.desktopHelperClient.available) {
+    const helperAvailable = Boolean(this.desktopHelperClient && this.desktopHelperClient.available);
+    if (!helperAvailable && !openSettings) {
       return { ok: false, error: "CUADesktopHelper 未连接或未安装" };
     }
-    const res = await this.desktopHelperClient.requestPermission(kind);
+
+    let helperRes = {};
+    if (helperAvailable) {
+      try {
+        helperRes = await this.desktopHelperClient.requestPermission(kind);
+      } catch (err) {
+        if (kind === "all") {
+          const results = {};
+          for (const subKind of ["screenRecording", "inputMonitoring"]) {
+            try {
+              const subRes = await this.desktopHelperClient.requestPermission(subKind);
+              results[subKind] = Boolean(subRes?.granted);
+            } catch {}
+          }
+          helperRes = { kind: "all", results };
+        } else if (!openSettings) {
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }
+    }
+
     await this.#refreshPermissionsQuietly();
     this.webAdapter.broadcastState();
-    return { ok: true, ...res, permissions: await this.getPermissionsReport() };
+
+    let openedSettings = null;
+    if (openSettings && typeof this.openPermissionSettingsFn === "function") {
+      const targetKind =
+        kind === "all"
+          ? collectMissingPermissions(this.state.permissions, this.state.permissionComponents)[0] ||
+            "accessibility"
+          : kind;
+      openedSettings = await this.openPermissionSettingsFn(targetKind);
+    }
+
+    return {
+      ok: true,
+      kind,
+      ...helperRes,
+      ...(openedSettings ? { openedSettings } : {}),
+      permissions: await this.getPermissionsReport(),
+    };
+  }
+
+  async #handleOpenPermissionSettings(kind) {
+    if (!getPermissionSettingsUrl(kind)) {
+      return { ok: false, error: "Unsupported permission kind" };
+    }
+    const res =
+      typeof this.openPermissionSettingsFn === "function"
+        ? await this.openPermissionSettingsFn(kind)
+        : { ok: false, error: "openPermissionSettingsFn unavailable" };
+    return {
+      ...res,
+      permissions: await this.getPermissionsReport(),
+    };
   }
 
   async #handleSettingsUpdate(data = {}) {

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { installCodexComputerUse } from "./installer-lib.mjs";
+import { probeOrRegisterHelperPermissions, runPermissionGuide } from "./open-permissions.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(__dirname, "..");
@@ -53,13 +55,40 @@ async function main() {
   }
 
   const helperRuntimePath = path.join(result.installDir, "native-runtime", "CUADesktopHelper.app");
+  const helperBinPath = path.join(helperRuntimePath, "Contents", "MacOS", "CUADesktopHelper");
   console.log("\n[系统权限配置清单（系统设置 → 隐私与安全性）]");
-  console.log("  • 辅助功能 (Accessibility)：Antigravity.app（若在 T3 Code 中使用还需勾选 T3 Code (Beta).app / T3 Code.app）+ Open Computer Use.app + CUADesktopHelper.app");
+  console.log("  • 辅助功能 / 设备控制和数据访问 (Accessibility)：Antigravity.app（若在 T3 Code 中使用还需勾选 T3 Code (Beta).app / T3 Code.app）+ Open Computer Use.app + CUADesktopHelper.app");
   console.log("  • 录屏与系统录音 (Screen Recording)：Open Computer Use.app + CUADesktopHelper.app（在 T3 Code 中使用建议同时勾选 T3 Code (Beta).app / T3 Code.app）");
   console.log("  • 输入监控 (Input Monitoring)：CUADesktopHelper.app");
   console.log(`  • CUADesktopHelper 路径（选「+」后按 ⌘⇧G 粘贴）：${helperRuntimePath}`);
   console.log("  * 若新版升级后某项权限开关看似已开但仍提示未授权，请先选中 CUADesktopHelper 点「−」移出后再点「+」重加一次。");
 
+  const openPermissions = process.argv.includes("--open-permissions");
+  if (process.platform === "darwin" && existsSync(helperBinPath)) {
+    if (openPermissions) {
+      await runPermissionGuide({
+        kind: "all",
+        register: true,
+        open: true,
+        helperAppPath: helperRuntimePath,
+      });
+    } else {
+      try {
+        const permStatus = await probeOrRegisterHelperPermissions({
+          helperBinPath,
+          register: false,
+        });
+        if (permStatus.missing.length > 0) {
+          console.log(`\n[提示] CUADesktopHelper 尚有未授权项: ${permStatus.missing.join(", ")}`);
+          console.log("  • 一键登记并跳转系统设置页: npm run permissions:guide");
+        } else {
+          console.log("\n[完成] CUADesktopHelper 三项系统权限均已就绪。");
+        }
+      } catch {}
+    }
+  }
+
+  console.log("  • 可选配置本机固定签名证书（重编 Swift 原生源码不掉授权）: npm run setup:local-cert");
   console.log("\n安装全部完成！现在可以在 Antigravity 对话中直接使用 Computer Use，解压包可随时删除。");
 }
 

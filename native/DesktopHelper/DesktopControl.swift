@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import Darwin
 import Foundation
@@ -312,6 +313,50 @@ final class DesktopHelperController {
           replyOk([
             "kind": kind,
             "granted": granted,
+            "capabilities": self.sensor.flatMap { encodeToJsonObject($0.currentCapabilities()) } ?? [:],
+          ])
+        }
+      } else if kind == "accessibility" {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        let granted = AXIsProcessTrustedWithOptions(opts)
+        if granted {
+          sensor?.refreshTaps()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+          guard let self else { return }
+          replyOk([
+            "kind": kind,
+            "granted": granted,
+            "capabilities": self.sensor.flatMap { encodeToJsonObject($0.currentCapabilities()) } ?? [:],
+          ])
+        }
+      } else if kind == "all" {
+        var axGranted = AXIsProcessTrusted()
+        if !axGranted {
+          let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+          axGranted = AXIsProcessTrustedWithOptions(opts)
+        }
+        var srGranted = CGPreflightScreenCaptureAccess()
+        if !srGranted {
+          srGranted = CGRequestScreenCaptureAccess()
+        }
+        var imGranted = CGPreflightListenEventAccess()
+        if !imGranted {
+          imGranted = CGRequestListenEventAccess()
+        }
+        if imGranted || axGranted {
+          sensor?.refreshTaps()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+          guard let self else { return }
+          replyOk([
+            "kind": kind,
+            "granted": axGranted && srGranted && imGranted,
+            "results": [
+              "accessibility": axGranted,
+              "screenRecording": srGranted,
+              "inputMonitoring": imGranted,
+            ],
             "capabilities": self.sensor.flatMap { encodeToJsonObject($0.currentCapabilities()) } ?? [:],
           ])
         }

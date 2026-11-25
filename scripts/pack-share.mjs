@@ -187,23 +187,53 @@ export function buildShareZip({
     "native-payloads",
   ];
 
-  if (
-    process.platform === "darwin" &&
-    !existsSync(path.join(sourceRoot, "native-payloads", "manifest.json"))
-  ) {
-    const buildNativeScript = path.join(sourceRoot, "scripts", "build-native.mjs");
-    if (existsSync(buildNativeScript)) {
-      execFileSync(process.execPath, [buildNativeScript, "--if-missing"], {
-        cwd: sourceRoot,
-        stdio: "inherit",
-      });
-    }
+  const buildNativeScript = path.join(sourceRoot, "scripts", "build-native.mjs");
+  const sourceManifestPath = path.join(sourceRoot, "native-payloads", "manifest.json");
+  if (process.platform === "darwin" && !existsSync(sourceManifestPath) && existsSync(buildNativeScript)) {
+    execFileSync(process.execPath, [buildNativeScript, "--if-missing"], {
+      cwd: sourceRoot,
+      stdio: "inherit",
+    });
+  }
+
+  let portablePayloadsDir = null;
+  if (process.platform === "darwin" && existsSync(sourceManifestPath) && existsSync(buildNativeScript)) {
+    try {
+      const manifest = JSON.parse(readFileSync(sourceManifestPath, "utf8"));
+      if (manifest?.signingMode === "local_cert") {
+        // Never ship machine-local self-signed bundles in share ZIPs; build portable ad-hoc payloads in temp dir.
+        portablePayloadsDir = path.join(tempBase, "portable-payloads");
+        const portableRuntimeDir = path.join(tempBase, "portable-runtime");
+        execFileSync(
+          process.execPath,
+          [
+            buildNativeScript,
+            "--force",
+            "--identity",
+            "-",
+            "--runtime-dir",
+            portableRuntimeDir,
+            "--payloads-dir",
+            portablePayloadsDir,
+            "--skip-self-check",
+          ],
+          {
+            cwd: sourceRoot,
+            env: { ...process.env, AGY_CUA_ALLOW_AUTO_LOCAL_CERT: "0" },
+            stdio: "inherit",
+          }
+        );
+      }
+    } catch {}
   }
 
   try {
     mkdirSync(bundleFolder, { recursive: true });
     for (const rel of INCLUDE_PATHS) {
-      const src = path.join(sourceRoot, rel);
+      const src =
+        rel === "native-payloads" && portablePayloadsDir
+          ? portablePayloadsDir
+          : path.join(sourceRoot, rel);
       if (!existsSync(src)) continue;
       cpSync(src, path.join(bundleFolder, rel), { recursive: true });
     }

@@ -30,6 +30,8 @@
     "install-agy": "node scripts/install-agy.mjs",
     "uninstall-agy": "node scripts/uninstall-agy.mjs",
     "pack-share": "node scripts/pack-share.mjs",
+    "setup:local-cert": "node scripts/setup-local-codesign-cert.mjs",
+    "permissions:guide": "node scripts/open-permissions.mjs",
     "start:sidecar": "node src/broker-sidecar.mjs",
     "start:mcp": "node src/mcp-server.mjs",
     "start:mcp-js": "node src/mcp-repl-server.mjs"

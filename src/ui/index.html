@@ -996,9 +996,24 @@
         logDrawer.replaceChildren(frag);
       }
 
-      async function requestHelperPermission(kind) {
+      async function requestHelperPermission(kind, { openSettings = true } = {}) {
+        const labels = {
+          accessibility: "辅助功能 / 设备控制",
+          screenRecording: "录屏与系统录音",
+          inputMonitoring: "输入监控",
+          all: "系统隐私权限",
+        };
         try {
-          const res = await apiPost("/api/permissions/request", { kind });
+          let res;
+          try {
+            res = await apiPost("/api/permissions/request", { kind, openSettings });
+          } catch (err) {
+            if (openSettings && kind && kind !== "all") {
+              res = await apiPost("/api/permissions/open-settings", { kind });
+            } else {
+              throw err;
+            }
+          }
           if (res?.permissions) {
             currentState.permissions = {
               platform: res.permissions.platform,
@@ -1016,7 +1031,12 @@
             activeApp: currentState.activeApp,
             streamPaused: currentState.streamPaused,
           });
-          showToast(kind === "inputMonitoring" ? "已请求输入监控授权" : "已请求屏幕录制授权");
+          const openedLabel = res?.openedSettings?.labelZh || labels[kind] || "系统设置";
+          if (res?.openedSettings?.ok) {
+            showToast(`已登记并打开「${openedLabel}」设置页，请在列表中勾选后返回`);
+          } else {
+            showToast(`已请求「${labels[kind] || kind}」授权`);
+          }
         } catch {}
       }
 
@@ -1044,16 +1064,23 @@
             ? !helperCaps.screenRecordingPreflight && !ocuStreamVerified
             : permissions.screenRecording === false && !ocuStreamVerified;
 
-        const missing = [];
-        if (permissions.accessibility === false) missing.push("辅助功能 (Accessibility)");
-        if (effectiveScreenRecordingMissing) missing.push("屏幕录制 (Screen Recording)");
-
+        const needsAccessibility =
+          permissions.accessibility === false ||
+          Boolean(helperAvail && helperCaps && helperCaps.accessibilityTrusted === false);
         const needsInputMonitoring = Boolean(
-          helperAvail && helperCaps && !helperCaps.mouseTapActive && !helperCaps.keyTapActive
+          helperAvail &&
+            helperCaps &&
+            (helperCaps.inputMonitoringPreflight === false ||
+              (!helperCaps.mouseTapActive && !helperCaps.keyTapActive))
         );
         const needsHelperScreenRecording = Boolean(
           helperAvail && helperCaps && helperCaps.screenRecordingPreflight === false
         );
+        const needsScreenRecording = effectiveScreenRecordingMissing || needsHelperScreenRecording;
+
+        const missing = [];
+        if (needsAccessibility) missing.push("辅助功能 / 设备控制 (Accessibility)");
+        if (effectiveScreenRecordingMissing) missing.push("屏幕录制 (Screen Recording)");
 
         if (
           missing.length === 0 &&
@@ -1081,20 +1108,38 @@
         textSpan.textContent = parts.join(" · ");
         frag.appendChild(textSpan);
 
+        const missingCount = [needsAccessibility, needsScreenRecording, needsInputMonitoring].filter(Boolean).length;
+        if (missingCount >= 2) {
+          const btnAll = document.createElement("button");
+          btnAll.className = "perm-btn";
+          btnAll.type = "button";
+          btnAll.textContent = "一键登记并跳转设置";
+          btnAll.addEventListener("click", () => requestHelperPermission("all", { openSettings: true }));
+          frag.appendChild(btnAll);
+        }
+        if (needsAccessibility) {
+          const btnAx = document.createElement("button");
+          btnAx.className = "perm-btn";
+          btnAx.type = "button";
+          btnAx.textContent = "打开辅助功能/设备控制";
+          btnAx.addEventListener("click", () => requestHelperPermission("accessibility", { openSettings: true }));
+          frag.appendChild(btnAx);
+        }
         if (needsInputMonitoring) {
           const btn = document.createElement("button");
           btn.className = "perm-btn";
           btn.type = "button";
           btn.textContent = "开启精准输入接管";
-          btn.addEventListener("click", () => requestHelperPermission("inputMonitoring"));
+          btn.title = "登记输入监控权限并直达系统设置页";
+          btn.addEventListener("click", () => requestHelperPermission("inputMonitoring", { openSettings: true }));
           frag.appendChild(btn);
         }
-        if (needsHelperScreenRecording) {
+        if (needsScreenRecording) {
           const btn = document.createElement("button");
           btn.className = "perm-btn";
           btn.type = "button";
-          btn.textContent = "授权辅助录屏";
-          btn.addEventListener("click", () => requestHelperPermission("screenRecording"));
+          btn.textContent = "打开录屏设置";
+          btn.addEventListener("click", () => requestHelperPermission("screenRecording", { openSettings: true }));
           frag.appendChild(btn);
         }
 

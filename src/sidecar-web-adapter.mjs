@@ -38,6 +38,7 @@ export class SidecarWebAdapter {
     refreshPermissionsQuietly = async () => {},
     getPermissionsReport = null,
     onRequestPermission = async () => ({ ok: false }),
+    onOpenPermissionSettings = async () => ({ ok: false }),
     refreshAppsList = async () => ({ apps: [] }),
     onGetWindows = async () => ({ ok: true, windows: [] }),
     runSerializedAction = async (fn) => fn(),
@@ -63,6 +64,7 @@ export class SidecarWebAdapter {
     this.refreshPermissionsQuietly = refreshPermissionsQuietly;
     this.getPermissionsReport = getPermissionsReport;
     this.onRequestPermission = onRequestPermission;
+    this.onOpenPermissionSettings = onOpenPermissionSettings;
     this.refreshAppsList = refreshAppsList;
     this.onGetWindows = onGetWindows;
     this.runSerializedAction = runSerializedAction;
@@ -706,7 +708,17 @@ export class SidecarWebAdapter {
 
         if (url.pathname === "/api/permissions/request") {
           const kind = String(data.kind || "").trim();
-          const out = await this.onRequestPermission(kind);
+          const out = await this.onRequestPermission(kind, {
+            openSettings: Boolean(data.openSettings),
+          });
+          res.writeHead(out?.ok === false ? 400 : 200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(out));
+          return;
+        }
+
+        if (url.pathname === "/api/permissions/open-settings") {
+          const kind = String(data.kind || "").trim();
+          const out = await this.onOpenPermissionSettings(kind);
           res.writeHead(out?.ok === false ? 400 : 200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(out));
           return;

@@ -97,12 +97,13 @@ bash /path/to/Codex风格ComputerUse一键安装包/双击安装.command
 
 ### 3. 首次授权（系统设置 → 隐私与安全性）
 请按需勾选以下权限（未全部开启时会自动降级至基础模式，推荐一次配齐）：
-1. **辅助功能 (Accessibility)**：`Antigravity.app`（若在 T3 Code 中使用还需勾选 `T3 Code (Beta).app` / `T3 Code.app`）、`Open Computer Use.app`、`~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
+1. **辅助功能 / 设备控制和数据访问 (Accessibility)**：`Antigravity.app`（若在 T3 Code 中使用还需勾选 `T3 Code (Beta).app` / `T3 Code.app`）、`Open Computer Use.app`、`~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`（较新 macOS 版本可能显示为「设备控制和数据访问」）
 2. **录屏与系统录音 (Screen Recording)**：`Open Computer Use.app`、`CUADesktopHelper.app`（在 T3 Code 中使用建议同时勾选 `T3 Code (Beta).app` / `T3 Code.app`，以启用 H.264 实时小窗画面与精准窗口采集）
 3. **输入监控 (Input Monitoring)**：`CUADesktopHelper.app`（启用真人接管自动刹车与全局急停热键）
 
-> 在系统设置权限列表中点击「+」后按 `Command + Shift + G`，粘贴以下路径即可快速选中：  
-> `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
+> **一键登记并跳转设置**：可运行 `npm run permissions:guide`（或安装时附加 `npm run install-agy -- --open-permissions`），也可直接在右侧实时小窗顶部黄色提示条点击**「一键登记并跳转设置」**或各单项直达按钮。  
+> **本机固定签名证书（强烈推荐给开发者）**：若希望日后修改 `native/DesktopHelper/*.swift` 重编也不丢三项授权，可先运行一次 `npm run setup:local-cert` 在钥匙串创建并信任自签名证书 `Codex CUA Local Code Signing`，之后 `npm run build:native` 会自动优先使用该固定证书签名（而 `npm run pack-share` 仍会自动产出可移植的 ad-hoc 分享包）。  
+> 手动添加路径提示：在系统设置权限列表中点击「+」后按 `Command + Shift + G`，粘贴 `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`。
 
 ### 4. 在 Antigravity 对话中使用
 - **打开实时小窗**：AI 在首轮调用 Computer Use 时会在回复中自动附上 `[Computer Use 小窗](sidecar://computer-use-preview/)`，点击即可在 Antigravity 右侧打开实时监控小窗。

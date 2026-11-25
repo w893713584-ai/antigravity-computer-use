@@ -97,11 +97,13 @@ bash /path/to/Codex风格ComputerUse一键安装包/双击安装.command
 
 ### First-Time macOS Permissions (System Settings → Privacy & Security)
 Grant permissions as needed (missing permissions degrade individual features gracefully):
-1. **Accessibility**: `Antigravity.app` (plus `T3 Code (Beta).app` / `T3 Code.app` when running inside T3 Code), `Open Computer Use.app`, `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
+1. **Accessibility / Device Control & Data Access**: `Antigravity.app` (plus `T3 Code (Beta).app` / `T3 Code.app` when running inside T3 Code), `Open Computer Use.app`, `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
 2. **Screen Recording**: `Open Computer Use.app`, `CUADesktopHelper.app` (plus `T3 Code (Beta).app` / `T3 Code.app` when using T3 Code; enables live H.264 streaming and window capture)
 3. **Input Monitoring**: `CUADesktopHelper.app` (enables hardware takeover detection and global emergency hotkey)
 
-> Tip: When clicking `+` in System Settings, press `Command + Shift + G` and paste `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`.
+> **Guided Registration & Deep Links**: Run `npm run permissions:guide` (or `npm run install-agy -- --open-permissions`), or click the **one-click permission buttons** in the live Mini-Window banner to register `CUADesktopHelper.app` and jump straight to each Privacy pane.  
+> **Local Fixed Signing Certificate (Recommended for Developers)**: Run `npm run setup:local-cert` once to create and trust `Codex CUA Local Code Signing` in your login keychain. Subsequent `npm run build:native` builds auto-use it so even Swift source rebuilds keep TCC approvals intact (while `npm run pack-share` still builds a portable ad-hoc share bundle).  
+> Manual tip: When clicking `+` in System Settings, press `Command + Shift + G` and paste `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`.
 
 ### Daily Usage in Antigravity
 - **Open the Live Mini-Window**: On the first Computer Use call in a chat, the reply includes a `[Computer Use 小窗](sidecar://computer-use-preview/)` link — click it to open the live pane beside the conversation.
