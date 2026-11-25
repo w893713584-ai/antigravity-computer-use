@@ -54,7 +54,7 @@
 4. **高性能与低冷启动延迟**：常驻 JXA 热桥消除反复启动 `osascript` 的几十毫秒开销；硬件 H.264 推流降低 CPU 与 IPC 传输负担；深模块设计与注入替身测试支持无 TCC 弹窗的高速单元测试与 CI。
 
 ### 缺点与局限（Cons & Limitations）
-1. **平台与宿主强绑定**：仅支持 **macOS 14.0+（Apple Silicon / Intel Mac）** 及 **Google Antigravity**（依赖 Antigravity MCP 注册与 Aux Pane sidecar URI 机制），不支持 Windows 或 Linux。
+1. **平台与宿主强绑定**：仅支持 **macOS 14.0+（Apple Silicon / Intel Mac）** 及 **Google Antigravity / T3 Code（Antigravity Provider）**，不支持 Windows 或 Linux；在 T3 Code 独立运行（未打开 Antigravity 桌面端）时，实时小窗通过本地 `http://127.0.0.1:<port>/?token=...` 链接在浏览器或预览面板打开。
 2. **高度依赖系统隐私权限且升级需注意 ad-hoc 签名**：完整能力需要分别授予 **辅助功能**、**录屏**、**输入监控** 权限。由于原生助手默认使用本地 ad-hoc 签名，**升级覆盖安装新版后**系统可能沿用旧签名缓存——若授权开关已打开但仍提示缺权限，需在「系统设置 → 隐私与安全性」中先移除再重新添加 `CUADesktopHelper.app`。
 3. **复杂自研界面与全屏应用仍有边界**：部分重度自研渲染软件、全屏独占 Space 应用、游戏或刚新建且尚未建立键盘/鼠标响应链的 Qt/Electron 窗口（如剪映新建编辑页）可能会忽略纯后台事件——此时仍可能需要人工在该窗口轻点一下以激活其内部响应链。
 4. **macOS 系统版本风险与常驻资源开销**：依赖 SkyLight、CGEvent 与 ScreenCaptureKit 等底层接口，未来 macOS 大版本更新可能需要同步适配；常驻 Broker、JXA 桥与硬件视频编码会占用一定的后台内存与电量。
@@ -67,7 +67,7 @@
 ### 1. 环境要求
 - **操作系统**：macOS 14.0 (Sonoma) 或更高版本
 - **Node.js**：>= 18（推荐 Node.js 22）
-- **宿主应用**：Google Antigravity
+- **宿主应用**：Google Antigravity 或 T3 Code（Antigravity Provider）
 - **源码编译额外依赖**：Xcode Command Line Tools（含 `swiftc`、`clang`、`codesign`；若使用一键分享安装包则无需手动编译）
 
 ### 2. 安装与部署
@@ -97,8 +97,8 @@ bash /path/to/Codex风格ComputerUse一键安装包/双击安装.command
 
 ### 3. 首次授权（系统设置 → 隐私与安全性）
 请按需勾选以下权限（未全部开启时会自动降级至基础模式，推荐一次配齐）：
-1. **辅助功能 (Accessibility)**：`Antigravity.app`、`Open Computer Use.app`、`~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
-2. **录屏与系统录音 (Screen Recording)**：`Open Computer Use.app`、`CUADesktopHelper.app`（启用 H.264 实时小窗画面与精准窗口采集）
+1. **辅助功能 (Accessibility)**：`Antigravity.app`（若在 T3 Code 中使用还需勾选 `T3 Code (Beta).app` / `T3 Code.app`）、`Open Computer Use.app`、`~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
+2. **录屏与系统录音 (Screen Recording)**：`Open Computer Use.app`、`CUADesktopHelper.app`（在 T3 Code 中使用建议同时勾选 `T3 Code (Beta).app` / `T3 Code.app`，以启用 H.264 实时小窗画面与精准窗口采集）
 3. **输入监控 (Input Monitoring)**：`CUADesktopHelper.app`（启用真人接管自动刹车与全局急停热键）
 
 > 在系统设置权限列表中点击「+」后按 `Command + Shift + G`，粘贴以下路径即可快速选中：  

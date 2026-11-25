@@ -27,6 +27,14 @@ export const REPL_ALLOWED_OPS = new Set([
 ]);
 
 const REPL_TOOL_NOTE = `\nSide-pane live view: include ${SIDECAR_PILL_MARKDOWN} once in your first reply using Computer Use so the user can open the right-hand live mini-window.`;
+const T3_REPL_TOOL_NOTE =
+  "\nSide-pane live view: include the local HTTP live mini-window link from the first tool result once in your reply.";
+
+const SHARED_REPL_USAGE = `Usage:
+- Bind an app with \`var app = await cua.getApp("Example App")\` (or \`{ initialState: false }\` followed by \`app.query({ text, role })\` or \`app.act({ target, expect })\`).
+- Top-level bindings (\`var\`, \`let\`, \`const\`) and \`session\` persist across \`js\` turns until \`js_reset\` or error abort.
+- For ordinary apps, NEVER invoke AppleScript \`activate\` or \`open -a\` without \`-g\`. Ask the user before destructive or externally visible actions.
+- 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。`;
 
 export const REPL_SERVER_INSTRUCTIONS = `UI automation through a persistent JavaScript REPL using the initialized \`cua\` API — running inside a hardened OS-level Seatbelt + JavaScriptCore sandbox without bringing windows to the front or stealing focus.
 
@@ -34,19 +42,28 @@ Live Side-Pane Mini-Window:
 - Every \`cua\` app interaction automatically streams into the user's right-hand Side-Pane Mini-Window.
 - On the FIRST turn in a conversation where you use Computer Use, include ${SIDECAR_PILL_MARKDOWN} once in your reply so the user can open the live mini-window on the side of the chat.
 
-Usage:
-- Bind an app with \`var app = await cua.getApp("Example App")\` (or \`{ initialState: false }\` followed by \`app.query({ text, role })\` or \`app.act({ target, expect })\`).
-- Top-level bindings (\`var\`, \`let\`, \`const\`) and \`session\` persist across \`js\` turns until \`js_reset\` or error abort.
-- For ordinary apps, NEVER invoke AppleScript \`activate\` or \`open -a\` without \`-g\`. Ask the user before destructive or externally visible actions.
-- 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。`;
+${SHARED_REPL_USAGE}`;
 
-export function getReplToolDefinitions() {
+export const T3_REPL_SERVER_INSTRUCTIONS = `UI automation through a persistent JavaScript REPL using the initialized \`cua\` API — running inside a hardened OS-level Seatbelt + JavaScriptCore sandbox without bringing windows to the front or stealing focus.
+
+Live Side-Pane Mini-Window:
+- Every \`cua\` app interaction automatically streams into the local live mini-window HTTP server.
+- On the FIRST turn in a conversation where you use Computer Use, include the local HTTP live mini-window link from the tool output once in your reply (do not emit \`sidecar://\` links in T3 Code).
+
+${SHARED_REPL_USAGE}`;
+
+export function getReplServerInstructions({ host = "antigravity" } = {}) {
+  return host === "t3" ? T3_REPL_SERVER_INSTRUCTIONS : REPL_SERVER_INSTRUCTIONS;
+}
+
+export function getReplToolDefinitions({ host = "antigravity" } = {}) {
   const annotations = { destructiveHint: false, openWorldHint: false };
+  const note = host === "t3" ? T3_REPL_TOOL_NOTE : REPL_TOOL_NOTE;
   return [
     {
       name: "js",
       description:
-        `Run JavaScript in a sandboxed persistent Computer Use REPL with top-level await and the initialized \`cua\` API. Top-level var/let/const bindings and \`session\` persist across calls until \`js_reset\`. Supports \`app.query\`, \`app.act\`, \`app.getAXState\`, \`app.getScreenshot\` (Uint8Array), \`app.click\`, \`app.typeText\`, \`app.pressKey\`, \`app.scroll\`, \`app.setValue\`, \`app.selectText\`, \`app.drag\`, \`app.performSecondaryAction\`, plus \`nodeRepl.write\` / \`nodeRepl.emitImage\`.${REPL_TOOL_NOTE}`,
+        `Run JavaScript in a sandboxed persistent Computer Use REPL with top-level await and the initialized \`cua\` API. Top-level var/let/const bindings and \`session\` persist across calls until \`js_reset\`. Supports \`app.query\`, \`app.act\`, \`app.getAXState\`, \`app.getScreenshot\` (Uint8Array), \`app.click\`, \`app.typeText\`, \`app.pressKey\`, \`app.scroll\`, \`app.setValue\`, \`app.selectText\`, \`app.drag\`, \`app.performSecondaryAction\`, plus \`nodeRepl.write\` / \`nodeRepl.emitImage\`.${note}`,
       annotations,
       inputSchema: {
         type: "object",

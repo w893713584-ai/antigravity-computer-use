@@ -18,12 +18,20 @@ function normalizeSemanticFingerprintText(textStr) {
   return textStr;
 }
 
+function toStrictFiniteNumber(val) {
+  if (val === null || val === undefined || val === "" || typeof val === "boolean") {
+    return NaN;
+  }
+  const n = Number(val);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 export function normalizeElementBounds(raw) {
   if (!raw || typeof raw !== "object") return null;
-  const x = Number(raw.x);
-  const y = Number(raw.y);
-  const w = Number(raw.w ?? raw.width);
-  const h = Number(raw.h ?? raw.height);
+  const x = toStrictFiniteNumber(raw.x);
+  const y = toStrictFiniteNumber(raw.y);
+  const w = toStrictFiniteNumber(raw.w ?? raw.width);
+  const h = toStrictFiniteNumber(raw.h ?? raw.height);
   if (!Number.isFinite(x) || !Number.isFinite(y) || !(w > 0) || !(h > 0)) {
     return null;
   }
@@ -317,6 +325,7 @@ export function evaluateScreenshotMetaProof(
 export function buildElementDescriptor({
   index,
   role,
+  subrole = null,
   primaryText = "",
   identifier = null,
   help = null,
@@ -331,7 +340,7 @@ export function buildElementDescriptor({
   const indexStr = String(index);
   const roleStr = String(role || "控件");
   const cleanId = identifier ? String(identifier).trim() || null : null;
-  const isSecure = isSecureTextRole(roleStr);
+  const isSecure = isSecureTextRole(roleStr) || isSecureTextRole(subrole);
   const cleanHelp = !(isSecure && redactHelp) && help ? String(help).trim() || null : null;
   const actions = Array.isArray(secondaryActions)
     ? secondaryActions.map((s) => String(s).trim()).filter(Boolean)
@@ -493,6 +502,10 @@ export class AppSnapshotRegistry {
         : identityChanged || !captureMatchesPrev
           ? null
           : prev.lastImageDigest || null;
+    if (pidChanged && prev?.pid > 0) {
+      this.#manualAxWokenByPid.delete(prev.pid);
+      void this.#axBridge?.dropSnapshots?.({ pid: prev.pid });
+    }
     if (identityChanged) {
       elements = new Map();
       elementsPartial = false;
@@ -589,6 +602,9 @@ export class AppSnapshotRegistry {
       });
       if (snap) {
         snapshotId = snap.id;
+        if (!identityChanged && (meta.elementsPartial || source === "query") && snap.elements instanceof Map) {
+          elements = new Map(snap.elements);
+        }
         this.#onSnapshotIssued?.(snap);
       }
     } else if (fromActionPeer && !includeAx) {
@@ -694,6 +710,15 @@ export class AppSnapshotRegistry {
       this.#manualAxWokenByPid.delete(meta.pid);
       void this.#axBridge?.dropSnapshots?.({ pid: meta.pid });
     }
+    for (const [normKey, entry] of Array.from(this.#cache.entries())) {
+      if (
+        (meta && entry === meta) ||
+        (meta?.bundleId && entry?.bundleId && entry.bundleId === meta.bundleId)
+      ) {
+        this.#cache.delete(normKey);
+        this.#ledger.clearApp(normKey);
+      }
+    }
     for (const key of [appQuery, meta?.bundleId, meta?.appDisplayName]) {
       const norm = normalizeMetaKey(key);
       if (norm) {
@@ -717,10 +742,6 @@ export class AppSnapshotRegistry {
     const prevToken = this.#manualAxWokenByPid.get(pid);
     if (prevToken) {
       if (!processToken || prevToken === processToken) {
-        return { supported: true, changed: false, enabled: true };
-      }
-      if (prevToken === "pid-only") {
-        this.#manualAxWokenByPid.set(pid, processToken);
         return { supported: true, changed: false, enabled: true };
       }
     }
@@ -757,6 +778,7 @@ export class AppSnapshotRegistry {
         this.#axBridge.bindSnapshot({
           snapshotId: merged.snapshotId,
           pid: merged.pid,
+          wid: merged.windowId || null,
           windowTitle: merged.windowTitle,
           elements: merged.elements,
         })
@@ -796,6 +818,7 @@ export class AppSnapshotRegistry {
           const desc = buildElementDescriptor({
             index: m.index,
             role: m.role || "控件",
+            subrole: m.subrole || null,
             primaryText,
             identifier: m.identifier || null,
             help: m.help || null,
@@ -848,6 +871,29 @@ export class AppSnapshotRegistry {
             () => null
           )
         : null;
+
+    if (currentMeta?.pid > 0 && typeof this.#processIdentityFn === "function") {
+      const expectedSnap = parsedRef?.snapshotId
+        ? this.#ledger.getSnapshot(parsedRef.snapshotId)
+        : this.#ledger.getLatest(currentMeta.bundleId || app);
+      const expectedToken = currentMeta.processToken || expectedSnap?.processToken || null;
+      const processExitedAfterCapture =
+        liveProc?.alive === false ||
+        Boolean(expectedToken && (!liveProc || !liveProc.processToken));
+      if (processExitedAfterCapture) {
+        const appKeyForStale = currentMeta.bundleId || app;
+        this.#ledger.markAppStale(appKeyForStale, "process_restarted");
+        return {
+          ok: false,
+          stage: "ledger",
+          errorCode: "STALE_REF",
+          reason: "process_restarted",
+          message: `Target process (PID ${currentMeta.pid}) exited or restarted since snapshot capture; call get_app_state before retrying.`,
+          currentSnapshotId: null,
+          currentMeta,
+        };
+      }
+    }
 
     const refCheck = this.#ledger.validateRef({
       appKey: app,
@@ -930,6 +976,7 @@ export class AppSnapshotRegistry {
           .bindSnapshot({
             snapshotId: validatedSnapshot.id,
             pid: validatedSnapshot.pid || currentMeta.pid,
+            wid: validatedSnapshot.windowId || currentMeta?.windowId || null,
             windowTitle: validatedSnapshot.windowTitle,
             elements: targetElements,
           })
@@ -1015,7 +1062,19 @@ export class AppSnapshotRegistry {
           if (!refreshRes?.isError) {
             const refreshedMeta = this.getMeta(app);
             const refreshedEl = refreshedMeta?.elements?.get(parsedRef.rawIndex) || null;
+            const prevPid = validatedSnapshot?.pid || currentMeta?.pid || null;
+            const prevToken = validatedSnapshot?.processToken || currentMeta?.processToken || null;
+            const prevWid = validatedSnapshot?.windowId || currentMeta?.windowId || null;
+            const prevTitle = validatedSnapshot?.windowTitle || currentMeta?.windowTitle || null;
+            const sameIdentity = Boolean(
+              refreshedMeta &&
+                (!prevPid || refreshedMeta.pid === prevPid) &&
+                (!prevToken || !refreshedMeta.processToken || refreshedMeta.processToken === prevToken) &&
+                (!(prevWid > 0) || refreshedMeta.windowId === prevWid) &&
+                (!prevTitle || refreshedMeta.windowTitle === prevTitle)
+            );
             if (
+              sameIdentity &&
               refreshedEl &&
               validatedElement?.fingerprint &&
               refreshedEl.fingerprint === validatedElement.fingerprint
@@ -1060,13 +1119,11 @@ export class AppSnapshotRegistry {
 
   resolveActionWindowPoint(app, args = {}, element = null) {
     const meta = this.getMeta(app);
-    if (
-      args?.windowPointPt &&
-      Number.isFinite(Number(args.windowPointPt.x)) &&
-      Number.isFinite(Number(args.windowPointPt.y))
-    ) {
+    const ptX = toStrictFiniteNumber(args?.windowPointPt?.x);
+    const ptY = toStrictFiniteNumber(args?.windowPointPt?.y);
+    if (args?.windowPointPt && Number.isFinite(ptX) && Number.isFinite(ptY)) {
       return {
-        windowPointPt: { x: Number(args.windowPointPt.x), y: Number(args.windowPointPt.y) },
+        windowPointPt: { x: ptX, y: ptY },
         windowId: Number(args.windowId) > 0 ? Number(args.windowId) : meta?.windowId || null,
       };
     }
@@ -1078,8 +1135,8 @@ export class AppSnapshotRegistry {
       };
     }
     const winBounds = normalizeElementBounds(meta?.actionScreenshotMeta?.windowBounds || meta?.windowBounds);
-    const px = Number(args?.x ?? args?.to_x);
-    const py = Number(args?.y ?? args?.to_y);
+    const px = toStrictFiniteNumber(args?.x ?? args?.to_x);
+    const py = toStrictFiniteNumber(args?.y ?? args?.to_y);
     const fw = meta?.actionScreenshotMeta?.width || meta?.actionFrameWidth || 0;
     const fh = meta?.actionScreenshotMeta?.height || meta?.actionFrameHeight || 0;
     if (winBounds && Number.isFinite(px) && Number.isFinite(py) && fw > 0 && fh > 0) {

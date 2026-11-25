@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -110,6 +111,7 @@ export const BROKER_STATE_DIR = path.join(HOME, ".config", "ocu");
 export const BROKER_SOCKET_PATH =
   process.env.AGY_CUA_BROKER_SOCK || path.join(BROKER_STATE_DIR, "agy-cua.sock");
 export const BROKER_INFO_PATH = path.join(BROKER_STATE_DIR, "agy-cua-sidecar.json");
+export const BROKER_SPAWN_LOCK_PATH = path.join(BROKER_STATE_DIR, "agy-cua-spawn.lock");
 
 export const NATIVE_RUNTIME_DIR = path.join(PROJECT_ROOT, "native-runtime");
 export const NATIVE_PAYLOADS_DIR = path.join(PROJECT_ROOT, "native-payloads");
@@ -153,6 +155,100 @@ export const EMERGENCY_HOTKEY =
 export const SIDECAR_ID = "computer-use-preview";
 export const SIDECAR_PILL_MARKDOWN = `[Computer Use 小窗](sidecar://${SIDECAR_ID}/)`;
 
+let cachedDarwinShortTmpDir = null;
+
+function isShortSafeTmpDir(dirPath) {
+  if (typeof dirPath !== "string" || !dirPath.trim()) return false;
+  if (dirPath.includes("/.t3/")) return false;
+  try {
+    const resolved = path.resolve(dirPath.trim());
+    return Buffer.byteLength(resolved, "utf8") <= 56 && existsSync(resolved);
+  } catch {
+    return false;
+  }
+}
+
+export function resolveSafeSystemTmpDir(rawEnv = process.env) {
+  const candidate = rawEnv?.TMPDIR;
+  if (process.platform !== "darwin") {
+    return typeof candidate === "string" && candidate.trim() ? candidate.trim() : "/tmp";
+  }
+  if (isShortSafeTmpDir(candidate)) {
+    return path.resolve(candidate.trim());
+  }
+  if (!cachedDarwinShortTmpDir || !existsSync(cachedDarwinShortTmpDir)) {
+    let resolved = "/tmp";
+    try {
+      const darwinTmp = execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], {
+        encoding: "utf8",
+        timeout: 1000,
+      }).trim();
+      if (isShortSafeTmpDir(darwinTmp)) {
+        resolved = path.resolve(darwinTmp);
+      }
+    } catch {}
+    cachedDarwinShortTmpDir = resolved;
+  }
+  return cachedDarwinShortTmpDir;
+}
+
+export function sanitizeHostEnv(rawEnv = process.env) {
+  const clean = {};
+  for (const [k, v] of Object.entries(rawEnv || {})) {
+    if (
+      k === "ELECTRON_RUN_AS_NODE" ||
+      k === "GEMINI_HOME" ||
+      k === "AGY_ACP_FORCE_FILE_STORAGE" ||
+      /^AGY_(ACP|CLI)_/u.test(k)
+    ) {
+      continue;
+    }
+    if (v !== undefined) {
+      clean[k] = v;
+    }
+  }
+  clean.TMPDIR = resolveSafeSystemTmpDir(rawEnv);
+  return clean;
+}
+
+export function detectMcpHost(env = process.env, clientInfo = null) {
+  const explicit = String(env?.AGY_CUA_HOST || "").trim().toLowerCase();
+  if (explicit === "t3" || explicit === "antigravity") {
+    return explicit;
+  }
+  const clientName = String(clientInfo?.name || "").trim().toLowerCase();
+  if (clientName.includes("t3")) {
+    return "t3";
+  }
+  if (!env?.NODE_TEST_CONTEXT && !env?.AGY_CUA_BROKER_SOCK) {
+    if (
+      String(env?.GEMINI_HOME || "").includes("/.t3/") ||
+      String(env?.XPC_SERVICE_NAME || "").startsWith("application.com.t3tools.") ||
+      Boolean(
+        env?.T3CODE_THREAD_ID || env?.T3CODE_DESKTOP_HOST_SCOPE || env?.T3_ACP_MCP_ENDPOINT
+      )
+    ) {
+      return "t3";
+    }
+  }
+  return "antigravity";
+}
+
+export function formatT3LiveViewUrl(webPort, uiToken = "") {
+  const port = Number(webPort || 0);
+  if (!(port > 0)) return "";
+  const tokenParam = uiToken ? `?token=${encodeURIComponent(String(uiToken))}` : "";
+  return `http://127.0.0.1:${port}/${tokenParam}`;
+}
+
+export function buildT3OneTimePillHint(webPort, uiToken = "") {
+  const url = formatT3LiveViewUrl(webPort, uiToken);
+  if (url) {
+    return `[Side-pane live view: in T3 Code, include [Computer Use 实时小窗](${url}) once in your reply so the user can open the live mini-window in preview or browser.]`;
+  }
+  return "[Side-pane live view: running in T3 Code background mode without stealing window focus.]";
+}
+
 export const MAX_LINE_BUFFER_BYTES = 32 * 1024 * 1024;
 export const MAX_HTTP_BODY_BYTES = 1024 * 1024;
 
@@ -167,7 +263,7 @@ export function isMainModule(importMetaUrl) {
 
 export function buildNativeEnv(overrides = {}) {
   return {
-    ...process.env,
+    ...sanitizeHostEnv(process.env),
     // Hide floating desktop cursor: cursor renders inside the side-pane mini-window instead.
     OPEN_COMPUTER_USE_VISUAL_CURSOR: "0",
     // Keep windows in-place on desktop behind active windows (Codex unlocked desktop behavior).

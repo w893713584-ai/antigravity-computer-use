@@ -275,7 +275,12 @@ export class AtomicActExecutor {
       pid = meta?.pid || pid || null;
     }
 
-    if (pid > 0 && typeof axBridge?.resolveActionTarget === "function" && !meta?.windowBounds) {
+    if (
+      pid > 0 &&
+      typeof axBridge?.resolveActionTarget === "function" &&
+      (!meta?.windowBounds ||
+        (Number(explicitWindowId) > 0 && meta?.windowId !== Number(explicitWindowId)))
+    ) {
       const resolvedWin = await axBridge
         .resolveActionTarget(pid, {
           wid: explicitWindowId || meta?.tinyWindowOverride?.wid || meta?.windowId || null,
@@ -326,6 +331,8 @@ export class AtomicActExecutor {
       windowId,
       focusScope,
       operation = null,
+      signal = null,
+      deadlineAt = 0,
       remainingBudgetMs = 4000,
     }
   ) {
@@ -340,10 +347,12 @@ export class AtomicActExecutor {
       limit: 25,
     };
 
+    const currentBudget = () =>
+      deadlineAt > 0 ? Math.max(50, deadlineAt - Date.now()) : remainingBudgetMs;
     let queryPeerInstanceId = null;
     const callQuery = async (extra = {}) => {
       const qArgs = { ...baseQueryArgs, ...extra };
-      const callTimeout = Math.max(50, Math.min(8000, remainingBudgetMs));
+      const callTimeout = Math.max(50, Math.min(8000, currentBudget()));
       if (operation?.isAi) {
         this.takeoverController.assertMayDispatch(operation, { isRead: true });
       }
@@ -412,7 +421,12 @@ export class AtomicActExecutor {
     };
 
     let evaluated = filterAndDedupe(processed);
-    if (processed.parsed?.truncated === true && evaluated.deduped.length <= 1 && remainingBudgetMs > 120) {
+    if (
+      processed.parsed?.truncated === true &&
+      evaluated.deduped.length <= 1 &&
+      !signal?.aborted &&
+      currentBudget() > 120
+    ) {
       processed = await callQuery({ max_nodes: 2500, limit: 50 });
       evaluated = filterAndDedupe(processed);
     }
@@ -609,6 +623,7 @@ export class AtomicActExecutor {
           return "inconclusive";
         }
         if (signal?.aborted || Date.now() > deadlineAt) return "inconclusive";
+        const queryLim = wantWid > 0 ? 25 : 5;
         const qRes = await actionPeer
           .callTool(
             "query",
@@ -616,7 +631,7 @@ export class AtomicActExecutor {
               app,
               text: term,
               ...(wantWid > 0 ? { window_id: wantWid } : {}),
-              limit: 5,
+              limit: queryLim,
             },
             rem()
           )
@@ -650,7 +665,9 @@ export class AtomicActExecutor {
             return true;
           });
           if (matched) return "present";
-          if (parsed?.truncated === true) return "inconclusive";
+          if (parsed?.truncated === true || (wantWid > 0 && matches.length >= queryLim)) {
+            return "inconclusive";
+          }
           return "absent";
         } catch {
           return "inconclusive";
@@ -659,7 +676,10 @@ export class AtomicActExecutor {
 
       const normalizeList = (v) =>
         Array.isArray(v)
-          ? v.map((s) => String(s || "").trim()).filter(Boolean)
+          ? v
+              .filter((s) => typeof s === "string")
+              .map((s) => s.trim())
+              .filter(Boolean)
           : typeof v === "string" && v.trim()
             ? [v.trim()]
             : [];
@@ -668,6 +688,18 @@ export class AtomicActExecutor {
       const allTerms = normalizeList(expectSpec.all_text);
       const anyTerms = normalizeList(expectSpec.any_text);
       const vanishTerms = normalizeList(expectSpec.text_disappears);
+      if (
+        titleTerms.length === 0 &&
+        allTerms.length === 0 &&
+        anyTerms.length === 0 &&
+        vanishTerms.length === 0
+      ) {
+        return {
+          matched: false,
+          windowTitle: winTitle || null,
+          image,
+        };
+      }
 
       if (wantWid > 0 && titleTerms.length > 0 && !winTitle && pid > 0 && typeof axBridge?.resolveActionTarget === "function") {
         const resolvedWin = await axBridge.resolveActionTarget(pid, { wid: wantWid }).catch(() => null);
@@ -754,23 +786,45 @@ export class AtomicActExecutor {
     const hasQuerySelector = Boolean(
       rawTarget && (String(rawTarget.text || "").trim() || String(rawTarget.role || "").trim())
     );
+    const parseExpectField = (v) => {
+      if (v === undefined || v === null) return { valid: true, terms: [] };
+      if (typeof v === "string") {
+        const t = v.trim();
+        return { valid: true, terms: t ? [t] : [] };
+      }
+      if (Array.isArray(v) && v.every((item) => typeof item === "string")) {
+        return { valid: true, terms: v.map((s) => s.trim()).filter(Boolean) };
+      }
+      return { valid: false, terms: [] };
+    };
+    const expAny = expectSpec ? parseExpectField(expectSpec.any_text) : { valid: false, terms: [] };
+    const expAll = expectSpec ? parseExpectField(expectSpec.all_text) : { valid: false, terms: [] };
+    const expVanish = expectSpec ? parseExpectField(expectSpec.text_disappears) : { valid: false, terms: [] };
+    const expTitle = expectSpec ? parseExpectField(expectSpec.window_title_contains) : { valid: false, terms: [] };
     const hasExpectClause = Boolean(
       expectSpec &&
-        ((Array.isArray(expectSpec.any_text) && expectSpec.any_text.some((s) => String(s || "").trim())) ||
-          (Array.isArray(expectSpec.all_text) && expectSpec.all_text.some((s) => String(s || "").trim())) ||
-          (Array.isArray(expectSpec.text_disappears) &&
-            expectSpec.text_disappears.some((s) => String(s || "").trim())) ||
-          String(expectSpec.window_title_contains || "").trim())
+        expAny.valid &&
+        expAll.valid &&
+        expVanish.valid &&
+        expTitle.valid &&
+        expAny.terms.length + expAll.terms.length + expVanish.terms.length + expTitle.terms.length > 0
     );
+    const hasExplicitWindowId = args?.window_id !== undefined && args?.window_id !== null;
+    const validExplicitWindowId =
+      !hasExplicitWindowId ||
+      (typeof args.window_id !== "boolean" &&
+        args.window_id !== "" &&
+        Number.isSafeInteger(Number(args.window_id)) &&
+        Number(args.window_id) > 0);
     const mouseButton = String(args?.mouse_button ?? "left").toLowerCase();
     const validButton = ["left", "right", "middle"].includes(mouseButton);
-    if (!app || !hasQuerySelector || !hasExpectClause || !validButton) {
+    if (!app || !hasQuerySelector || !hasExpectClause || !validButton || !validExplicitWindowId) {
       return this.#buildToolResult({
         isError: true,
         status: "invalid_args",
         code: "INVALID_ACT_ARGS",
         message:
-          "act requires valid `app`, `target` (`text` and/or `role`), `expect`, and `mouse_button` (left|right|middle).",
+          "act requires valid `app`, `target` (`text` and/or `role`), non-empty `expect`, optional positive integer `window_id`, and `mouse_button` (left|right|middle).",
       });
     }
 
@@ -795,7 +849,7 @@ export class AtomicActExecutor {
     const clickCount = Number.isFinite(parsedClicks)
       ? Math.max(1, Math.min(3, Math.round(parsedClicks)))
       : 1;
-    const callerExplicitWindowId = Number(args?.window_id) > 0 ? Number(args.window_id) : null;
+    const callerExplicitWindowId = hasExplicitWindowId ? Number(args.window_id) : null;
     const parsedTimeout = Number(args?.timeout_ms);
     const timeoutMs = Number.isFinite(parsedTimeout)
       ? Math.max(40, Math.min(25_000, parsedTimeout))
@@ -918,6 +972,8 @@ export class AtomicActExecutor {
           windowId: selectedWindowId,
           focusScope,
           operation,
+          signal: effectiveSignal,
+          deadlineAt,
           remainingBudgetMs: Math.max(50, deadlineAt - Date.now()),
         });
         if (qOut.windowId) {
@@ -950,7 +1006,28 @@ export class AtomicActExecutor {
           const candidate = qOut.deduped[0];
           const candBounds = normalizeElementBounds(candidate?.bounds || candidate?.frame);
           const snapMeta = this.registry.getMeta(app);
-          const logicalWin = normalizeElementBounds(snapMeta?.windowBounds || snapMeta?.tinyWindowOverride?.bounds);
+          const candidateWid =
+            Number(candidate.window_id) > 0
+              ? Number(candidate.window_id)
+              : qOut.windowId || selectedWindowId || null;
+          let logicalWin =
+            !(candidateWid > 0 && snapMeta?.windowId > 0 && snapMeta.windowId !== candidateWid)
+              ? normalizeElementBounds(snapMeta?.windowBounds || snapMeta?.tinyWindowOverride?.bounds)
+              : null;
+          if (candBounds && !logicalWin && pid > 0) {
+            const axBridge = this.getAxBridge?.();
+            if (typeof axBridge?.resolveActionTarget === "function") {
+              const resolvedWin = await axBridge
+                .resolveActionTarget(pid, {
+                  wid: candidateWid,
+                  windowTitle: qOut.windowTitle || snapMeta?.windowTitle || "",
+                })
+                .catch(() => null);
+              if (resolvedWin?.windowBounds) {
+                logicalWin = normalizeElementBounds(resolvedWin.windowBounds);
+              }
+            }
+          }
           const offscreen =
             candBounds &&
             logicalWin &&

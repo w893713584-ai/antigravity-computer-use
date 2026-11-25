@@ -1070,7 +1070,7 @@
         const textSpan = document.createElement("span");
         const parts = [];
         if (missing.length > 0) {
-          parts.push(`⚠ 缺少 macOS 权限：${missing.join("、")}（请在「系统设置 → 隐私与安全性」授权）`);
+          parts.push(`⚠ 缺少 macOS 权限：${missing.join("、")}（请在「系统设置 → 隐私与安全性」为 Antigravity / T3 Code 与辅助组件授权）`);
         }
         if (helperReconnecting) {
           parts.push("桌面辅助进程正在重连…");
@@ -1145,7 +1145,10 @@
         const prevTargetKey = currentState.targetKey || "";
         const nextTargetKey =
           state.targetKey !== undefined ? (state.targetKey || "") : prevTargetKey;
-        if (prevAppIdentity !== nextAppIdentity || (prevTargetKey && nextTargetKey && prevTargetKey !== nextTargetKey)) {
+        if (
+          prevAppIdentity !== nextAppIdentity ||
+          (prevTargetKey !== nextTargetKey && (prevTargetKey || nextTargetKey))
+        ) {
           clearDisplayedCanvas();
           bumpViewGeneration();
         }

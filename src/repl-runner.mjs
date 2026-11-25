@@ -146,11 +146,31 @@ export class StrictReplSessionManager {
     this.#activeRunCount = Math.max(0, this.#activeRunCount - 1);
   }
 
-  getToolDefinitions() {
-    return { tools: getReplToolDefinitions() };
+  getToolDefinitions({ host = "antigravity" } = {}) {
+    return { tools: getReplToolDefinitions({ host }) };
+  }
+
+  #pruneDisconnectedSessions() {
+    const now = Date.now();
+    const IDLE_TTL_MS = 30 * 60 * 1000;
+    for (const [id, s] of this.#sessions.entries()) {
+      if (!s.activeChild && !s.activeAbortController && now - (s.lastUsedAt || 0) > IDLE_TTL_MS) {
+        this.#wipeSessionState(s);
+        this.#sessions.delete(id);
+      }
+    }
+    while (this.#sessions.size > 16) {
+      const oldestEntry = Array.from(this.#sessions.entries()).find(
+        ([, s]) => !s.activeChild && !s.activeAbortController
+      );
+      if (!oldestEntry) break;
+      this.#wipeSessionState(oldestEntry[1]);
+      this.#sessions.delete(oldestEntry[0]);
+    }
   }
 
   #getOrCreateSession(sessionId) {
+    this.#pruneDisconnectedSessions();
     const key = String(sessionId || "default");
     let s = this.#sessions.get(key);
     if (!s) {
@@ -163,9 +183,12 @@ export class StrictReplSessionManager {
         docsEmitted: false,
         activeAbortController: null,
         activeChild: null,
+        lastUsedAt: Date.now(),
         queue: Promise.resolve(),
       };
       this.#sessions.set(key, s);
+    } else {
+      s.lastUsedAt = Date.now();
     }
     return s;
   }
@@ -248,6 +271,22 @@ export class StrictReplSessionManager {
     return task;
   }
 
+  async disconnectClientSession(sessionId) {
+    const key = String(sessionId || "");
+    const session = this.#sessions.get(key);
+    if (!session) return;
+    session.lastUsedAt = Date.now();
+    if (session.activeAbortController && !session.activeAbortController.signal.aborted) {
+      session.activeAbortController.abort(new Error("socket_disconnected"));
+    }
+    if (session.activeChild && session.activeChild.exitCode === null) {
+      try {
+        session.activeChild.kill("SIGKILL");
+      } catch {}
+    }
+    this.#pruneDisconnectedSessions();
+  }
+
   async closeSession(sessionId) {
     const key = String(sessionId || "");
     const session = this.#sessions.get(key);
@@ -312,8 +351,23 @@ export class StrictReplSessionManager {
       };
     }
 
+    const runAbort = new AbortController();
+    const onExternalAbort = () => {
+      if (!runAbort.signal.aborted) {
+        runAbort.abort(signal?.reason || new Error("CANCELLED"));
+      }
+    };
+    if (signal?.aborted) {
+      runAbort.abort(signal?.reason || new Error("CANCELLED"));
+    } else {
+      signal?.addEventListener("abort", onExternalAbort, { once: true });
+    }
+    session.activeAbortController = runAbort;
+
     const runnerCheck = await this.#ensureVerifiedRunnerBinary();
     if (!runnerCheck.ok) {
+      signal?.removeEventListener("abort", onExternalAbort);
+      if (session.activeAbortController === runAbort) session.activeAbortController = null;
       this.#wipeSessionState(session);
       return {
         isError: true,
@@ -326,7 +380,9 @@ export class StrictReplSessionManager {
       };
     }
 
-    if (signal?.aborted) {
+    if (signal?.aborted || runAbort.signal.aborted) {
+      signal?.removeEventListener("abort", onExternalAbort);
+      if (session.activeAbortController === runAbort) session.activeAbortController = null;
       this.#wipeSessionState(session);
       return {
         isError: true,
@@ -340,14 +396,6 @@ export class StrictReplSessionManager {
         ? Math.min(reqTimeout, MAX_REPL_TIMEOUT_MS)
         : DEFAULT_REPL_TIMEOUT_MS;
 
-    const runAbort = new AbortController();
-    const onExternalAbort = () => {
-      if (!runAbort.signal.aborted) {
-        runAbort.abort(signal?.reason || new Error("CANCELLED"));
-      }
-    };
-    signal?.addEventListener("abort", onExternalAbort, { once: true });
-
     let operation;
     try {
       operation = this.#broker.takeoverController.admit({
@@ -360,6 +408,7 @@ export class StrictReplSessionManager {
       operation.isRepl = true;
     } catch (err) {
       signal?.removeEventListener("abort", onExternalAbort);
+      if (session.activeAbortController === runAbort) session.activeAbortController = null;
       if (isTakeoverAbortedError(err)) {
         return {
           isError: true,
@@ -368,8 +417,6 @@ export class StrictReplSessionManager {
       }
       throw err;
     }
-
-    session.activeAbortController = runAbort;
     const runId = `r-${crypto.randomBytes(6).toString("hex")}`;
     const collectedContent = [];
     const pendingHandles = new Map();
@@ -834,13 +881,24 @@ export class StrictReplSessionManager {
             if (msg.runId && msg.runId !== runId) continue;
 
             if (msg.type === "out" && msg.item) {
-              if (msg.item?._meta?.id === "cua.core") {
+              const isCoreDocs = msg.item?._meta?.id === "cua.core";
+              if (isCoreDocs) {
                 if (session.docsEmitted || runEmittedDocs) continue;
                 runEmittedDocs = true;
               }
               if (collectedContent.length < 256) {
                 if (msg.item.type === "text") {
-                  collectedContent.push({ type: "text", text: String(msg.item.text ?? "") });
+                  let textVal = String(msg.item.text ?? "");
+                  if (isCoreDocs && params?.host === "t3") {
+                    const replacement = params?.t3LiveUrl
+                      ? `[Computer Use 实时小窗](${params.t3LiveUrl})`
+                      : "the local HTTP live mini-window link";
+                    textVal = textVal.replace(
+                      "`[Computer Use 小窗](sidecar://computer-use-preview/)`",
+                      replacement
+                    );
+                  }
+                  collectedContent.push({ type: "text", text: textVal });
                 } else if (msg.item.type === "image") {
                   collectedContent.push({
                     type: "image",
@@ -971,6 +1029,11 @@ export class StrictReplSessionManager {
             session.session = committed.session;
             for (const [k, v] of pendingHandles) {
               session.appHandles.set(k, v);
+            }
+            while (session.appHandles.size > 64) {
+              const oldestKey = session.appHandles.keys().next().value;
+              if (oldestKey === undefined) break;
+              session.appHandles.delete(oldestKey);
             }
             if (runEmittedDocs) {
               session.docsEmitted = true;

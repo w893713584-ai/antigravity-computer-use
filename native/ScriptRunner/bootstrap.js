@@ -552,12 +552,15 @@
       },
 
       async selectText(elementIndex, text, options = {}) {
-        const index =
-          typeof elementIndex === "string" && /^(0|[1-9]\d*)$/u.test(elementIndex)
+        const isQualifiedRef =
+          typeof elementIndex === "string" && /^@s\d+:(0|[1-9]\d*)$/iu.test(elementIndex.trim());
+        const normalizedRef = isQualifiedRef
+          ? elementIndex.trim()
+          : typeof elementIndex === "string" && /^(0|[1-9]\d*)$/u.test(elementIndex)
             ? Number(elementIndex)
             : elementIndex;
-        if (!Number.isSafeInteger(index) || index < 0) {
-          throw new Error("selectText requires a non-negative integer element index");
+        if (!isQualifiedRef && (!Number.isSafeInteger(normalizedRef) || normalizedRef < 0)) {
+          throw new Error("selectText requires a non-negative integer element index or @sN:index ref");
         }
         if (typeof text !== "string" || !text.length) {
           throw new Error("selectText requires non-empty text");
@@ -584,7 +587,7 @@
         return await callBroker("app.selectText", {
           handleId,
           app: appName,
-          element_index: elementIndex,
+          element_index: isQualifiedRef ? normalizedRef : elementIndex,
           text,
           prefix: options.prefix,
           suffix: options.suffix,
@@ -755,7 +758,12 @@
       }
       const obj = {};
       for (const k of Object.keys(encoded)) {
-        obj[k] = deserializeBindingValue(encoded[k]);
+        Object.defineProperty(obj, k, {
+          value: deserializeBindingValue(encoded[k]),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
       return obj;
     }

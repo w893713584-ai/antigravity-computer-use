@@ -1,10 +1,8 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
-import { rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
-import { OPEN_COMPUTER_USE_BIN, buildNativeEnv } from "./constants.mjs";
+import { OPEN_COMPUTER_USE_BIN, buildNativeEnv, resolveSafeSystemTmpDir } from "./constants.mjs";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
@@ -33,6 +31,14 @@ function extractMcpText(result) {
     .join("\n");
 }
 
+function createCancelledError() {
+  const err = new Error("Native peer request cancelled before dispatch");
+  err.code = "CANCELLED";
+  err.aborted = true;
+  err.deliveryState = "not_sent";
+  return err;
+}
+
 /**
  * Persistent, serialized JSON-RPC 2.0 client over `open-computer-use mcp`.
  * Maintains a single native process with an isolated app-agent socket namespace so
@@ -43,6 +49,8 @@ export class NativeComputerUsePeer extends EventEmitter {
   #everSpawned = false;
   #agentGenSeq = 0;
   #currentAgentInstanceId = null;
+  #pendingUnknownAgentId = null;
+  #pendingUnknownChild = null;
 
   constructor({
     name = "ocu-peer",
@@ -217,6 +225,45 @@ export class NativeComputerUsePeer extends EventEmitter {
     }
   }
 
+  async #reapAgentForId(clearedAgentId, childRef = null) {
+    const isChildDead = () =>
+      !childRef ||
+      childRef.exitCode !== null ||
+      childRef.signalCode !== null ||
+      typeof childRef.once !== "function";
+
+    if (typeof this.agentReapFn === "function") {
+      const res = await this.agentReapFn(clearedAgentId);
+      return res !== false && res?.reaped !== false;
+    }
+    const reapRes = await this.#cleanupIsolatedAgentDaemonAsync({ forceNamespaceCleanup: true });
+    return Boolean(reapRes?.reaped) && isChildDead();
+  }
+
+  async verifyAndClearStaleUnknownAgent(targetAgentId = null) {
+    const idToClear = targetAgentId || this.#pendingUnknownAgentId;
+    if (!idToClear) return false;
+    if (this.child && this.#currentAgentInstanceId === idToClear) {
+      return false;
+    }
+    const childRef = this.#pendingUnknownAgentId === idToClear ? this.#pendingUnknownChild : null;
+    if (childRef && childRef.exitCode === null && childRef.signalCode === null) {
+      try {
+        childRef.kill?.("SIGKILL");
+      } catch {}
+    }
+    const reaped = await this.#reapAgentForId(idToClear, childRef).catch(() => false);
+    if (reaped) {
+      if (this.#pendingUnknownAgentId === idToClear) {
+        this.#pendingUnknownAgentId = null;
+        this.#pendingUnknownChild = null;
+      }
+      this.onAgentInstanceCleared?.(idToClear);
+      return true;
+    }
+    return false;
+  }
+
   #teardownChild(reason, { deferAgentClear = false } = {}) {
     const child = this.child;
     const clearedAgentId = this.#currentAgentInstanceId;
@@ -265,11 +312,18 @@ export class NativeComputerUsePeer extends EventEmitter {
       this.onAgentInstanceCleared?.(clearedAgentId);
       return;
     }
-    let childExited = !child || child.exitCode !== null || typeof child.once !== "function";
+    this.#pendingUnknownAgentId = clearedAgentId;
+    this.#pendingUnknownChild = child || null;
+    const isChildDead = () =>
+      !child ||
+      child.exitCode !== null ||
+      child.signalCode !== null ||
+      typeof child.once !== "function";
+    let childExited = isChildDead();
     const waitChildExit = childExited
       ? Promise.resolve()
       : new Promise((resolve) => {
-          const t = setTimeout(resolve, 350);
+          const t = setTimeout(resolve, 1500);
           t.unref?.();
           child.once("exit", () => {
             childExited = true;
@@ -279,16 +333,31 @@ export class NativeComputerUsePeer extends EventEmitter {
         });
     void waitChildExit
       .then(async () => {
-        if (typeof this.agentReapFn === "function") {
-          const res = await this.agentReapFn(clearedAgentId);
-          return res !== false && res?.reaped !== false;
+        const retryDelays = [0, 500, 1200];
+        for (const delayMs of retryDelays) {
+          if (delayMs > 0) {
+            await new Promise((r) => {
+              const timer = setTimeout(r, delayMs);
+              timer.unref?.();
+            });
+          }
+          if (!isChildDead()) {
+            try {
+              child.kill?.("SIGKILL");
+            } catch {}
+          }
+          const ok = await this.#reapAgentForId(clearedAgentId, child).catch(() => false);
+          if (ok) return true;
         }
-        const reapRes = await this.#cleanupIsolatedAgentDaemonAsync({ forceNamespaceCleanup: true });
-        return Boolean(reapRes?.reaped) && childExited;
+        return false;
       })
       .then(
         (reaped) => {
           if (reaped) {
+            if (this.#pendingUnknownAgentId === clearedAgentId) {
+              this.#pendingUnknownAgentId = null;
+              this.#pendingUnknownChild = null;
+            }
             this.onAgentInstanceCleared?.(clearedAgentId);
           }
         },
@@ -380,7 +449,7 @@ export class NativeComputerUsePeer extends EventEmitter {
     }
     const nsHash = crypto.createHash("sha256").update(this.socketNamespace).digest("hex").slice(0, 16);
     const sockName = `open-computer-use-agent-${nsHash}.sock`;
-    const sockFullPath = path.join(tmpdir(), sockName);
+    const sockFullPath = path.join(resolveSafeSystemTmpDir(), sockName);
     return new Promise((resolve) => {
       try {
         const reaper = spawn(
@@ -394,7 +463,7 @@ export class NativeComputerUsePeer extends EventEmitter {
           ],
           { detached: true, stdio: "ignore" }
         );
-        const timer = setTimeout(() => resolve({ reaped: false }), 600);
+        const timer = setTimeout(() => resolve({ reaped: false }), 2500);
         timer.unref?.();
         reaper.once("exit", (code) => {
           clearTimeout(timer);
@@ -427,17 +496,25 @@ export class NativeComputerUsePeer extends EventEmitter {
     const beforeWriteCheck =
       typeof options?.beforeWriteCheck === "function" ? options.beforeWriteCheck : null;
     const expectedAgentInstanceId = options?.expectedAgentInstanceId || null;
+    const signal = options?.signal || null;
+    const readOnly = isReadOnlyMcpRequest(method, params);
     const task = this.queue.then(async () => {
       try {
+        if (readOnly && signal?.aborted) {
+          throw createCancelledError();
+        }
         beforeWriteCheck?.();
         await this.ensureStarted();
+        if (readOnly && signal?.aborted) {
+          throw createCancelledError();
+        }
         const res = await this.#rawRequest(method, params, timeoutMs, {
           beforeWriteCheck,
           expectedAgentInstanceId,
         });
         if (
           res?.isError &&
-          isReadOnlyMcpRequest(method, params) &&
+          readOnly &&
           TRANSIENT_AGENT_ERR_RE.test(extractMcpText(res))
         ) {
           throw new Error(extractMcpText(res));
@@ -447,12 +524,16 @@ export class NativeComputerUsePeer extends EventEmitter {
         if (
           !this.disposed &&
           !err?.aborted &&
-          isReadOnlyMcpRequest(method, params) &&
+          !signal?.aborted &&
+          readOnly &&
           TRANSIENT_AGENT_ERR_RE.test(err instanceof Error ? err.message : String(err))
         ) {
           this.#teardownChild(err instanceof Error ? err : new Error(String(err)));
           this.#cleanupIsolatedAgentDaemon({ forceNamespaceCleanup: true });
           await new Promise((r) => setTimeout(r, 180));
+          if (signal?.aborted) {
+            throw createCancelledError();
+          }
           beforeWriteCheck?.();
           await this.ensureStarted();
           return this.#rawRequest(method, params, timeoutMs, {

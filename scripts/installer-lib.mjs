@@ -18,6 +18,7 @@ import http from "node:http";
 import os, { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { resolveSafeSystemTmpDir } from "../src/constants.mjs";
 import { stageAndInstallNativePayloads } from "../src/native-distribution.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -32,6 +33,56 @@ const MANAGED_GEMINI_RULE_BLOCK = `${GEMINI_RULE_BEGIN}
 - 操作普通后台应用时严禁调用 AppleScript \`activate\`、不带 \`-g\` 的 \`open -a\` 或 \`Raise\`，保持被操作窗口在后台运行、不置顶抢焦点。
 - 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。
 ${GEMINI_RULE_END}`;
+
+const MANAGED_T3_GEMINI_RULE_BLOCK = `${GEMINI_RULE_BEGIN}
+## Codex-Style Computer Use 小窗规则 (T3 Code)
+- 当你在对话中首次使用 \`computer-use\` 或 \`computer-use-js\` 操作桌面应用时，请按工具返回的一次性提示附带本地 HTTP 实时小窗链接（不要输出无效的 \`sidecar://\` 链接），方便用户在浏览器或预览面板查看实时后台小窗。
+- 操作普通后台应用时严禁调用 AppleScript \`activate\`、不带 \`-g\` 的 \`open -a\` 或 \`Raise\`，保持被操作窗口在后台运行、不置顶抢焦点。
+- 特例：操作剪映专业版（\`com.lemon.lvpro\`）等 Qt6 自绘应用且后台滚轮、搜索框或弹窗失灵时，允许临时通过 \`osascript\` 将其 \`activate\` 到前台快速完成点击/输入，操作完成后立即退回后台或退出应用。
+${GEMINI_RULE_END}`;
+
+const T3_PREVIOUS_MCP_SNAPSHOT = ".codex-cua-previous-mcp.json";
+
+export function resolveStableNodePath(execPath = process.execPath) {
+  if (typeof execPath !== "string" || !execPath.trim()) return process.execPath;
+  if (!execPath.includes("/Cellar/node/")) return execPath;
+  let targetReal = null;
+  try {
+    targetReal = realpathSync(execPath);
+  } catch {
+    return execPath;
+  }
+  for (const candidate of ["/opt/homebrew/bin/node", "/usr/local/bin/node"]) {
+    if (!existsSync(candidate)) continue;
+    try {
+      if (realpathSync(candidate) === targetReal) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return execPath;
+}
+
+export function discoverT3AntigravityConfigDirs(homeDir = process.env.HOME || homedir()) {
+  if (!homeDir) return [];
+  const providersRoot = path.join(homeDir, ".t3", "userdata", "providers", "antigravity");
+  if (!existsSync(providersRoot)) return [];
+  const out = [];
+  try {
+    for (const entry of readdirSync(providersRoot)) {
+      if (!entry || entry.startsWith(".")) continue;
+      const cfgDir = path.join(providersRoot, entry, "config");
+      if (existsSync(cfgDir)) {
+        try {
+          if (statSync(cfgDir).isDirectory()) {
+            out.push(cfgDir);
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return out;
+}
 
 const STAGE_ITEMS = [
   "package.json",
@@ -258,21 +309,23 @@ function updateOfflineConfigSidecar(configDir, enabled) {
   writeJsonAtomic(cfgPath, { ...current, sidecars }, 0o600);
 }
 
-function upsertManagedGeminiRules(configDir) {
+function upsertManagedGeminiRules(configDir, { host = "antigravity" } = {}) {
   const geminiMdPath = path.join(configDir, "GEMINI.md");
   const existing = existsSync(geminiMdPath) ? readFileSync(geminiMdPath, "utf8") : "";
+  const targetBlock = host === "t3" ? MANAGED_T3_GEMINI_RULE_BLOCK : MANAGED_GEMINI_RULE_BLOCK;
   const blockRe = new RegExp(
     `${GEMINI_RULE_BEGIN.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}[\\s\\S]*?${GEMINI_RULE_END.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
     "u"
   );
   let next;
   if (blockRe.test(existing)) {
-    next = existing.replace(blockRe, MANAGED_GEMINI_RULE_BLOCK);
+    next = existing.replace(blockRe, targetBlock);
   } else if (existing.trim()) {
-    next = `${existing.replace(/\s+$/u, "")}\n\n${MANAGED_GEMINI_RULE_BLOCK}\n`;
+    next = `${existing.replace(/\s+$/u, "")}\n\n${targetBlock}\n`;
   } else {
-    next = `${MANAGED_GEMINI_RULE_BLOCK}\n`;
+    next = `${targetBlock}\n`;
   }
+  mkdirSync(configDir, { recursive: true });
   writeFileSync(geminiMdPath, next, "utf8");
 }
 
@@ -375,7 +428,7 @@ async function terminateRunningBrokerAndAgents({ skipProcessKill = false } = {})
   try {
     await execFileAsync(
       "/usr/bin/pkill",
-      ["-TERM", "-f", "codex-style-computer-use/src/(broker-sidecar|mcp-server|mcp-repl-server)\\.mjs"],
+      ["-TERM", "-f", "codex-style-computer-use/src/broker-sidecar\\.mjs"],
       { timeout: 3000 }
     );
   } catch {}
@@ -400,17 +453,133 @@ async function terminateRunningBrokerAndAgents({ skipProcessKill = false } = {})
     try {
       await execFileAsync("/usr/bin/pkill", ["-TERM", "-f", sockName], { timeout: 3000 });
     } catch {}
+    for (const dir of new Set([os.tmpdir(), resolveSafeSystemTmpDir(), "/tmp"])) {
+      try {
+        rmSync(path.join(dir, sockName), { force: true });
+      } catch {}
+    }
+  }
+}
+
+function mergeMcpConfigFile({ mcpPath, snapshotPath, installDir, nodeExecPath }) {
+  let mcpData = { mcpServers: {} };
+  if (existsSync(mcpPath)) {
+    const rawMcp = readFileSync(mcpPath, "utf8");
     try {
-      rmSync(path.join(os.tmpdir(), sockName), { force: true });
+      const parsed = JSON.parse(rawMcp);
+      if (parsed && typeof parsed === "object") {
+        mcpData = {
+          ...parsed,
+          mcpServers:
+            parsed.mcpServers && typeof parsed.mcpServers === "object" ? { ...parsed.mcpServers } : {},
+        };
+      }
+    } catch {
+      throw new Error(`现有的 ${mcpPath} 不是合法 JSON，已中止修改以免损坏配置。`);
+    }
+
+    let existingSnap = null;
+    if (existsSync(snapshotPath)) {
+      try {
+        existingSnap = JSON.parse(readFileSync(snapshotPath, "utf8"));
+      } catch {}
+    }
+
+    const prevCu = mcpData.mcpServers["computer-use"];
+    const prevCuJs = mcpData.mcpServers["computer-use-js"];
+    const cuOwned = isOurMcpEntry(prevCu, installDir);
+    const cuJsOwned = isOurMcpEntry(prevCuJs, installDir);
+
+    const nextSnap = {
+      hadComputerUse: !cuOwned
+        ? prevCu !== undefined
+        : Boolean(existingSnap?.hadComputerUse),
+      computerUse: !cuOwned
+        ? (prevCu ?? null)
+        : (existingSnap?.computerUse ?? null),
+      hadComputerUseJs: !cuJsOwned
+        ? prevCuJs !== undefined
+        : Boolean(existingSnap?.hadComputerUseJs),
+      computerUseJs: !cuJsOwned
+        ? (prevCuJs ?? null)
+        : (existingSnap?.computerUseJs ?? null),
+    };
+
+    if (!existingSnap || !cuOwned || !cuJsOwned) {
+      writeJsonAtomic(snapshotPath, nextSnap, 0o600);
+    }
+    if ((!cuOwned && prevCu !== undefined) || (!cuJsOwned && prevCuJs !== undefined)) {
+      writeFileSync(
+        `${mcpPath}.backup-before-codex-cua-${Date.now()}`,
+        rawMcp,
+        { mode: 0o600 }
+      );
+    }
+  } else {
+    writeJsonAtomic(
+      snapshotPath,
+      {
+        hadComputerUse: false,
+        computerUse: null,
+        hadComputerUseJs: false,
+        computerUseJs: null,
+      },
+      0o600
+    );
+  }
+
+  const existingMcpMode = existsSync(mcpPath) ? statSync(mcpPath).mode & 0o777 : 0o600;
+  mcpData.mcpServers["computer-use"] = {
+    command: nodeExecPath,
+    args: [path.join(installDir, "src", "mcp-server.mjs")],
+  };
+  mcpData.mcpServers["computer-use-js"] = {
+    command: nodeExecPath,
+    args: [path.join(installDir, "src", "mcp-repl-server.mjs")],
+  };
+  writeJsonAtomic(mcpPath, mcpData, existingMcpMode);
+}
+
+function restoreMcpConfigFile({ mcpPath, snapshotPath, installDir }) {
+  if (!existsSync(mcpPath)) return;
+  const existingMcpMode = statSync(mcpPath).mode & 0o777;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(mcpPath, "utf8"));
+  } catch (err) {
+    throw new Error(`无法解析 ${mcpPath}，已保留安装目录与备份文件以免丢失配置：${err.message}`);
+  }
+  const servers =
+    parsed?.mcpServers && typeof parsed.mcpServers === "object" ? { ...parsed.mcpServers } : {};
+  let snap = null;
+  if (existsSync(snapshotPath)) {
+    try {
+      snap = JSON.parse(readFileSync(snapshotPath, "utf8"));
     } catch {}
   }
+
+  if (isOurMcpEntry(servers["computer-use"], installDir)) {
+    if (snap?.hadComputerUse && snap.computerUse) {
+      servers["computer-use"] = snap.computerUse;
+    } else {
+      delete servers["computer-use"];
+    }
+  }
+  if (isOurMcpEntry(servers["computer-use-js"], installDir)) {
+    if (snap?.hadComputerUseJs && snap.computerUseJs) {
+      servers["computer-use-js"] = snap.computerUseJs;
+    } else {
+      delete servers["computer-use-js"];
+    }
+  }
+  writeJsonAtomic(mcpPath, { ...(parsed || {}), mcpServers: servers }, existingMcpMode);
 }
 
 export async function installCodexComputerUse({
   sourceRoot,
   homeDir = process.env.HOME || homedir(),
   installDir = path.join(homeDir, ".gemini", "codex-style-computer-use"),
-  nodeExecPath = process.execPath,
+  nodeExecPath = resolveStableNodePath(process.execPath),
   skipDoctor = false,
   skipProcessKill = false,
   skipNativeSelfTest = false,
@@ -418,6 +587,8 @@ export async function installCodexComputerUse({
   liveRpcFn = syncLiveAntigravity,
   log = console.log,
 } = {}) {
+  const effectiveNodePath =
+    nodeExecPath === process.execPath ? resolveStableNodePath(nodeExecPath) : nodeExecPath;
   if (process.platform === "darwin" || darwinReleaseOverride) {
     const rel = String(darwinReleaseOverride || os.release() || "");
     const major = Number.parseInt(rel.split(".")[0], 10);
@@ -471,7 +642,7 @@ export async function installCodexComputerUse({
   let runtime = findInstalledOcuRuntime(homeDir, installDir);
   let reusedExistingRuntime = Boolean(runtime);
   if (!runtime) {
-    await ensureOcuDependencyInstalled({ installDir, nodeExecPath, log });
+    await ensureOcuDependencyInstalled({ installDir, nodeExecPath: effectiveNodePath, log });
     runtime = findInstalledOcuRuntime(homeDir, installDir);
     if (!runtime) {
       throw new Error("未能找到或安装 open-computer-use 原生运行库，请检查网络连接后重试。");
@@ -486,7 +657,7 @@ export async function installCodexComputerUse({
     display_name: "Computer Use 小窗",
     description:
       "Codex 风格后台无感 Computer Use 侧面实时小窗（操作窗口不置顶、不抢焦点，支持实时画面预览、虚拟光标与小窗内直接点击交互）",
-    command: nodeExecPath,
+    command: effectiveNodePath,
     args: [path.join(installDir, "src", "broker-sidecar.mjs")],
     restart_policy: "always",
     has_web_ui: true,
@@ -503,88 +674,27 @@ export async function installCodexComputerUse({
   };
   writeJsonAtomic(path.join(sidecarDir, "sidecar.json"), sidecarManifest);
 
-  // 4. Backup & merge ~/.gemini/config/mcp_config.json without touching friend's other MCP servers
-  const mcpPath = path.join(configDir, "mcp_config.json");
-  let mcpData = { mcpServers: {} };
-  if (existsSync(mcpPath)) {
-    const rawMcp = readFileSync(mcpPath, "utf8");
-    try {
-      const parsed = JSON.parse(rawMcp);
-      if (parsed && typeof parsed === "object") {
-        mcpData = {
-          ...parsed,
-          mcpServers:
-            parsed.mcpServers && typeof parsed.mcpServers === "object" ? { ...parsed.mcpServers } : {},
-        };
-      }
-    } catch {
-      throw new Error(`现有的 ${mcpPath} 不是合法 JSON，已中止修改以免损坏配置。`);
-    }
+  // 4. Backup & merge ~/.gemini/config/mcp_config.json + any T3 Code Antigravity provider configs
+  mergeMcpConfigFile({
+    mcpPath: path.join(configDir, "mcp_config.json"),
+    snapshotPath: path.join(installDir, PREVIOUS_MCP_SNAPSHOT),
+    installDir,
+    nodeExecPath: effectiveNodePath,
+  });
 
-    const prevSnapPath = path.join(installDir, PREVIOUS_MCP_SNAPSHOT);
-    let existingSnap = null;
-    if (existsSync(prevSnapPath)) {
-      try {
-        existingSnap = JSON.parse(readFileSync(prevSnapPath, "utf8"));
-      } catch {}
-    }
-
-    const prevCu = mcpData.mcpServers["computer-use"];
-    const prevCuJs = mcpData.mcpServers["computer-use-js"];
-    const cuOwned = isOurMcpEntry(prevCu, installDir);
-    const cuJsOwned = isOurMcpEntry(prevCuJs, installDir);
-
-    const nextSnap = {
-      hadComputerUse: !cuOwned
-        ? prevCu !== undefined
-        : Boolean(existingSnap?.hadComputerUse),
-      computerUse: !cuOwned
-        ? (prevCu ?? null)
-        : (existingSnap?.computerUse ?? null),
-      hadComputerUseJs: !cuJsOwned
-        ? prevCuJs !== undefined
-        : Boolean(existingSnap?.hadComputerUseJs),
-      computerUseJs: !cuJsOwned
-        ? (prevCuJs ?? null)
-        : (existingSnap?.computerUseJs ?? null),
-    };
-
-    if (!existingSnap || !cuOwned || !cuJsOwned) {
-      writeJsonAtomic(prevSnapPath, nextSnap, 0o600);
-    }
-    if ((!cuOwned && prevCu !== undefined) || (!cuJsOwned && prevCuJs !== undefined)) {
-      writeFileSync(
-        `${mcpPath}.backup-before-codex-cua-${Date.now()}`,
-        rawMcp,
-        { mode: 0o600 }
-      );
-    }
-  } else {
-    writeJsonAtomic(
-      path.join(installDir, PREVIOUS_MCP_SNAPSHOT),
-      {
-        hadComputerUse: false,
-        computerUse: null,
-        hadComputerUseJs: false,
-        computerUseJs: null,
-      },
-      0o600
-    );
+  const t3ConfigDirs = discoverT3AntigravityConfigDirs(homeDir);
+  for (const t3CfgDir of t3ConfigDirs) {
+    mergeMcpConfigFile({
+      mcpPath: path.join(t3CfgDir, "mcp_config.json"),
+      snapshotPath: path.join(t3CfgDir, T3_PREVIOUS_MCP_SNAPSHOT),
+      installDir,
+      nodeExecPath: effectiveNodePath,
+    });
+    upsertManagedGeminiRules(t3CfgDir, { host: "t3" });
   }
 
-  const existingMcpMode = existsSync(mcpPath) ? statSync(mcpPath).mode & 0o777 : 0o600;
-  mcpData.mcpServers["computer-use"] = {
-    command: nodeExecPath,
-    args: [path.join(installDir, "src", "mcp-server.mjs")],
-  };
-  mcpData.mcpServers["computer-use-js"] = {
-    command: nodeExecPath,
-    args: [path.join(installDir, "src", "mcp-repl-server.mjs")],
-  };
-  writeJsonAtomic(mcpPath, mcpData, existingMcpMode);
-
   // 5. Write global GEMINI.md rule + clear any stale projectId in config.json + hot-reload Antigravity
-  upsertManagedGeminiRules(configDir);
+  upsertManagedGeminiRules(configDir, { host: "antigravity" });
   updateOfflineConfigSidecar(configDir, true);
   await terminateRunningBrokerAndAgents({ skipProcessKill });
   const liveReloaded = await liveRpcFn({ enableSidecar: true });
@@ -605,6 +715,7 @@ export async function installCodexComputerUse({
     installDir,
     reusedExistingRuntime,
     liveReloaded,
+    t3SyncedCount: t3ConfigDirs.length,
     runtimeDir: runtime.dir,
     doctorOutput,
     nativePayloads,
@@ -622,35 +733,18 @@ export async function uninstallCodexComputerUse({
   const prevSnapPath = path.join(installDir, PREVIOUS_MCP_SNAPSHOT);
 
   // 1. Restore previous MCP entries BEFORE deleting runtime/recovery files; propagate errors if corrupt/unwritable
-  if (existsSync(mcpPath)) {
-    const existingMcpMode = statSync(mcpPath).mode & 0o777;
-    let parsed;
-    try {
-      parsed = JSON.parse(readFileSync(mcpPath, "utf8"));
-    } catch (err) {
-      throw new Error(`无法解析 ${mcpPath}，已保留安装目录与备份文件以免丢失配置：${err.message}`);
-    }
-    const servers =
-      parsed?.mcpServers && typeof parsed.mcpServers === "object" ? { ...parsed.mcpServers } : {};
-    const snap = existsSync(prevSnapPath)
-      ? JSON.parse(readFileSync(prevSnapPath, "utf8"))
-      : null;
+  restoreMcpConfigFile({ mcpPath, snapshotPath: prevSnapPath, installDir });
 
-    if (isOurMcpEntry(servers["computer-use"], installDir)) {
-      if (snap?.hadComputerUse && snap.computerUse) {
-        servers["computer-use"] = snap.computerUse;
-      } else {
-        delete servers["computer-use"];
-      }
-    }
-    if (isOurMcpEntry(servers["computer-use-js"], installDir)) {
-      if (snap?.hadComputerUseJs && snap.computerUseJs) {
-        servers["computer-use-js"] = snap.computerUseJs;
-      } else {
-        delete servers["computer-use-js"];
-      }
-    }
-    writeJsonAtomic(mcpPath, { ...(parsed || {}), mcpServers: servers }, existingMcpMode);
+  const t3ConfigDirs = discoverT3AntigravityConfigDirs(homeDir);
+  for (const t3CfgDir of t3ConfigDirs) {
+    const t3SnapPath = path.join(t3CfgDir, T3_PREVIOUS_MCP_SNAPSHOT);
+    restoreMcpConfigFile({
+      mcpPath: path.join(t3CfgDir, "mcp_config.json"),
+      snapshotPath: t3SnapPath,
+      installDir,
+    });
+    removeManagedGeminiRules(t3CfgDir);
+    rmSync(t3SnapPath, { force: true });
   }
 
   // 2. Remove managed GEMINI.md rule block, disable sidecar, stop broker + app-agents & remove state files
@@ -662,6 +756,7 @@ export async function uninstallCodexComputerUse({
   const ocuStateDir = path.join(homeDir, ".config", "ocu");
   rmSync(path.join(ocuStateDir, "agy-cua.sock"), { force: true });
   rmSync(path.join(ocuStateDir, "agy-cua-sidecar.json"), { force: true });
+  rmSync(path.join(ocuStateDir, "agy-cua-spawn.lock"), { force: true });
   rmSync(path.join(configDir, "sidecars", SIDECAR_ID), { recursive: true, force: true });
   rmSync(installDir, { recursive: true, force: true });
 

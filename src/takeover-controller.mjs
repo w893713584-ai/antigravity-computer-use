@@ -154,6 +154,7 @@ export class TakeoverController {
     onPhaseChanged = null,
     onTargetChanged = null,
     onResume = null,
+    onVerifyUnknownAgentCleared = null,
   } = {}) {
     this.syntheticEventTag = Number(syntheticEventTag) || generateSyntheticEventTag();
     this.emergencyHotkey = emergencyHotkey || EMERGENCY_HOTKEY;
@@ -163,6 +164,7 @@ export class TakeoverController {
     this.onPhaseChanged = onPhaseChanged;
     this.onTargetChanged = onTargetChanged;
     this.onResume = onResume;
+    this.onVerifyUnknownAgentCleared = onVerifyUnknownAgentCleared;
 
     // Default black-box safety: untagged OCU routes cannot be distinguished from human HID events while in flight.
     for (const routeKey of ["click:sky_click", "click:app_post", "click:native", "drag:native"]) {
@@ -278,8 +280,15 @@ export class TakeoverController {
   }
 
   isReservedHotkey(keySpec) {
-    const sig = normalizeHotkeySignature(keySpec);
-    return Boolean(sig && sig === this.emergencyHotkeySignature);
+    if (!this.emergencyHotkeySignature || typeof keySpec !== "string") return false;
+    const tokens = keySpec.trim().split(/\s+/u).filter(Boolean);
+    for (const tok of tokens) {
+      const sig = normalizeHotkeySignature(tok);
+      if (sig && sig === this.emergencyHotkeySignature) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -607,6 +616,12 @@ export class TakeoverController {
           ...this.publicState(),
         };
       }
+    }
+
+    if (this.#nativeWriteUnknownLock && typeof this.onVerifyUnknownAgentCleared === "function") {
+      try {
+        await this.onVerifyUnknownAgentCleared(this.#unknownAgentInstanceId);
+      } catch {}
     }
 
     if (this.#nativeWriteUnknownLock) {

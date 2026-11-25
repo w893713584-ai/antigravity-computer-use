@@ -12,6 +12,7 @@ import {
   SCRIPT_RUNNER_BIN_PATH,
   SIDECAR_PILL_MARKDOWN,
   isMainModule,
+  resolveSafeSystemTmpDir,
 } from "./constants.mjs";
 import { NativeComputerUsePeer } from "./native-peer.mjs";
 import {
@@ -74,19 +75,65 @@ import {
 import { PreviewStreamManager } from "./preview-stream.mjs";
 import { StrictReplSessionManager } from "./repl-runner.mjs";
 import {
+  TakeoverAbortedError,
   TakeoverController,
   buildUiInteractionPauseClaim,
   isTakeoverAbortedError,
 } from "./takeover-controller.mjs";
 import { VideoWebSocketHub } from "./video-websocket.mjs";
 
+if (process.platform === "darwin") {
+  process.env.TMPDIR = resolveSafeSystemTmpDir(process.env);
+}
+
 const execFileAsync = promisify(execFile);
 const DEFAULT_FOCUS_SWEEP_DELAYS_MS = [80, 220, 450];
 const SIDECAR_TOOL_NOTE = `\nSide-pane live view: include ${SIDECAR_PILL_MARKDOWN} once in your first reply using Computer Use so the user can open the right-hand live mini-window.`;
+const T3_SIDECAR_TOOL_NOTE =
+  "\nSide-pane live view: include the local HTTP live mini-window link from the first tool result once in your reply.";
 const SIDECAR_REF_TOOL_NOTE = `\n${SNAPSHOT_REF_DOC}`;
 const LOCKED_SESSION_POSIX_RE = /NSPOSIXErrorDomain\s+Code=2\b/iu;
 const LOCKED_SESSION_MESSAGE =
   "macOS 屏幕当前处于锁屏/休眠状态（Locked Use 未启用），请先解锁屏幕后重试，或运行 `open-computer-use locked-use enable` 开启锁屏后台控制。";
+
+function raceWithReadOnlyAbort(promise, signal, pauseEpoch = 0) {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason instanceof TakeoverAbortedError
+        ? signal.reason
+        : new TakeoverAbortedError("调用已取消（客户端断开或中止）。", {
+            code: signal.reason?.code === "PAUSED" ? "PAUSED" : "CANCELLED",
+            deliveryState: "not_sent",
+            pauseEpoch,
+          })
+    );
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reject(
+        signal.reason instanceof TakeoverAbortedError
+          ? signal.reason
+          : new TakeoverAbortedError("调用已取消（客户端断开或中止）。", {
+              code: signal.reason?.code === "PAUSED" ? "PAUSED" : "CANCELLED",
+              deliveryState: "not_sent",
+              pauseEpoch,
+            })
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (val) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(val);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      }
+    );
+  });
+}
 
 export class ComputerUseBrokerServer {
   #actionQueue = Promise.resolve();
@@ -95,6 +142,8 @@ export class ComputerUseBrokerServer {
   #ownsBoundSocket = false;
   #boundSocketInode = null;
   #nextConnSeq = 1;
+  #closing = false;
+  #activeSelectionEpoch = 0;
 
   constructor({
     webPort = Number.parseInt(
@@ -166,6 +215,8 @@ export class ComputerUseBrokerServer {
             source: "ui",
           });
         },
+        onVerifyUnknownAgentCleared: (agentId) =>
+          this.actionPeer?.verifyAndClearStaleUnknownAgent?.(agentId),
       });
 
     if (!this.replManager) {
@@ -255,17 +306,21 @@ export class ComputerUseBrokerServer {
                 this.takeoverController.setHelperCapabilities(caps);
                 this.previewStreamManager?.bumpCapabilityEpoch();
                 this.#syncTakeoverStateFields();
-                void this.#refreshPermissionsQuietly().then(() => {
-                  this.#syncPreviewStateFields();
-                  this.webAdapter?.broadcastState();
-                });
+                void this.#refreshPermissionsQuietly()
+                  .then(() => {
+                    this.#syncPreviewStateFields();
+                    this.webAdapter?.broadcastState();
+                  })
+                  .catch(() => {});
               },
               onStatusChanged: () => {
                 this.#syncTakeoverStateFields();
-                void this.#refreshPermissionsQuietly().then(() => {
-                  this.#syncPreviewStateFields();
-                  this.webAdapter?.broadcastState();
-                });
+                void this.#refreshPermissionsQuietly()
+                  .then(() => {
+                    this.#syncPreviewStateFields();
+                    this.webAdapter?.broadcastState();
+                  })
+                  .catch(() => {});
               },
               onVideoPacket: (pkt) => this.previewStreamManager?.handleVideoPacket(pkt),
               onStreamStatus: (st) => void this.previewStreamManager?.handleHelperStreamStatus(st),
@@ -528,9 +583,13 @@ export class ComputerUseBrokerServer {
   #syncPreviewStateFields() {
     const geom = this.previewStreamManager.getActiveGeometry();
     const vs = this.previewStreamManager.getViewTransportSummary(geom?.targetKey || this.state.targetKey);
+    const activeMetaWid = this.state.activeApp
+      ? this.registry.getMeta(this.state.activeApp)?.windowId || null
+      : null;
     this.state.targetKey = geom?.targetKey || null;
     this.state.geometryRev = geom?.geometryRev || 1;
-    this.state.windowId = geom?.windowId > 0 ? geom.windowId : this.state.windowId || null;
+    this.state.windowId =
+      geom?.windowId > 0 ? geom.windowId : activeMetaWid || this.state.pinnedWindowId || null;
     this.state.availableWindows = this.previewStreamManager.availableWindows;
     this.state.previewGeometry = geom
       ? {
@@ -801,23 +860,45 @@ export class ComputerUseBrokerServer {
   /**
    * Check if `appQuery` is currently running without launching it.
    */
-  async #checkAppRunning(peer, appQuery) {
+  async #checkAppRunning(peer, appQuery, { signal = null } = {}) {
     if (!appQuery) return { running: false, pid: null, apps: [] };
     const cached = this.registry.getMeta(appQuery);
     if (cached?.pid && isProcessAlive(cached.pid)) {
-      return { running: true, pid: cached.pid, apps: null };
+      let tokenValid = true;
+      if (cached.processToken && typeof this.registry.resolveProcessIdentity === "function") {
+        const liveIdent = await this.registry.resolveProcessIdentity(cached.pid).catch(() => null);
+        if (!liveIdent || liveIdent.alive === false || (liveIdent.processToken && liveIdent.processToken !== cached.processToken)) {
+          tokenValid = false;
+        }
+      }
+      if (tokenValid) {
+        return { running: true, pid: cached.pid, apps: null };
+      }
     }
     try {
-      const listRes = await peer.callTool("list_apps", {}, 4_000);
+      const listRes = await raceWithReadOnlyAbort(
+        peer.callTool("list_apps", {}, 4_000, { signal }),
+        signal,
+        this.takeoverController.pauseEpoch
+      );
       const parsed = parseAppsList(extractResultText(listRes));
       this.state.runningApps = parsed.filter((a) => a.isRunning);
       const match =
         findRunningApp(parsed, appQuery) ||
         (cached?.bundleId ? findRunningApp(parsed, cached.bundleId) : null) ||
         (cached?.appDisplayName ? findRunningApp(parsed, cached.appDisplayName) : null);
-      return { running: Boolean(match), pid: null, match, apps: parsed };
-    } catch {
-      return { running: false, pid: null, apps: null };
+      return { running: Boolean(match), pid: match?.pid || null, match, apps: parsed };
+    } catch (err) {
+      if (isTakeoverAbortedError(err) || err?.aborted) throw err;
+      if (typeof this.runningAppIdentityFn === "function") {
+        const fallbackIdent = await this.runningAppIdentityFn(appQuery, {
+          axBridge: this.axBridge,
+        }).catch(() => null);
+        if (fallbackIdent?.pid > 0 && fallbackIdent.alive !== false) {
+          return { running: true, pid: fallbackIdent.pid, match: fallbackIdent, apps: null };
+        }
+      }
+      return { running: null, unknown: true, pid: null, apps: null };
     }
   }
 
@@ -826,6 +907,7 @@ export class ComputerUseBrokerServer {
    * preventing live stream or UI interactions from calling `get_app_state` and auto-relaunching it.
    */
   #detachExitedActiveApp(runningApps = null) {
+    this.#activeSelectionEpoch += 1;
     const exitedLabel = this.state.appDisplayName || this.state.activeApp;
     this.registry.deleteMeta(this.state.activeApp);
     this.registry.deleteMeta(this.state.bundleId);
@@ -950,9 +1032,10 @@ export class ComputerUseBrokerServer {
     const canMutateForRead =
       !observationalOnly && allowLaunch && (!operation?.isAi || !this.takeoverController.paused);
 
+    const opSignal = operation?.signal || null;
     if (app) {
-      const check = await this.#checkAppRunning(peer, app);
-      if (!check.running) {
+      const check = await this.#checkAppRunning(peer, app, { signal: opSignal });
+      if (check.running === false) {
         if (!canMutateForRead) {
           if (this.#isSameActiveApp(app)) {
             this.#detachExitedActiveApp(check.apps?.filter((a) => a.isRunning));
@@ -1022,8 +1105,16 @@ export class ComputerUseBrokerServer {
     let capturedPeerInstanceId = null;
     let preObsRes = await capturePreShotObs();
     const callTimeout = Number(timeoutMs) > 0 ? Math.max(50, Math.min(12_000, timeoutMs)) : undefined;
+    const deadlineAt = callTimeout ? t0 + callTimeout : null;
+    const remTimeout = () => (deadlineAt ? Math.max(60, deadlineAt - Date.now()) : undefined);
+    const callReadState = async (customTimeout = remTimeout()) =>
+      raceWithReadOnlyAbort(
+        peer.callTool("get_app_state", argsWithReadOnly, customTimeout, { signal: opSignal }),
+        opSignal,
+        this.takeoverController.pauseEpoch
+      );
     try {
-      result = await peer.callTool("get_app_state", argsWithReadOnly, callTimeout);
+      result = await callReadState(callTimeout);
       capturedPeerInstanceId = peer?.agentInstanceId || null;
     } catch (err) {
       if (LOCKED_SESSION_POSIX_RE.test(String(err?.message || ""))) {
@@ -1038,45 +1129,61 @@ export class ComputerUseBrokerServer {
     this.#screenLockedBackoff = false;
     let text = extractResultText(result);
 
-    if (result?.isError && app && !LOCKED_SESSION_POSIX_RE.test(text)) {
-      const errCheck = await this.#checkAppRunning(peer, app);
-      if (errCheck.running) {
-        if (!observationalOnly && (!operation?.isAi || !this.takeoverController.paused)) {
+    if (
+      result?.isError &&
+      app &&
+      !LOCKED_SESSION_POSIX_RE.test(text) &&
+      (!deadlineAt || Date.now() + 120 < deadlineAt)
+    ) {
+      const errCheck = await this.#checkAppRunning(peer, app, { signal: opSignal });
+      try {
+        if (errCheck.running === true) {
+          if (!observationalOnly && (!operation?.isAi || !this.takeoverController.paused)) {
+            if (operation?.isAi) {
+              this.takeoverController.assertMayDispatch(operation, { isRead: false });
+            }
+            const cached = this.registry.getMeta(app);
+            const unhidePromise = unhideAppWithoutActivating(cached?.pid, app);
+            await (operation
+              ? this.takeoverController.trackNativeWrite(operation, unhidePromise, {
+                  routeKey: "app:unhide",
+                })
+              : unhidePromise);
+            if (operation?.isAi) {
+              this.takeoverController.assertMayDispatch(operation, { isRead: true });
+            }
+            preObsRes = await capturePreShotObs();
+            result = await callReadState();
+            capturedPeerInstanceId = peer?.agentInstanceId || null;
+            text = extractResultText(result);
+          }
+        } else if (errCheck.running === false && canMutateForRead) {
           if (operation?.isAi) {
             this.takeoverController.assertMayDispatch(operation, { isRead: false });
           }
-          const cached = this.registry.getMeta(app);
-          const unhidePromise = unhideAppWithoutActivating(cached?.pid, app);
+          const launchRetryPromise = launchAppInBackground(app);
           await (operation
-            ? this.takeoverController.trackNativeWrite(operation, unhidePromise, {
-                routeKey: "app:unhide",
+            ? this.takeoverController.trackNativeWrite(operation, launchRetryPromise, {
+                routeKey: "app:launch_in_background",
               })
-            : unhidePromise);
+            : launchRetryPromise);
           if (operation?.isAi) {
             this.takeoverController.assertMayDispatch(operation, { isRead: true });
           }
           preObsRes = await capturePreShotObs();
-          result = await peer.callTool("get_app_state", argsWithReadOnly);
+          result = await callReadState();
           capturedPeerInstanceId = peer?.agentInstanceId || null;
           text = extractResultText(result);
         }
-      } else if (canMutateForRead) {
-        if (operation?.isAi) {
-          this.takeoverController.assertMayDispatch(operation, { isRead: false });
+      } catch (retryErr) {
+        if (LOCKED_SESSION_POSIX_RE.test(String(retryErr?.message || ""))) {
+          this.#screenLockedBackoff = true;
+          return {
+            isError: true,
+            content: [{ type: "text", text: LOCKED_SESSION_MESSAGE }],
+          };
         }
-        const launchRetryPromise = launchAppInBackground(app);
-        await (operation
-          ? this.takeoverController.trackNativeWrite(operation, launchRetryPromise, {
-              routeKey: "app:launch_in_background",
-            })
-          : launchRetryPromise);
-        if (operation?.isAi) {
-          this.takeoverController.assertMayDispatch(operation, { isRead: true });
-        }
-        preObsRes = await capturePreShotObs();
-        result = await peer.callTool("get_app_state", argsWithReadOnly);
-        capturedPeerInstanceId = peer?.agentInstanceId || null;
-        text = extractResultText(result);
+        throw retryErr;
       }
     }
 
@@ -1093,7 +1200,8 @@ export class ComputerUseBrokerServer {
         peer === this.actionPeer &&
         fallbackPid > 0 &&
         typeof this.promoteMainWindowFn === "function" &&
-        !(operation?.isAi && this.takeoverController.paused)
+        !(operation?.isAi && this.takeoverController.paused) &&
+        (!deadlineAt || Date.now() + 120 < deadlineAt)
       ) {
         if (operation?.isAi) {
           this.takeoverController.assertMayDispatch(operation, { isRead: false });
@@ -1104,13 +1212,16 @@ export class ComputerUseBrokerServer {
               routeKey: "ax:promote_main_window",
             })
           : promotePromise);
-        if (promoted) {
+        if (promoted && (!deadlineAt || Date.now() + 100 < deadlineAt)) {
           if (operation?.isAi) {
             this.takeoverController.assertMayDispatch(operation, { isRead: true });
           }
           preObsRes = await capturePreShotObs();
-          const retryRes = await peer.callTool("get_app_state", argsWithReadOnly);
-          if (!retryRes?.isError) {
+          const retryRes = await callReadState().catch((err) => {
+            if (isTakeoverAbortedError(err) || err?.aborted) throw err;
+            return null;
+          });
+          if (retryRes && !retryRes.isError) {
             result = retryRes;
             capturedPeerInstanceId = peer?.agentInstanceId || null;
             text = extractResultText(result);
@@ -1164,13 +1275,16 @@ export class ComputerUseBrokerServer {
               routeKey: "ax:ensure_manual",
             })
           : wakePromise);
-        if (wake?.changed) {
+        if (wake?.changed && (!deadlineAt || Date.now() + 120 < deadlineAt)) {
           await new Promise((r) => setTimeout(r, 35));
           if (operation?.isAi) {
             this.takeoverController.assertMayDispatch(operation, { isRead: true });
           }
           preObsRes = await capturePreShotObs();
-          const wokenRes = await peer.callTool("get_app_state", argsWithReadOnly).catch(() => null);
+          const wokenRes = await callReadState().catch((err) => {
+            if (isTakeoverAbortedError(err) || err?.aborted) throw err;
+            return null;
+          });
           if (wokenRes && !wokenRes.isError) {
             capturedPeerInstanceId = peer?.agentInstanceId || null;
             if (
@@ -1247,8 +1361,14 @@ export class ComputerUseBrokerServer {
 
       if (updateActiveApp) {
         const switching = !this.#isSameActiveApp(merged.bundleId || app);
-        if (switching && !preservePinnedWindow) {
-          this.state.pinnedWindowId = null;
+        if (switching) {
+          this.#activeSelectionEpoch += 1;
+          if (!preservePinnedWindow) {
+            this.state.pinnedWindowId = null;
+          }
+          this.state.windowId = null;
+          this.state.frameWidth = 0;
+          this.state.frameHeight = 0;
         }
         this.state.activeApp = merged.bundleId || app;
         this.state.bundleId = merged.bundleId ?? (switching ? null : this.state.bundleId);
@@ -1506,8 +1626,12 @@ export class ComputerUseBrokerServer {
   /**
    * Refresh running app inventory for the UI dropdown without activating anything.
    */
-  async refreshAppsList() {
-    const res = await this.actionPeer.callTool("list_apps", {});
+  async refreshAppsList({ signal = null } = {}) {
+    const res = await raceWithReadOnlyAbort(
+      this.actionPeer.callTool("list_apps", {}, undefined, { signal }),
+      signal,
+      this.takeoverController.pauseEpoch
+    );
     const text = extractResultText(res);
     const parsed = parseAppsList(text);
     this.state.runningApps = parsed.filter((a) => a.isRunning);
@@ -1638,9 +1762,9 @@ export class ComputerUseBrokerServer {
 
     if (name === "list_apps") {
       if (this.state.permissions.accessibility === null) {
-        void this.#refreshPermissionsQuietly();
+        void this.#refreshPermissionsQuietly().catch(() => {});
       }
-      const { rawResult } = await this.refreshAppsList();
+      const { rawResult } = await this.refreshAppsList({ signal: effectiveSignal });
       return rawResult;
     }
 
@@ -1662,7 +1786,7 @@ export class ComputerUseBrokerServer {
     try {
       if (name === "get_app_state") {
         if (this.state.permissions.accessibility === null) {
-          void this.#refreshPermissionsQuietly();
+          void this.#refreshPermissionsQuietly().catch(() => {});
         }
         const cachedMeta = this.registry.getMeta(app);
         const preserveActionAx =
@@ -1684,7 +1808,11 @@ export class ComputerUseBrokerServer {
           this.#ocuObservationStats.streamOk = !res?.isError;
         } else {
           this.#ocuObservationStats.actionOk = !res?.isError;
-          if (res?.isError) this.#ocuObservationStats.lastError = extractResultText(res).slice(0, 120);
+          if (res?.isError) {
+            this.#ocuObservationStats.lastError = extractResultText(res).slice(0, 120);
+          } else {
+            this.#ocuObservationStats.lastError = null;
+          }
         }
         const stolen = await focusScope?.enforce("get_app_state");
         focusScope?.finish("get_app_state", { alreadyRecorded: Boolean(stolen) });
@@ -1729,8 +1857,8 @@ export class ComputerUseBrokerServer {
         touchedTargetOs = true;
         lastRouteKey = "query";
         if (app) {
-          const check = await this.#checkAppRunning(this.actionPeer, app);
-          if (!check.running && isAiSource) {
+          const check = await this.#checkAppRunning(this.actionPeer, app, { signal: effectiveSignal });
+          if (check.running === false && isAiSource) {
             if (this.takeoverController.paused) {
               return {
                 isError: true,
@@ -1779,7 +1907,13 @@ export class ComputerUseBrokerServer {
         if (isAiSource) {
           this.takeoverController.assertMayDispatch(operation, { isRead: true });
         }
-        let res = await this.actionPeer.callTool("query", args);
+        const callQueryRead = () =>
+          raceWithReadOnlyAbort(
+            this.actionPeer.callTool("query", args, undefined, { signal: effectiveSignal }),
+            effectiveSignal,
+            this.takeoverController.pauseEpoch
+          );
+        let res = await callQueryRead();
         if (res?.isError && /target app is hidden/iu.test(extractResultText(res))) {
           if (!isAiSource || !this.takeoverController.paused) {
             if (isAiSource) {
@@ -1794,7 +1928,7 @@ export class ComputerUseBrokerServer {
             if (isAiSource) {
               this.takeoverController.assertMayDispatch(operation, { isRead: true });
             }
-            res = await this.actionPeer.callTool("query", args);
+            res = await callQueryRead();
           }
         }
         const stolen = await focusScope?.enforce("query");
@@ -1854,8 +1988,8 @@ export class ComputerUseBrokerServer {
       // Guard mutating actions (including Raise): never foreground-launch a quit app on UI calls
       // or pinned snapshot refs, and pre-launch with `open -g` on unpinned AI calls if not running.
       if (app) {
-        const preCheck = await this.#checkAppRunning(this.actionPeer, app);
-        if (!preCheck.running) {
+        const preCheck = await this.#checkAppRunning(this.actionPeer, app, { signal: effectiveSignal });
+        if (preCheck.running === false) {
           this.registry.markAppStale(this.registry.getMeta(app)?.bundleId || app, "app_exited");
           if (source === "ui") {
             if (this.#isSameActiveApp(app)) {
@@ -2228,6 +2362,7 @@ export class ComputerUseBrokerServer {
     ) {
       return false;
     }
+    const startEpoch = this.#activeSelectionEpoch;
     const metaCached = this.registry.getMeta(app);
     const cap = await this.desktopHelperClient
       .captureWindowJpeg({
@@ -2239,8 +2374,9 @@ export class ComputerUseBrokerServer {
     if (!cap?.data) return false;
     if (cap.windowId > 0 && Number(cap.windowId) !== windowId) return false;
     if (
-      requireActiveUnchanged &&
-      (this.state.activeApp !== app || this.state.pinnedWindowId !== windowId)
+      this.#activeSelectionEpoch !== startEpoch ||
+      (requireActiveUnchanged &&
+        (!this.#isSameActiveApp(app) || this.state.pinnedWindowId !== windowId))
     ) {
       return false;
     }
@@ -2268,6 +2404,9 @@ export class ComputerUseBrokerServer {
         allowHelperQuery: !cap.boundsPt,
         selectAsActive: true,
       }).catch(() => {});
+      if (this.#activeSelectionEpoch !== startEpoch || !this.#isSameActiveApp(app)) {
+        return false;
+      }
     }
     this.previewStreamManager.setTargetStreamPaused(this.state.targetKey, false, null);
     this.state.streamPaused = false;
@@ -2298,14 +2437,16 @@ export class ComputerUseBrokerServer {
     this.streamInFlight = true;
     try {
       const targetApp = this.state.activeApp;
+      const startEpoch = this.#activeSelectionEpoch;
       if (!(this.state.pid && isProcessAlive(this.state.pid))) {
         const listRes = await this.streamPeer.callTool("list_apps", {}, 4_000);
+        if (this.#activeSelectionEpoch !== startEpoch || !this.#isSameActiveApp(targetApp)) return;
         const parsed = parseAppsList(extractResultText(listRes));
         const runningMatch =
           findRunningApp(parsed, targetApp) ||
           (this.state.appDisplayName ? findRunningApp(parsed, this.state.appDisplayName) : null);
         if (!runningMatch) {
-          if (this.state.activeApp === targetApp) {
+          if (this.#activeSelectionEpoch === startEpoch && this.#isSameActiveApp(targetApp)) {
             this.#detachExitedActiveApp(parsed.filter((a) => a.isRunning));
           }
           return;
@@ -2325,7 +2466,7 @@ export class ComputerUseBrokerServer {
           broadcast: true,
           requireActiveUnchanged: true,
         });
-        if (helperCaptured) {
+        if (helperCaptured || this.#activeSelectionEpoch !== startEpoch) {
           return;
         }
         // Pinned windows MUST NOT fall back to app-scoped OCU screenshots (wrong window provenance).
@@ -2335,6 +2476,7 @@ export class ComputerUseBrokerServer {
             allowHelperQuery: Boolean(this.desktopHelperClient?.available),
             selectAsActive: true,
           }).catch(() => {});
+          if (this.#activeSelectionEpoch !== startEpoch || !this.#isSameActiveApp(targetApp)) return;
           const lastHist = this.webAdapter.frameHistory[this.webAdapter.frameHistory.length - 1] || null;
           if (!lastHist || Number(lastHist.windowId) !== pinnedWid) {
             this.webAdapter.latestFrameBytes = null;
@@ -2364,8 +2506,13 @@ export class ComputerUseBrokerServer {
       this.#screenLockedBackoff = false;
       this.#ocuObservationStats.checkedAt = Date.now();
       this.#ocuObservationStats.streamOk = !res?.isError;
-      if (!res?.isError && this.state.activeApp === targetApp) {
+      if (
+        !res?.isError &&
+        this.#activeSelectionEpoch === startEpoch &&
+        this.#isSameActiveApp(targetApp)
+      ) {
         const upgraded = await this.#upgradeTinyFloatingWindowResult(res, this.state.pid);
+        if (this.#activeSelectionEpoch !== startEpoch || !this.#isSameActiveApp(targetApp)) return;
         res = upgraded.result;
         const dt = Date.now() - t0;
         const meta = parseSnapshotMetadata(extractResultText(res));
@@ -2416,6 +2563,7 @@ export class ComputerUseBrokerServer {
     minWinCount = 0,
     forceCheckMultiWindow = true,
   }) {
+    const startEpoch = this.#activeSelectionEpoch;
     let ambiguousEvaluated = false;
     let multiWindowAmbiguous = false;
     await this.#refreshActivePreviewGeometry({
@@ -2439,6 +2587,9 @@ export class ComputerUseBrokerServer {
           : null;
       },
     }).catch(() => {});
+    if (this.#activeSelectionEpoch !== startEpoch || !this.#isSameActiveApp(app)) {
+      return;
+    }
     if (!ambiguousEvaluated && forceCheckMultiWindow) {
       const helperWinCount = Math.max(
         Number(minWinCount || 0),
@@ -2497,71 +2648,94 @@ export class ComputerUseBrokerServer {
   }
 
   async #handleSelectApp(target, data = {}) {
+    const prevFollow = this.state.followAi;
+    const prevPinned = this.state.pinnedWindowId;
     if (typeof data.followAi === "boolean") {
       this.state.followAi = data.followAi;
     }
     const reqWid = Number(data.windowId) > 0 ? Number(data.windowId) : null;
-    const prevPinned = this.state.pinnedWindowId;
     if (reqWid !== null) {
+      if (this.state.pinnedWindowId !== reqWid) this.#activeSelectionEpoch += 1;
       this.state.pinnedWindowId = reqWid;
     } else if (!this.#isSameActiveApp(target) || data.windowId === null || data.windowId === "") {
+      if (this.state.pinnedWindowId !== null || !this.#isSameActiveApp(target)) {
+        this.#activeSelectionEpoch += 1;
+      }
       this.state.pinnedWindowId = null;
     }
 
-    const focusScope = await this.focusPolicyGuard.beginGuard(target);
-    const selRes = await this.#safeGetAppState(
-      this.actionPeer,
-      {
-        app: target,
-        include_ax: true,
-        include_screenshot: !(reqWid > 0),
-        max_tree_nodes: 400,
-      },
-      { updateActiveApp: true, allowLaunch: true, preservePinnedWindow: true }
-    );
-    const stolen = await focusScope.enforce("select_app");
-    focusScope.finish("select_app", { alreadyRecorded: stolen });
-    if (selRes?.isError) {
-      return {
-        ok: false,
-        error: extractResultText(selRes) || "该应用当前没有可捕获的窗口",
-        state: this.webAdapter.publicState(),
-      };
-    }
+    let focusScope = null;
+    let focusFinished = false;
+    try {
+      focusScope = await this.focusPolicyGuard.beginGuard(target);
+      const selRes = await this.#safeGetAppState(
+        this.actionPeer,
+        {
+          app: target,
+          include_ax: true,
+          include_screenshot: !(reqWid > 0),
+          max_tree_nodes: 400,
+        },
+        { updateActiveApp: true, allowLaunch: true, preservePinnedWindow: true }
+      );
+      const stolen = await focusScope.enforce("select_app");
+      focusScope.finish("select_app", { alreadyRecorded: stolen });
+      focusFinished = true;
+      if (selRes?.isError) {
+        this.state.pinnedWindowId = prevPinned;
+        this.state.followAi = prevFollow;
+        return {
+          ok: false,
+          error: extractResultText(selRes) || "该应用当前没有可捕获的窗口",
+          state: this.webAdapter.publicState(),
+        };
+      }
 
-    const geomRes = await this.#refreshActivePreviewGeometry({
-      app: target,
-      allowHelperQuery: true,
-      selectAsActive: true,
-    });
-    if (reqWid && geomRes.notFound) {
-      this.state.pinnedWindowId = prevPinned;
-      await this.#refreshActivePreviewGeometry({
+      const geomRes = await this.#refreshActivePreviewGeometry({
         app: target,
         allowHelperQuery: true,
         selectAsActive: true,
-      }).catch(() => {});
-      this.#syncPreviewStateFields();
-      return {
-        ok: false,
-        statusCode: 404,
-        error: `指定的目标窗口 (${reqWid}) 不存在或已关闭`,
-        state: this.webAdapter.publicState(),
-      };
+      });
+      if (reqWid && geomRes.notFound) {
+        this.state.pinnedWindowId = prevPinned;
+        await this.#refreshActivePreviewGeometry({
+          app: target,
+          allowHelperQuery: true,
+          selectAsActive: true,
+        }).catch(() => {});
+        this.#syncPreviewStateFields();
+        return {
+          ok: false,
+          statusCode: 404,
+          error: `指定的目标窗口 (${reqWid}) 不存在或已关闭`,
+          state: this.webAdapter.publicState(),
+        };
+      }
+
+      await this.#tryCaptureHelperWindowJpeg({
+        app: target,
+        pid: this.state.pid,
+        windowId: reqWid,
+        refreshGeometry: false,
+        broadcast: false,
+      });
+
+      this.state.lastActivityAt = Date.now();
+      this.webAdapter.broadcastState();
+      this.webAdapter.ensureStreamLoop();
+      return this.webAdapter.publicState();
+    } catch (err) {
+      this.state.pinnedWindowId = prevPinned;
+      this.state.followAi = prevFollow;
+      throw err;
+    } finally {
+      if (focusScope && !focusFinished) {
+        try {
+          const stolen = await focusScope.enforce("select_app");
+          focusScope.finish("select_app", { alreadyRecorded: Boolean(stolen) });
+        } catch {}
+      }
     }
-
-    await this.#tryCaptureHelperWindowJpeg({
-      app: target,
-      pid: this.state.pid,
-      windowId: reqWid,
-      refreshGeometry: false,
-      broadcast: false,
-    });
-
-    this.state.lastActivityAt = Date.now();
-    this.webAdapter.broadcastState();
-    this.webAdapter.ensureStreamLoop();
-    return this.webAdapter.publicState();
   }
 
   async #handleBringToFront(target) {
@@ -2712,7 +2886,7 @@ export class ComputerUseBrokerServer {
     }
 
     const check = await this.#checkAppRunning(this.actionPeer, app);
-    if (!check.running) {
+    if (check.running === false) {
       if (this.#isSameActiveApp(app)) {
         this.#detachExitedActiveApp(check.apps?.filter((a) => a.isRunning));
       }
@@ -2808,16 +2982,17 @@ export class ComputerUseBrokerServer {
       isAi: false,
       isMutating: true,
     });
-    const focusScope = await this.focusPolicyGuard.beginGuard(app);
-    const uiCallOpts = {
-      source: "ui",
-      focusScopeOverride: focusScope,
-      operation: uiOp,
-    };
+    let focusScope = null;
     let delegatedToToolCall = false;
     let interactTouchedOs = false;
 
     try {
+      focusScope = await this.focusPolicyGuard.beginGuard(app);
+      const uiCallOpts = {
+        source: "ui",
+        focusScopeOverride: focusScope,
+        operation: uiOp,
+      };
       if (data.kind === "click") {
         const normX = Number(data.normX);
         const normY = Number(data.normY);
@@ -3228,7 +3403,7 @@ export class ComputerUseBrokerServer {
   }
 
 
-  async getToolsList() {
+  async getToolsList({ host = "antigravity" } = {}) {
     if (!this.cachedTools) {
       const raw = await this.actionPeer.listTools();
       const tools = Array.isArray(raw?.tools)
@@ -3340,14 +3515,35 @@ export class ComputerUseBrokerServer {
       }
       this.cachedTools = { ...(raw || {}), tools };
     }
+    if (host === "t3") {
+      return {
+        ...this.cachedTools,
+        tools: (this.cachedTools.tools || []).map((tool) => {
+          if (!tool || typeof tool.description !== "string" || !tool.description.includes(SIDECAR_TOOL_NOTE)) {
+            return tool;
+          }
+          return {
+            ...tool,
+            description: tool.description.replace(SIDECAR_TOOL_NOTE, T3_SIDECAR_TOOL_NOTE),
+          };
+        }),
+      };
+    }
     return this.cachedTools;
   }
 
   #handleSocketConnection(conn) {
+    if (this.#closing) {
+      try {
+        conn.destroy();
+      } catch {}
+      return;
+    }
     this.socketClients.add(conn);
     const connAbort = new AbortController();
     const connCtx = {
       sessionId: `conn-${this.#nextConnSeq++}`,
+      boundClientSessionIds: new Set(),
       connAbort,
       inFlightRequests: new Map(),
       cancelledRequestIds: new Set(),
@@ -3359,10 +3555,16 @@ export class ComputerUseBrokerServer {
       }
       connCtx.inFlightRequests.clear();
       void this.replManager?.closeSession?.(connCtx.sessionId)?.catch?.(() => {});
+      for (const csid of connCtx.boundClientSessionIds) {
+        void this.replManager?.disconnectClientSession?.(csid)?.catch?.(() => {});
+      }
+      connCtx.boundClientSessionIds.clear();
       this.socketClients.delete(conn);
     };
     conn.setEncoding("utf8");
     let buf = "";
+    let bufBytes = 0;
+    let scanOffset = 0;
 
     conn.on("error", () => {
       cleanupConn("socket_error");
@@ -3374,15 +3576,23 @@ export class ComputerUseBrokerServer {
     });
 
     conn.on("data", (chunk) => {
-      buf += chunk;
-      if (Buffer.byteLength(buf, "utf8") > MAX_LINE_BUFFER_BYTES) {
+      const strChunk = String(chunk);
+      buf += strChunk;
+      bufBytes += Buffer.byteLength(strChunk, "utf8");
+      if (bufBytes > MAX_LINE_BUFFER_BYTES) {
         conn.destroy();
         return;
       }
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
+      for (;;) {
+        const nl = buf.indexOf("\n", scanOffset);
+        if (nl < 0) {
+          scanOffset = buf.length;
+          break;
+        }
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
+        scanOffset = 0;
+        bufBytes = buf.length ? Buffer.byteLength(buf, "utf8") : 0;
         if (!line) continue;
         void this.#dispatchBrokerRpc(conn, line, connCtx);
       }
@@ -3478,8 +3688,17 @@ export class ComputerUseBrokerServer {
         return;
       }
       if (method === "tools/list") {
-        const result = await this.getToolsList();
+        const result = await this.getToolsList({ host: params?.host });
         reply({ result });
+        return;
+      }
+      if (method === "sidecar/info") {
+        reply({
+          result: {
+            webPort: this.webAdapter?.webPort || this.webPort || 0,
+            uiToken: this.uiToken || "",
+          },
+        });
         return;
       }
       if (method === "tools/call") {
@@ -3498,11 +3717,18 @@ export class ComputerUseBrokerServer {
         return;
       }
       if (method === "repl/tools") {
-        reply({ result: this.replManager.getToolDefinitions() });
+        reply({ result: this.replManager.getToolDefinitions({ host: params?.host }) });
         return;
       }
       if (method === "repl/run") {
-        const result = await this.replManager.run(connCtx.sessionId, params || {}, {
+        const replSid =
+          typeof params?.clientSessionId === "string" && params.clientSessionId.trim()
+            ? params.clientSessionId.trim()
+            : connCtx.sessionId;
+        if (replSid !== connCtx.sessionId) {
+          connCtx.boundClientSessionIds.add(replSid);
+        }
+        const result = await this.replManager.run(replSid, params || {}, {
           signal: reqAbort.signal,
         });
         if (!reqAbort.signal.aborted) {
@@ -3511,7 +3737,14 @@ export class ComputerUseBrokerServer {
         return;
       }
       if (method === "repl/reset") {
-        const result = await this.replManager.reset(connCtx.sessionId);
+        const replSid =
+          typeof params?.clientSessionId === "string" && params.clientSessionId.trim()
+            ? params.clientSessionId.trim()
+            : connCtx.sessionId;
+        if (replSid !== connCtx.sessionId) {
+          connCtx.boundClientSessionIds.add(replSid);
+        }
+        const result = await this.replManager.reset(replSid);
         if (!reqAbort.signal.aborted) {
           reply({ result });
         }
@@ -3558,6 +3791,47 @@ export class ComputerUseBrokerServer {
     });
   }
 
+  async #probeRpcHealthy(socketPath, timeoutMs = 400) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let buf = "";
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          probe.destroy();
+        } catch {}
+        resolve(ok);
+      };
+      const probe = net.createConnection(socketPath);
+      probe.setEncoding("utf8");
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref?.();
+      probe.once("connect", () => {
+        try {
+          probe.write('{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n');
+        } catch {
+          finish(false);
+        }
+      });
+      probe.on("data", (chunk) => {
+        buf += chunk;
+        const nl = buf.indexOf("\n");
+        if (nl >= 0) {
+          try {
+            const msg = JSON.parse(buf.slice(0, nl));
+            finish(Boolean(msg?.result?.ok));
+          } catch {
+            finish(false);
+          }
+        }
+      });
+      probe.once("error", () => finish(false));
+      probe.once("close", () => finish(false));
+    });
+  }
+
   async #reclaimStaleSocketOwner() {
     if (!this.reclaimStaleOwner || !this.infoPath || !existsSync(this.infoPath)) return false;
     let info;
@@ -3581,6 +3855,20 @@ export class ComputerUseBrokerServer {
       return false;
     }
 
+    const oldHostPid = Number(info?.hostParentPid || 0);
+    if (
+      info?.standalone !== true &&
+      oldHostPid > 0 &&
+      oldHostPid !== process.ppid &&
+      oldHostPid !== process.pid &&
+      isProcessAlive(oldHostPid)
+    ) {
+      const healthy = await this.#probeRpcHealthy(this.socketPath, 400);
+      if (healthy) {
+        return false;
+      }
+    }
+
     try {
       process.kill(oldPid, "SIGTERM");
     } catch (err) {
@@ -3602,7 +3890,7 @@ export class ComputerUseBrokerServer {
       }
     };
 
-    if (await waitUntilFree(1200, true)) {
+    if (await waitUntilFree(3000, true)) {
       return true;
     }
     try {
@@ -3614,6 +3902,7 @@ export class ComputerUseBrokerServer {
   }
 
   async start() {
+    this.#closing = false;
     mkdirSync(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
     if (existsSync(this.socketPath)) {
       let liveOwner = await this.#probeLiveSocket(this.socketPath);
@@ -3632,19 +3921,26 @@ export class ComputerUseBrokerServer {
     }
 
     this.socketServer = net.createServer((conn) => this.#handleSocketConnection(conn));
-    await new Promise((resolve, reject) => {
-      this.socketServer.once("error", reject);
-      this.socketServer.listen(this.socketPath, () => {
-        this.#ownsBoundSocket = true;
-        try {
-          chmodSync(this.socketPath, 0o600);
-          this.#boundSocketInode = statSync(this.socketPath).ino;
-        } catch {}
-        resolve();
+    try {
+      await new Promise((resolve, reject) => {
+        const onListenErr = (err) => reject(err);
+        this.socketServer.once("error", onListenErr);
+        this.socketServer.listen(this.socketPath, () => {
+          this.socketServer?.removeListener("error", onListenErr);
+          this.#ownsBoundSocket = true;
+          try {
+            chmodSync(this.socketPath, 0o600);
+            this.#boundSocketInode = statSync(this.socketPath).ino;
+          } catch {}
+          resolve();
+        });
       });
-    });
 
-    await this.webAdapter.start();
+      await this.webAdapter.start();
+    } catch (err) {
+      await this.close().catch(() => {});
+      throw err;
+    }
     if (this.desktopHelperClient && typeof this.desktopHelperClient.start === "function") {
       void this.desktopHelperClient
         .start()
@@ -3662,6 +3958,8 @@ export class ComputerUseBrokerServer {
           JSON.stringify(
             {
               pid: process.pid,
+              hostParentPid: process.env.ANTIGRAVITY_SIDECAR_WEB_PORT ? process.ppid : null,
+              standalone: !process.env.ANTIGRAVITY_SIDECAR_WEB_PORT,
               brokerBootId: this.brokerBootId,
               webPort: this.webPort,
               socketPath: this.socketPath,
@@ -3683,6 +3981,20 @@ export class ComputerUseBrokerServer {
   }
 
   async close() {
+    this.#closing = true;
+    const serverRef = this.socketServer;
+    this.socketServer = null;
+    const serverClosePromise = serverRef
+      ? new Promise((resolve) => serverRef.close(() => resolve()))
+      : Promise.resolve();
+
+    for (const sock of this.socketClients) {
+      try {
+        sock.destroy();
+      } catch {}
+    }
+    this.socketClients.clear();
+
     this.focusPolicyGuard.close();
     if (this.previewStreamManager && typeof this.previewStreamManager.closeAll === "function") {
       await this.previewStreamManager.closeAll().catch(() => {});
@@ -3710,10 +4022,7 @@ export class ComputerUseBrokerServer {
       await this.axBridge.close().catch(() => {});
     }
 
-    if (this.socketServer) {
-      await new Promise((resolve) => this.socketServer.close(() => resolve()));
-      this.socketServer = null;
-    }
+    await serverClosePromise;
     if (this.#ownsBoundSocket) {
       try {
         if (existsSync(this.socketPath)) {
@@ -3738,7 +4047,12 @@ if (isMainModule(import.meta.url)) {
     process.exit(1);
   });
 
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const forceTimer = setTimeout(() => process.exit(0), 5000);
+    forceTimer.unref?.();
     server.close().finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);

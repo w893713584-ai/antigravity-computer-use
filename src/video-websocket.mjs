@@ -415,22 +415,33 @@ export class VideoWebSocketHub {
     }
 
     const hostHdr = String(req.headers.host || "").trim().toLowerCase();
-    const validHosts =
-      boundPort > 0
-        ? [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`]
-        : ["127.0.0.1", "localhost"];
-    if (!validHosts.includes(hostHdr)) {
+    const hostMatch = /^(127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/u.exec(hostHdr);
+    const hostPortValid =
+      Boolean(hostMatch) &&
+      (hostMatch[2] === undefined || (Number(hostMatch[2]) >= 1 && Number(hostMatch[2]) <= 65535));
+    if (!hostPortValid) {
       rejectUpgrade(socket, 403, "Invalid Host");
       return;
     }
 
-    const originHdr = String(req.headers.origin || "").trim().toLowerCase();
-    const expectedOrigin = `http://${hostHdr}`;
-    const altOrigins =
-      boundPort > 0
-        ? [`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`]
-        : ["http://127.0.0.1", "http://localhost"];
-    if (!originHdr || (originHdr !== expectedOrigin && !altOrigins.includes(originHdr))) {
+    const originHdr = String(req.headers.origin || "").trim();
+    let originTrusted = false;
+    if (originHdr) {
+      try {
+        const parsedOrigin = new URL(originHdr);
+        const proto = parsedOrigin.protocol.toLowerCase();
+        const hostname = parsedOrigin.hostname.toLowerCase();
+        if (proto === "vscode-webview:") {
+          originTrusted = true;
+        } else if (
+          (proto === "http:" || proto === "https:") &&
+          (hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]")
+        ) {
+          originTrusted = true;
+        }
+      } catch {}
+    }
+    if (!originTrusted) {
       rejectUpgrade(socket, 403, "Invalid Origin");
       return;
     }

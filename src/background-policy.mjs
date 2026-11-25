@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -534,10 +534,12 @@ export async function restoreFrontmostAppFast(
   }
 }
 
+const NON_MAIN_WINDOW_SUBROLES = new Set(["AXDialog", "AXSystemDialog", "AXFloatingWindow"]);
+
 export function pickPromotableMainWindow(mainWindow, windows = []) {
   if (
     mainWindow &&
-    String(mainWindow.subrole || "") !== "AXDialog" &&
+    !NON_MAIN_WINDOW_SUBROLES.has(String(mainWindow.subrole || "")) &&
     Number(mainWindow.width) >= 300 &&
     Number(mainWindow.height) >= 200
   ) {
@@ -595,7 +597,7 @@ export function buildPromoteMainWindowJxaScript(pid) {
     '  if ($.AXUIElementCopyAttributeValue(appEl, $("AXMainWindow"), mainOut) === 0 && mainOut[0]) {',
     '    var mainSub = getSubrole(mainOut[0]);',
     '    var mainSz = getSize(mainOut[0]);',
-    '    if (mainSub !== "AXDialog" && mainSz && mainSz.width >= 300 && mainSz.height >= 200) {',
+    '    if (mainSub !== "AXDialog" && mainSub !== "AXSystemDialog" && mainSub !== "AXFloatingWindow" && mainSz && mainSz.width >= 300 && mainSz.height >= 200) {',
     '      win = mainOut[0];',
     '    }',
     '  }',
@@ -713,7 +715,8 @@ export async function captureMainWindowFallbackJpeg(pid) {
   }
   if (!winInfo || !Number.isInteger(winInfo.wid) || winInfo.wid <= 0) return null;
 
-  const tmpFile = path.join(os.tmpdir(), `agy-cua-mainwin-${pid}-${crypto.randomUUID()}.jpg`);
+  const safeTmp = os.tmpdir().includes("/.t3/") || !existsSync(os.tmpdir()) ? "/tmp" : os.tmpdir();
+  const tmpFile = path.join(safeTmp, `agy-cua-mainwin-${pid}-${crypto.randomUUID()}.jpg`);
   try {
     await execFileAsync(
       "/usr/sbin/screencapture",

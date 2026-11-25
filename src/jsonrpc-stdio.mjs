@@ -3,16 +3,18 @@ import { MAX_LINE_BUFFER_BYTES, SIDECAR_PILL_MARKDOWN } from "./constants.mjs";
 
 export const ONE_TIME_PILL_HINT = `[Side-pane live view: include ${SIDECAR_PILL_MARKDOWN} once in your reply to the user so the live mini-window opens on the right side of Antigravity.]`;
 
-export function createOneTimePillHintAttacher() {
+export function createOneTimePillHintAttacher(defaultHint = ONE_TIME_PILL_HINT) {
   let pillHintSent = false;
-  return function attachPillHint(result) {
+  return function attachPillHint(result, overrideHintText = null) {
     if (pillHintSent || !result || result.isError || !Array.isArray(result.content)) {
       return result;
     }
+    const hintText = overrideHintText || defaultHint;
+    if (!hintText) return result;
     pillHintSent = true;
     return {
       ...result,
-      content: [...result.content, { type: "text", text: ONE_TIME_PILL_HINT }],
+      content: [...result.content, { type: "text", text: hintText }],
     };
   };
 }
@@ -36,9 +38,12 @@ export function runJsonRpcStdioServer({
   maxLineBufferBytes = MAX_LINE_BUFFER_BYTES,
 }) {
   let buffer = "";
+  let bufBytes = 0;
+  let scanOffset = 0;
   let discardingOversizedLine = false;
   let endedCleanly = false;
   let queue = Promise.resolve();
+  let clientInfo = null;
   const attachPillHint = createOneTimePillHintAttacher();
   const stdioAbortController = new AbortController();
   const inFlightControllers = new Map();
@@ -113,6 +118,11 @@ export function runJsonRpcStdioServer({
     let currentCallSignal = null;
     try {
       if (method === "initialize") {
+        if (isPlainObject(params.clientInfo)) {
+          clientInfo = params.clientInfo;
+        }
+        const resolvedInstructions =
+          typeof instructions === "function" ? instructions(params, clientInfo) : instructions;
         send({
           jsonrpc: "2.0",
           id,
@@ -120,7 +130,7 @@ export function runJsonRpcStdioServer({
             protocolVersion: params.protocolVersion || "2025-06-18",
             capabilities: { tools: { listChanged: false } },
             serverInfo,
-            instructions,
+            instructions: resolvedInstructions,
           },
         });
         return;
@@ -132,7 +142,7 @@ export function runJsonRpcStdioServer({
       }
 
       if (method === "tools/list") {
-        const result = await onListTools(params, req);
+        const result = await onListTools(params, req, { clientInfo });
         send({ jsonrpc: "2.0", id, result });
         return;
       }
@@ -161,6 +171,7 @@ export function runJsonRpcStdioServer({
           const result = await onCallTool(params, req, {
             attachPillHint,
             signal: callAbort.signal,
+            clientInfo,
           });
           if (!callAbort.signal.aborted) {
             send({ jsonrpc: "2.0", id, result });
@@ -215,31 +226,55 @@ export function runJsonRpcStdioServer({
     }
 
     buffer += incoming;
+    bufBytes += Buffer.byteLength(incoming, "utf8");
     for (;;) {
-      const nl = buffer.indexOf("\n");
-      if (nl < 0) break;
+      const nl = buffer.indexOf("\n", scanOffset);
+      if (nl < 0) {
+        scanOffset = buffer.length;
+        break;
+      }
       const rawLine = buffer.slice(0, nl);
       buffer = buffer.slice(nl + 1);
+      scanOffset = 0;
+      bufBytes = buffer.length ? Buffer.byteLength(buffer, "utf8") : 0;
       if (Buffer.byteLength(rawLine, "utf8") > maxLineBufferBytes) {
         enqueueOversizedError();
         continue;
       }
       const line = rawLine.trim();
       if (line) {
-        if (line.includes("cancelled")) {
+        let quickMethod = null;
+        if (
+          line.includes("cancelled") ||
+          line.includes('"initialize"') ||
+          line.includes('"ping"') ||
+          line.includes('"tools/list"')
+        ) {
           try {
             const quick = JSON.parse(line);
-            if (isPlainObject(quick) && quick.method === "notifications/cancelled") {
-              abortRequestById(quick.params?.requestId, "notifications/cancelled");
+            if (isPlainObject(quick) && typeof quick.method === "string") {
+              quickMethod = quick.method;
+              if (quick.method === "notifications/cancelled") {
+                abortRequestById(quick.params?.requestId, "notifications/cancelled");
+              }
             }
           } catch {}
         }
-        queue = queue.then(() => handleLine(line)).catch(() => {});
+        if (
+          inFlightControllers.size > 0 &&
+          (quickMethod === "ping" || quickMethod === "tools/list")
+        ) {
+          void handleLine(line).catch(() => {});
+        } else {
+          queue = queue.then(() => handleLine(line)).catch(() => {});
+        }
       }
     }
 
-    if (Buffer.byteLength(buffer, "utf8") > maxLineBufferBytes) {
+    if (bufBytes > maxLineBufferBytes) {
       buffer = "";
+      bufBytes = 0;
+      scanOffset = 0;
       discardingOversizedLine = true;
       enqueueOversizedError();
     }

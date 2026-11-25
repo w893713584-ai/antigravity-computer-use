@@ -143,6 +143,7 @@
     this.retryNotBeforeAt = 0;
     this.retryCooldownMs = opts.retryCooldownMs > 0 ? Number(opts.retryCooldownMs) : 5000;
     this.epoch = 0;
+    this.hadServerView = false;
     this.pendingSeqForNextOutput = 0;
     this.pendingSeqQueue = [];
   }
@@ -201,11 +202,48 @@
     }
   };
 
+  PreviewVideoController.prototype.unsubscribeServer = function (reason, useKeepalive) {
+    if (!this.hadServerView) return;
+    this.hadServerView = false;
+    var payload = {
+      viewId: this.viewId,
+      brokerBootId: this.getBrokerBootId(),
+      action: "unsubscribe",
+      reason: reason || "stop",
+    };
+    if (useKeepalive && typeof root.fetch === "function") {
+      try {
+        var tok = this.getToken ? this.getToken() : "";
+        var url = "/api/video/control" + (tok ? "?token=" + encodeURIComponent(tok) : "");
+        root
+          .fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            keepalive: true,
+          })
+          .catch(function () {});
+        return;
+      } catch (_e) {}
+    }
+    if (this.apiPost) {
+      this.apiPost("/api/video/control", payload).catch(function () {});
+    }
+  };
+
   PreviewVideoController.prototype.stop = function (reason) {
     this.epoch += 1;
     this.clearTimers();
     this.closeWs();
     this.closeDecoder();
+    if (
+      reason === "pane_hidden" ||
+      reason === "pagehide" ||
+      reason === "superseded" ||
+      reason === "no_target"
+    ) {
+      this.unsubscribeServer(reason, reason === "pagehide");
+    }
     this.streamId = 0;
     this.configuredGeneration = 0;
     this.renderedGeneration = 0;
@@ -282,6 +320,7 @@
     if (!support.ok) {
       this.suppressedUntilCapabilityChange = true;
       this.onTransportChange({ mode: "jpeg", reason: support.reason, targetKey: targetKey });
+      this.hadServerView = true;
       this.apiPost("/api/video/subscribe", {
         viewId: this.viewId,
         targetKey: targetKey,
@@ -293,6 +332,7 @@
     }
 
     this.mode = "probe";
+    this.hadServerView = true;
     this.onTransportChange({ mode: "jpeg", reason: "probing_h264", targetKey: targetKey });
 
     this.apiPost("/api/video/subscribe", {
@@ -533,11 +573,22 @@
     if (!this.decoder || this.decoder.state !== "configured") return;
     if (pkt.generation !== this.configuredGeneration) return;
 
-    if (this.awaitIdr) {
-      if (!pkt.isIdr) return;
+    if (this.decoder.decodeQueueSize > 4) {
+      this.requestIdrRecovery(myEpoch);
+      return;
+    }
+
+    if (pkt.isIdr) {
       this.awaitIdr = false;
+      this.awaitingRecovery = false;
+      if (this.recoveryTimer) {
+        clearTimeout(this.recoveryTimer);
+        this.recoveryTimer = null;
+      }
       this.expectNextSeq = pkt.seq;
-    } else if (pkt.seq !== this.expectNextSeq || this.decoder.decodeQueueSize > 4) {
+    } else if (this.awaitIdr) {
+      return;
+    } else if (pkt.seq !== this.expectNextSeq) {
       this.requestIdrRecovery(myEpoch);
       return;
     }

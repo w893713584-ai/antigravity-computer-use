@@ -876,7 +876,11 @@ export async function resolveJxaPostTrust({
  * Only succeeds when the target PID's `AXFocusedUIElement` is an editable, non-secure text control
  * whose `AXSelectedText` attribute is explicitly settable AND readback confirms the write stuck.
  */
-export async function tryHeadlessSelectedTextInsert(pid, text, { axBridge = null, beforeWriteCheck = null } = {}) {
+export async function tryHeadlessSelectedTextInsert(
+  pid,
+  text,
+  { axBridge = null, wid = null, beforeWriteCheck = null } = {}
+) {
   if (process.platform !== "darwin") return { delivered: false, verified: false, reason: "non_darwin" };
   if (!Number.isInteger(pid) || pid <= 0 || typeof text !== "string" || !text.length) {
     return { delivered: false, verified: false, reason: "invalid_args" };
@@ -886,7 +890,7 @@ export async function tryHeadlessSelectedTextInsert(pid, text, { axBridge = null
   }
   if (axBridge && typeof axBridge.insertSelectedText === "function") {
     try {
-      const res = await axBridge.insertSelectedText(pid, text, { beforeWriteCheck });
+      const res = await axBridge.insertSelectedText(pid, text, { wid, beforeWriteCheck });
       if (res) return res;
     } catch (err) {
       rethrowIfWriteOutcomeUnknown(err);
@@ -911,8 +915,14 @@ export async function tryHeadlessSelectedTextInsert(pid, text, { axBridge = null
       if ($.AXUIElementCopyAttributeValue(focused, $("AXRole"), roleOut) === 0 && roleOut[0]) {
         role = ObjC.unwrap(ObjC.castRefToObject(roleOut[0]));
       }
+      var subOut = Ref();
+      var subrole = ($.AXUIElementCopyAttributeValue(focused, $("AXSubrole"), subOut) === 0 && subOut[0])
+        ? String(ObjC.unwrap(ObjC.castRefToObject(subOut[0])) || "")
+        : "";
       if (!role || allowedRoles.indexOf(role) < 0) {
         JSON.stringify({ delivered: false, verified: false, reason: "unsupported_role", role: role });
+      } else if (subrole === "AXSecureTextField") {
+        JSON.stringify({ delivered: false, verified: false, reason: "secure_field", role: role });
       } else {
         var settableRef = Ref();
         var canSetErr = $.AXUIElementIsAttributeSettable(focused, $("AXSelectedText"), settableRef);
@@ -951,7 +961,7 @@ export async function tryHeadlessBackgroundScroll(
   elementMeta,
   direction = "down",
   pages = 1,
-  { axBridge = null, snapshotId = null, elementIndex = null, beforeWriteCheck = null } = {}
+  { axBridge = null, snapshotId = null, elementIndex = null, windowTitle = "", wid = null, beforeWriteCheck = null } = {}
 ) {
   if (process.platform !== "darwin") return { delivered: false, verified: false, reason: "non_darwin" };
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -966,6 +976,8 @@ export async function tryHeadlessBackgroundScroll(
         snapshotId,
         elementIndex,
         elementMeta,
+        windowTitle,
+        wid,
         direction,
         pages,
         beforeWriteCheck,

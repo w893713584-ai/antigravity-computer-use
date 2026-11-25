@@ -858,7 +858,7 @@ test("Concurrent tool calls serialize cleanly, ai-repl gets safe read-back, and 
     // 1. Fire 4 parallel tool calls (like step 191 in 9b849133) -> must serialize strictly with max concurrency 1
     const [r1, r2, r3, r4] = await Promise.all([
       client.request("tools/call", { name: "get_app_state", arguments: { app: "com.lemon.lvpro" }, source: "ai" }),
-      client.request("tools/call", { name: "click", arguments: { app: "com.lemon.lvpro", x: 320, y: 825 }, source: "ai-repl" }),
+      client.request("tools/call", { name: "click", arguments: { app: "com.lemon.lvpro", x: 320, y: 725 }, source: "ai-repl" }),
       client.request("tools/call", { name: "press_key", arguments: { app: "com.lemon.lvpro", key: "super+a" }, source: "ai" }),
       client.request("tools/call", { name: "get_app_state", arguments: { app: "com.lemon.lvpro" }, source: "ai" }),
     ]);
@@ -884,7 +884,7 @@ test("Concurrent tool calls serialize cleanly, ai-repl gets safe read-back, and 
     triggerDelayedStealMs = 60;
     await client.request("tools/call", {
       name: "click",
-      arguments: { app: "com.lemon.lvpro", x: 320, y: 825 },
+      arguments: { app: "com.lemon.lvpro", x: 320, y: 725 },
       source: "ai",
     });
     triggerDelayedStealMs = 0;

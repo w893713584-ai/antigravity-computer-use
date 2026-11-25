@@ -170,6 +170,17 @@ function sentUnknownError(message, reason = "write_outcome_unknown") {
  * Authorize converting Window-Local Points onto the current OCU action screenshot
  * under the Same-Window Proof invariant.
  */
+function parseStrictFiniteCoord(val) {
+  if (val === null || val === undefined || val === "" || typeof val === "boolean") {
+    return NaN;
+  }
+  if (typeof val === "string" && !/^[+-]?\d+(?:\.\d+)?$/u.test(val.trim())) {
+    return NaN;
+  }
+  const n = Number(val);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 export function authorizeActionScreenshotCoords(
   meta,
   {
@@ -192,19 +203,23 @@ export function authorizeActionScreenshotCoords(
     requireSingleWindow: false,
     requirePositiveWid: true,
   });
+  const lx = parseStrictFiniteCoord(localPoint?.x);
+  const ly = parseStrictFiniteCoord(localPoint?.y);
+  const ww = parseStrictFiniteCoord(windowSize?.width);
+  const wh = parseStrictFiniteCoord(windowSize?.height);
   const hasValidInput = Boolean(
     localPoint &&
-      Number.isFinite(Number(localPoint.x)) &&
-      Number.isFinite(Number(localPoint.y)) &&
+      Number.isFinite(lx) &&
+      Number.isFinite(ly) &&
       windowSize &&
-      Number(windowSize.width) > 0 &&
-      Number(windowSize.height) > 0
+      ww > 0 &&
+      wh > 0
   );
   const sameWindowProven = Boolean(proof.sameWindowProven && hasValidInput);
   const rawPx = sameWindowProven
-    ? windowPointToScreenshotPixel(localPoint, {
-        windowWidth: windowSize.width,
-        windowHeight: windowSize.height,
+    ? windowPointToScreenshotPixel({ x: lx, y: ly }, {
+        windowWidth: ww,
+        windowHeight: wh,
         imageWidth: proof.width,
         imageHeight: proof.height,
       })
@@ -434,6 +449,7 @@ export function dedupeSpatiallyOverlappingMatches(matches = []) {
   const decorated = matches.map((m, origIdx) => ({
     match: m,
     origIdx,
+    winId: Number(m?.window_id) > 0 ? Number(m.window_id) : 0,
     box: normBox(m),
     clickRank: clickableBonus(m),
   }));
@@ -452,7 +468,11 @@ export function dedupeSpatiallyOverlappingMatches(matches = []) {
       continue;
     }
     const existingIdx = kept.findIndex(
-      (k) => k.box && overlapRatio(item.box, k.box) >= 0.7 && representsSameControl(item, k)
+      (k) =>
+        k.box &&
+        !(item.winId > 0 && k.winId > 0 && item.winId !== k.winId) &&
+        overlapRatio(item.box, k.box) >= 0.7 &&
+        representsSameControl(item, k)
     );
     if (existingIdx < 0) {
       kept.push(item);
@@ -612,6 +632,7 @@ export class BackgroundActionExecutor {
       targetWindowId = null,
       windowSize = null,
       requireSingleWindow = false,
+      points = [],
       actionLabel = "click",
     } = {}
   ) {
@@ -637,6 +658,24 @@ export class BackgroundActionExecutor {
         message: `Coordinate ${actionLabel} blocked (unproven_single_window): PID-level fallback requires a proven single-window screenshot match.`,
       };
     }
+    for (const pt of Array.isArray(points) ? points : []) {
+      const px = Array.isArray(pt) ? pt[0] : pt?.x;
+      const py = Array.isArray(pt) ? pt[1] : pt?.y;
+      if (
+        !Number.isFinite(px) ||
+        !Number.isFinite(py) ||
+        px < 0 ||
+        py < 0 ||
+        px > proof.width ||
+        py > proof.height
+      ) {
+        return {
+          ok: false,
+          reason: "out_of_bounds",
+          message: `Coordinate ${actionLabel} out of bounds: (${px}, ${py}) lies outside current window screenshot bounds (${proof.width}x${proof.height}).`,
+        };
+      }
+    }
     return { ok: true, proof };
   }
 
@@ -650,6 +689,8 @@ export class BackgroundActionExecutor {
       operation = null,
       timeoutMs = undefined,
       expectedAgentInstanceId = null,
+      preMeta = null,
+      preElement = null,
     } = {}
   ) {
     const routeTag =
@@ -688,10 +729,9 @@ export class BackgroundActionExecutor {
     if (isWriteOutcomeUnknown(lastRes)) return normalizeUnknownOutcomeResult(lastRes);
     if (!lastRes?.isError || lastRes?.reason === "stale_peer_generation") return lastRes;
 
-    const hasFiniteCoord = (v) =>
-      v !== null && v !== undefined && v !== "" && Number.isFinite(Number(v));
+    const hasFiniteCoord = (v) => Number.isFinite(parseStrictFiniteCoord(v));
     const isCoordPeerOp =
-      (toolName === "click" || toolName === "drag") &&
+      (toolName === "click" || toolName === "drag" || toolName === "scroll") &&
       (hasFiniteCoord(callArgs?.x) ||
         hasFiniteCoord(callArgs?.y) ||
         hasFiniteCoord(callArgs?.from_x) ||
@@ -716,9 +756,70 @@ export class BackgroundActionExecutor {
       typeof this.refreshActionStateFn === "function" &&
       STALE_SNAPSHOT_RE.test(extractResultText(lastRes))
     ) {
+      const elemIdxRaw =
+        callArgs?.element_index !== undefined && callArgs?.element_index !== null
+          ? String(callArgs.element_index).trim()
+          : "";
+      if (elemIdxRaw && elemIdxRaw !== "0" && Number(elemIdxRaw) >= 1_000_000) {
+        const latestNow = this.registry.getLatestSnapshot(preMeta?.bundleId || app);
+        return {
+          ...buildStaleRefToolResult({
+            errorCode: "STALE_REF",
+            message: `Query element alias #${elemIdxRaw} is no longer valid in native AX table; re-run query or get_app_state before retrying.`,
+            currentSnapshotId: latestNow?.id || null,
+          }),
+          fatal: true,
+          deliveryState: "not_sent",
+        };
+      }
       this.#beforeWrite(operation, true);
       const refreshRes = await this.refreshActionStateFn(app, { shouldFollow, operation });
       if (refreshRes?.isError) return lastRes;
+      const refreshedMeta = this.registry.getMeta(app);
+      const windowOrProcDrifted = Boolean(
+        preMeta &&
+          refreshedMeta &&
+          ((preMeta.pid > 0 && refreshedMeta.pid > 0 && preMeta.pid !== refreshedMeta.pid) ||
+            (preMeta.processToken &&
+              refreshedMeta.processToken &&
+              preMeta.processToken !== refreshedMeta.processToken) ||
+            (preMeta.windowId > 0 &&
+              refreshedMeta.windowId > 0 &&
+              preMeta.windowId !== refreshedMeta.windowId) ||
+            (preMeta.windowTitle &&
+              refreshedMeta.windowTitle &&
+              preMeta.windowTitle !== refreshedMeta.windowTitle))
+      );
+      if (windowOrProcDrifted) {
+        return {
+          ...buildStaleRefToolResult({
+            errorCode: "STALE_REF",
+            message:
+              "Target window or process changed during state refresh; blocked automatic action replay.",
+            currentSnapshotId: refreshedMeta?.snapshotId || null,
+          }),
+          fatal: true,
+          deliveryState: "not_sent",
+        };
+      }
+      if (elemIdxRaw && elemIdxRaw !== "0" && (preElement || preMeta?.actionHasAx)) {
+        const refreshedEl = refreshedMeta?.elements?.get(elemIdxRaw) || null;
+        if (
+          !preElement?.fingerprint ||
+          !refreshedEl?.fingerprint ||
+          refreshedEl.fingerprint !== preElement.fingerprint
+        ) {
+          return {
+            ...buildStaleRefToolResult({
+              errorCode: "STALE_REF",
+              message: `Element #${elemIdxRaw} changed or disappeared after state refresh; blocked automatic action replay.`,
+              currentSnapshotId: refreshedMeta?.snapshotId || null,
+            }),
+            fatal: true,
+            deliveryState: "not_sent",
+          };
+        }
+      }
       beforeWriteCheck();
       lastRes = await invokePeer();
       if (isWriteOutcomeUnknown(lastRes)) return normalizeUnknownOutcomeResult(lastRes);
@@ -875,6 +976,8 @@ export class BackgroundActionExecutor {
         shouldFollow,
         allowAutoRefresh,
         operation,
+        preMeta,
+        preElement,
         expectedAgentInstanceId: isCoordPeerClick
           ? preMeta?.actionScreenshotMeta?.peerInstanceId || null
           : null,
@@ -990,7 +1093,7 @@ export class BackgroundActionExecutor {
       toolName,
       { ...cleanArgs, key_method: method },
       app,
-      { shouldFollow, allowAutoRefresh, operation }
+      { shouldFollow, allowAutoRefresh, operation, preMeta }
     );
   }
 
@@ -1006,6 +1109,21 @@ export class BackgroundActionExecutor {
       routeScope = null,
     } = ctx;
     const jxaTrusted = await ctx.getJxaTrusted();
+    if (
+      !jxaTrusted &&
+      this.editableFocusFn === verifyEditableTextFocus &&
+      this.axBridge &&
+      this.axBridge.enabled !== false &&
+      typeof this.axBridge.verifyEditableFocus === "function"
+    ) {
+      return { ok: false };
+    }
+    const effectiveWid =
+      routeScope?.windowId ||
+      preMeta?.tinyWindowOverride?.wid ||
+      preSnapshot?.windowId ||
+      preMeta?.windowId ||
+      null;
     const clickMethods = this.focusPolicyGuard.planClick(
       { app, element_index: cleanArgs.element_index },
       aliases,
@@ -1055,6 +1173,8 @@ export class BackgroundActionExecutor {
             snapshotId: preSnapshot?.id || null,
             elementIndex: cleanArgs.element_index,
             fallbackElementMeta: preElement,
+            windowTitle: preMeta?.windowTitle || "",
+            wid: effectiveWid,
           }).catch(() => ({ editable: false }))
         : { editable: false };
     if (!focusCheck?.editable) {
@@ -1089,7 +1209,16 @@ export class BackgroundActionExecutor {
         result: normalizeUnknownOutcomeResult(selAllRes),
       };
     }
-    if (selAllRes?.isError) return { ok: false };
+    if (selAllRes?.isError) {
+      if (selAllRes.deliveryState === "not_sent") {
+        return {
+          ok: false,
+          outcomeUnknown: false,
+          result: selAllRes,
+        };
+      }
+      return { ok: false };
+    }
 
     const clearRes = await runBypassPressKey("BackSpace");
     if (clearRes?.isError) {
@@ -1139,6 +1268,7 @@ export class BackgroundActionExecutor {
         ctx.operation,
         this.selectedTextInsertFn(preMeta.pid, targetValue, {
           axBridge: this.axBridge,
+          wid: effectiveWid,
           beforeWriteCheck: () => this.#beforeWrite(ctx.operation, false),
         }),
         "set_value:ax_selected_text"
@@ -1171,8 +1301,8 @@ export class BackgroundActionExecutor {
     }
 
     const safeKeyText = focusCheck.singleLine
-      ? targetValue.replace(/[\r\n]+/gu, " ")
-      : targetValue;
+      ? targetValue.replace(/[\r\n\t]+/gu, " ")
+      : targetValue.replace(/\t/gu, " ");
     const typeKeyMethods = this.focusPolicyGuard.planKey("type_text", { app }, aliases, {
       routeScope,
       windowKeyAvailable: jxaTrusted,
@@ -1314,6 +1444,62 @@ export class BackgroundActionExecutor {
       }
       return jxaTrustedPromise;
     };
+    let normalizedArgs = cleanArgs ? { ...cleanArgs } : {};
+    if (name === "click" && !parsedRef?.hasElementRef && !windowDelivery?.localPoint) {
+      const cx = parseStrictFiniteCoord(normalizedArgs.x);
+      const cy = parseStrictFiniteCoord(normalizedArgs.y);
+      if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
+        return {
+          result: this.#buildNotSentError(
+            "invalid_coordinates",
+            "Click requires either element_index or finite numeric x and y coordinates."
+          ),
+          actionRouteKey: requestedRoute || null,
+          requestedRoute,
+          directDeliveryVerified: false,
+          actionEvent: null,
+          isStalePinnedRef: false,
+          preAppKey,
+          preSnapshot,
+          preElement,
+          preFrameDigest,
+        };
+      }
+      normalizedArgs.x = cx;
+      normalizedArgs.y = cy;
+    } else if (name === "drag" && !parsedRef?.hasElementRef) {
+      const fx = parseStrictFiniteCoord(
+        normalizedArgs.from_x !== undefined ? normalizedArgs.from_x : normalizedArgs.x
+      );
+      const fy = parseStrictFiniteCoord(
+        normalizedArgs.from_y !== undefined ? normalizedArgs.from_y : normalizedArgs.y
+      );
+      const tx = parseStrictFiniteCoord(normalizedArgs.to_x);
+      const ty = parseStrictFiniteCoord(normalizedArgs.to_y);
+      if (!Number.isFinite(fx) || !Number.isFinite(fy) || !Number.isFinite(tx) || !Number.isFinite(ty)) {
+        return {
+          result: this.#buildNotSentError(
+            "invalid_coordinates",
+            "Coordinate drag requires finite numeric from_x, from_y, to_x, and to_y coordinates."
+          ),
+          actionRouteKey: requestedRoute || null,
+          requestedRoute,
+          directDeliveryVerified: false,
+          actionEvent: null,
+          isStalePinnedRef: false,
+          preAppKey,
+          preSnapshot,
+          preElement,
+          preFrameDigest,
+        };
+      }
+      normalizedArgs.from_x = fx;
+      normalizedArgs.from_y = fy;
+      normalizedArgs.to_x = tx;
+      normalizedArgs.to_y = ty;
+    }
+    cleanArgs = normalizedArgs;
+
     const ctx = {
       app,
       cleanArgs,
@@ -1497,6 +1683,7 @@ export class BackgroundActionExecutor {
                       height: windowDelivery.windowBoundsPt.height ?? windowDelivery.windowBoundsPt.h,
                     }
                   : null,
+                points: [[cleanArgs.x, cleanArgs.y]],
                 actionLabel: "click",
               })
             : { ok: true };
@@ -1578,6 +1765,8 @@ export class BackgroundActionExecutor {
               axBridge: this.axBridge,
               snapshotId: preSnapshot?.id || null,
               elementIndex: parsedRef.rawIndex,
+              windowTitle: preMeta?.windowTitle || "",
+              wid: effectiveRouteScope?.windowId || null,
               beforeWriteCheck,
             }),
             "click:ax_show_menu"
@@ -1656,6 +1845,7 @@ export class BackgroundActionExecutor {
           operation,
           this.selectedTextInsertFn(preMeta.pid, cleanArgs.text, {
             axBridge: this.axBridge,
+            wid: effectiveRouteScope?.windowId || null,
             beforeWriteCheck,
           }),
           "type_text:ax_selected_text"
@@ -1890,20 +2080,28 @@ export class BackgroundActionExecutor {
                 "Background set_value bypass outcome unknown; blocked native fallback.",
                 "set_value_bypass_unknown"
               );
+            } else if (bypass?.result) {
+              handledViaBypass = true;
+              actionRouteKey = formatDeliveryRoute("set_value", "sky_bypass");
+              result = bypass.result;
             }
           }
         }
 
         if (!handledViaBypass) {
-          const hasAnyDragCoord =
-            Number.isFinite(startX) ||
-            Number.isFinite(startY) ||
-            Number.isFinite(cleanArgs.to_x) ||
-            Number.isFinite(cleanArgs.to_y);
-          const isCoordDragDispatch = name === "drag" && hasAnyDragCoord;
+          const hasDragStartCoords = Number.isFinite(startX) && Number.isFinite(startY);
+          const hasDragEndCoords =
+            Number.isFinite(cleanArgs.to_x) && Number.isFinite(cleanArgs.to_y);
+          const dragPoints = [];
+          if (hasDragStartCoords) dragPoints.push([startX, startY]);
+          if (hasDragEndCoords) dragPoints.push([cleanArgs.to_x, cleanArgs.to_y]);
+          const isCoordDragDispatch =
+            name === "drag" && (hasDragStartCoords || hasDragEndCoords);
           const coordDragAuth = isCoordDragDispatch
             ? this.#authorizeCoordDispatch(preMeta, {
                 liveWindowObs,
+                requireSingleWindow: true,
+                points: dragPoints,
                 actionLabel: "drag",
               })
             : { ok: true };
@@ -1921,6 +2119,8 @@ export class BackgroundActionExecutor {
               shouldFollow,
               allowAutoRefresh,
               operation,
+              preMeta,
+              preElement,
               expectedAgentInstanceId: isCoordDragDispatch
                 ? coordDragAuth.proof?.peerInstanceId || preMeta?.actionScreenshotMeta?.peerInstanceId || null
                 : null,
@@ -1953,6 +2153,8 @@ export class BackgroundActionExecutor {
                 axBridge: this.axBridge,
                 snapshotId: preSnapshot?.id || null,
                 elementIndex: parsedRef?.hasElementRef ? parsedRef.rawIndex : null,
+                windowTitle: preMeta?.windowTitle || "",
+                wid: effectiveRouteScope?.windowId || null,
                 beforeWriteCheck,
               }
             ),
@@ -2150,10 +2352,27 @@ export class BackgroundActionExecutor {
     let deliveryStatus = "delivered_unverified";
     let verificationNote = "";
     if (name === "set_value") {
-      const postEl =
-        parsedRef?.hasElementRef && postSnapshot?.elements?.get(parsedRef.rawIndex)
-          ? postSnapshot.elements.get(parsedRef.rawIndex)
+      const freshSnapForSetValue =
+        postSnapshot && (!preSnapshot || postSnapshot.id !== preSnapshot.id) ? postSnapshot : null;
+      let postEl =
+        parsedRef?.hasElementRef &&
+        Number(parsedRef.rawIndex) < 1_000_000 &&
+        freshSnapForSetValue?.elements?.get(parsedRef.rawIndex)
+          ? freshSnapForSetValue.elements.get(parsedRef.rawIndex)
           : null;
+      if (postEl && preElement?.role && postEl.role !== preElement.role) {
+        postEl = null;
+      }
+      if (!postEl && preElement?.identifier && freshSnapForSetValue?.elements instanceof Map) {
+        const idMatches = Array.from(freshSnapForSetValue.elements.values()).filter(
+          (el) =>
+            el?.identifier === preElement.identifier &&
+            (!preElement.role || el.role === preElement.role)
+        );
+        if (idMatches.length === 1) {
+          postEl = idMatches[0];
+        }
+      }
       const check = verifySetValueObservation({
         expectedValue: cleanArgs.value,
         postElement: postEl,

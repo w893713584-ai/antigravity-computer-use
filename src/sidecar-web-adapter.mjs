@@ -114,7 +114,7 @@ export class SidecarWebAdapter {
 
   validateHttpToken(req, url) {
     if (
-      req?.method === "GET" &&
+      (req?.method === "GET" || req?.method === "HEAD") &&
       (url.pathname === "/" ||
         url.pathname === "/index.html" ||
         url.pathname === "/preload.js" ||
@@ -419,41 +419,51 @@ export class SidecarWebAdapter {
         return;
       }
 
-    if (req.method === "GET" && url.pathname === "/healthz") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+    const isGetOrHead = req.method === "GET" || req.method === "HEAD";
+    const isHead = req.method === "HEAD";
+    const secHeaders = {
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    };
+
+    if (isGetOrHead && url.pathname === "/healthz") {
+      res.writeHead(200, { "Content-Type": "application/json", ...secHeaders });
+      res.end(isHead ? undefined : JSON.stringify({ ok: true }));
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/preload.js") {
+    if (isGetOrHead && url.pathname === "/preload.js") {
       const preload = existsSync(SIDECAR_PRELOAD_PATH)
         ? readFileSync(SIDECAR_PRELOAD_PATH, "utf8")
         : "window.sidecar = window.sidecar || { fetch: window.fetch.bind(window) };";
       res.writeHead(200, {
         "Content-Type": "application/javascript; charset=utf-8",
         "Cache-Control": "no-store",
+        ...secHeaders,
       });
-      res.end(preload);
+      res.end(isHead ? undefined : preload);
       return;
     }
 
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+    if (isGetOrHead && (url.pathname === "/" || url.pathname === "/index.html")) {
       const html = readFileSync(UI_HTML_PATH, "utf8");
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
+        ...secHeaders,
       });
-      res.end(html);
+      res.end(isHead ? undefined : html);
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/preview-video.js") {
+    if (isGetOrHead && url.pathname === "/preview-video.js") {
       const js = existsSync(PREVIEW_VIDEO_JS_PATH) ? readFileSync(PREVIEW_VIDEO_JS_PATH, "utf8") : "";
       res.writeHead(200, {
         "Content-Type": "application/javascript; charset=utf-8",
         "Cache-Control": "no-store",
+        ...secHeaders,
       });
-      res.end(js);
+      res.end(isHead ? undefined : js);
       return;
     }
 
@@ -586,6 +596,11 @@ export class SidecarWebAdapter {
     }
 
     if (req.method === "POST") {
+      const badRequest = (msg) => {
+        const err = new Error(msg);
+        err.statusCode = 400;
+        return err;
+      };
       try {
         const data = await this.#readJsonBody(req);
 
@@ -593,7 +608,7 @@ export class SidecarWebAdapter {
           const convId = String(data.conversationId || "").trim();
           const message = String(data.message || "");
           if (!convId || convId.startsWith("-") || !message) {
-            throw new Error("conversationId and message are required");
+            throw badRequest("conversationId and message are required");
           }
           const out = await this.#execAgentApi(
             [
@@ -613,7 +628,7 @@ export class SidecarWebAdapter {
           const model = String(data.model || "flash").trim();
           const message = String(data.message || "");
           if (!message || model.startsWith("-")) {
-            throw new Error("valid model and message are required");
+            throw badRequest("valid model and message are required");
           }
           const out = await this.#execAgentApi(
             ["new-conversation", "--model", model, "--", message],
@@ -626,7 +641,7 @@ export class SidecarWebAdapter {
         if (url.pathname === "/_sidecar/get-conversation-metadata") {
           const convId = String(data.conversationId || "").trim();
           if (!convId || convId.startsWith("-")) {
-            throw new Error("valid conversationId is required");
+            throw badRequest("valid conversationId is required");
           }
           const out = await this.#execAgentApi(["get-conversation-metadata", convId]);
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -645,7 +660,7 @@ export class SidecarWebAdapter {
 
         if (url.pathname === "/api/select-app") {
           const target = String(data.app || "").trim();
-          if (!target) throw new Error("app is required");
+          if (!target) throw badRequest("app is required");
           const payload = await this.runSerializedAction(() => this.onSelectApp(target, data));
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(payload));
@@ -738,7 +753,7 @@ export class SidecarWebAdapter {
             throw staleErr;
           }
           const app = String(data.app || this.state.activeApp || "").trim();
-          if (!app) throw new Error("请先选择一个要操作的后台窗口");
+          if (!app) throw badRequest("请先选择一个要操作的后台窗口");
           if (typeof this.preQueueValidateInteract === "function") {
             const preCheck = await this.preQueueValidateInteract(app, data);
             if (preCheck && !preCheck.ok) {

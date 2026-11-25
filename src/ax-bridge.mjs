@@ -663,7 +663,7 @@ function handleBindSnapshot(params) {
     return { bound: false, boundCount: 0, windowBound: false, reason: "jxa_accessibility_untrusted" };
   }
   var appEl = createAppElement(pid, 0.7);
-  var winEl = selectTargetWindow(appEl, params.windowTitle || "");
+  var winEl = selectTargetWindow(appEl, params.windowTitle || "", params.wid || 0);
   if (!winEl) {
     return { bound: false, boundCount: 0, windowBound: false };
   }
@@ -928,7 +928,8 @@ function handleVerifyLiveRef(params) {
   return { ok: true };
 }
 
-function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta) {
+function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta, preferredTitle, preferredWid) {
+  var effWid = Number(preferredWid || (elementMeta && elementMeta.windowId) || 0);
   if (snapshotId && elementIndex !== undefined && elementIndex !== null) {
     var snap = retainedSnapshots[String(snapshotId)];
     var bound = snap && snap.elements ? snap.elements[String(elementIndex)] : null;
@@ -937,8 +938,14 @@ function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta) {
     }
   }
   var appEl = createAppElement(pid, 0.75);
-  var winEl = selectTargetWindow(appEl, "");
+  var winEl = selectTargetWindow(appEl, preferredTitle || "", effWid);
   if (!winEl) return { appEl: appEl, winEl: null, el: null };
+  if (effWid > 0 && hasAxGetWindowFn) {
+    var actualWid = getAxWindowId(winEl);
+    if (actualWid > 0 && actualWid !== effWid) {
+      return { appEl: appEl, winEl: null, el: null };
+    }
+  }
   if (!elementMeta) return { appEl: appEl, winEl: winEl, el: null };
 
   var walkedRes = walkWindowPreorder(winEl, 400, 0.45);
@@ -1001,10 +1008,18 @@ function handleVerifyEditableFocus(params) {
       }
     }
     if (!targetEl && params.elementMeta && params.elementMeta.identifier) {
-      var resolved = resolveElementHandle(pid, params.snapshotId, params.elementIndex, {
-        identifier: params.elementMeta.identifier,
-        role: params.elementMeta.role || ""
-      });
+      var resolved = resolveElementHandle(
+        pid,
+        params.snapshotId,
+        params.elementIndex,
+        {
+          identifier: params.elementMeta.identifier,
+          role: params.elementMeta.role || "",
+          windowId: params.elementMeta.windowId || null
+        },
+        params.windowTitle || "",
+        params.wid || 0
+      );
       if (resolved && resolved.el) {
         targetEl = resolved.el;
       }
@@ -1048,6 +1063,16 @@ function handleInsertSelectedText(params) {
   var role = readStr(focused, "AXRole");
   if (SAFE_INSERT_ROLES.indexOf(role) < 0) {
     return { delivered: false, verified: false, reason: "unsupported_role", role: role };
+  }
+  if (readStr(focused, "AXSubrole") === "AXSecureTextField") {
+    return { delivered: false, verified: false, reason: "secure_field", role: role };
+  }
+  var reqWid = Number(params.wid || 0);
+  if (reqWid > 0 && hasAxGetWindowFn) {
+    var fOwned = verifyElementWindowOwnership(focused, null, reqWid);
+    if (fOwned.effectiveWid > 0 && fOwned.effectiveWid !== reqWid) {
+      return { delivered: false, verified: false, reason: "focused_window_mismatch", wid: fOwned.effectiveWid };
+    }
   }
   var settableRef = Ref();
   if (Number($.AXUIElementIsAttributeSettable(focused, $("AXSelectedText"), settableRef)) !== 0 || !settableRef[0]) {
@@ -1112,7 +1137,20 @@ function handleScroll(params) {
   var sign = dir === "down" || dir === "right" ? 1 : -1;
   var pageAmount = Math.max(0.1, Math.min(10, Number(params.pages) || 1));
 
-  var resolved = resolveElementHandle(pid, params.snapshotId, params.elementIndex, params.elementMeta || null);
+  var resolved = resolveElementHandle(
+    pid,
+    params.snapshotId,
+    params.elementIndex,
+    params.elementMeta || null,
+    params.windowTitle || "",
+    params.wid || 0
+  );
+  if (Number(params.wid || 0) > 0 && (resolved.el || resolved.winEl) && hasAxGetWindowFn) {
+    var scrollOwned = verifyElementWindowOwnership(resolved.el, resolved.winEl || null, params.wid);
+    if (scrollOwned.effectiveWid > 0 && scrollOwned.effectiveWid !== Number(params.wid)) {
+      return { delivered: false, verified: false, reason: "element_window_mismatch" };
+    }
+  }
   var bar = findScrollBarFromElementOrWindow(
     resolved,
     barAttr,
@@ -1129,9 +1167,22 @@ function handleScroll(params) {
 function handleContextMenu(params) {
   var pid = Number(params.pid || 0);
   if (!pid || pid <= 0) return { delivered: false, verified: false, reason: "invalid_pid" };
-  var resolved = resolveElementHandle(pid, params.snapshotId, params.elementIndex, params.elementMeta || null);
+  var resolved = resolveElementHandle(
+    pid,
+    params.snapshotId,
+    params.elementIndex,
+    params.elementMeta || null,
+    params.windowTitle || "",
+    params.wid || 0
+  );
   if (!resolved.el) {
     return { delivered: false, verified: false, reason: "element_not_found" };
+  }
+  if (Number(params.wid || 0) > 0 && hasAxGetWindowFn) {
+    var menuOwned = verifyElementWindowOwnership(resolved.el, resolved.winEl || null, params.wid);
+    if (menuOwned.effectiveWid > 0 && menuOwned.effectiveWid !== Number(params.wid)) {
+      return { delivered: false, verified: false, reason: "element_window_mismatch" };
+    }
   }
   var actions = getActionNames(resolved.el);
   if (actions.indexOf("AXShowMenu") < 0) {
@@ -1648,7 +1699,14 @@ function handleResolveActionTarget(params) {
   var hitEl = null;
   var hitAxWinEl = null;
   if (params.elementIndex !== null && params.elementIndex !== undefined && String(params.elementIndex) !== "") {
-    var byRef = resolveElementHandle(pid, params.snapshotId, String(params.elementIndex), params.elementMeta || null);
+    var byRef = resolveElementHandle(
+      pid,
+      params.snapshotId,
+      String(params.elementIndex),
+      params.elementMeta || null,
+      params.windowTitle || win.title || "",
+      win.wid || params.wid || 0
+    );
     if (byRef && byRef.el) {
       var refOwned = verifyElementWindowOwnership(byRef.el, byRef.winEl, win.wid);
       if (refOwned.ok) {
@@ -1827,7 +1885,14 @@ function handleWindowClick(params) {
   var elCenter = null;
 
   if (!hasLocalPoint && hasElem && elemIdxStr !== "0") {
-    var resolved = resolveElementHandle(pid, params.snapshotId, elemIdxStr, params.elementMeta || null);
+    var resolved = resolveElementHandle(
+      pid,
+      params.snapshotId,
+      elemIdxStr,
+      params.elementMeta || null,
+      params.windowTitle || "",
+      params.wid || 0
+    );
     if (!resolved.el) {
       return { delivered: false, deliveryState: "not_sent", reason: "element_not_found" };
     }
@@ -2894,7 +2959,7 @@ export class PersistentAxBridge {
     return this.request("ensure_manual_ax", { pid }, { timeoutMs: 1200 });
   }
 
-  async bindSnapshot({ snapshotId, pid, windowTitle, elements }) {
+  async bindSnapshot({ snapshotId, pid, wid = null, windowTitle, elements }) {
     const serialized = [];
     if (elements instanceof Map) {
       for (const [, el] of elements.entries()) {
@@ -2912,7 +2977,7 @@ export class PersistentAxBridge {
     }
     return this.request(
       "bind_snapshot",
-      { snapshotId, pid, windowTitle: windowTitle || "", elements: serialized },
+      { snapshotId, pid, wid, windowTitle: windowTitle || "", elements: serialized },
       { timeoutMs: 2200 }
     );
   }
@@ -2925,36 +2990,55 @@ export class PersistentAxBridge {
     );
   }
 
-  async verifyEditableFocus(pid, { snapshotId = null, elementIndex = null, elementMeta = null } = {}) {
+  async verifyEditableFocus(
+    pid,
+    { snapshotId = null, elementIndex = null, elementMeta = null, windowTitle = "", wid = null } = {}
+  ) {
     return this.request(
       "verify_editable_focus",
-      { pid, snapshotId, elementIndex, elementMeta },
+      { pid, snapshotId, elementIndex, elementMeta, windowTitle, wid },
       { timeoutMs: 1000 }
     );
   }
 
-  async insertSelectedText(pid, text, { beforeWriteCheck = null } = {}) {
-    return this.request("insert_selected_text", { pid, text }, { timeoutMs: 1800, beforeWriteCheck });
+  async insertSelectedText(pid, text, { wid = null, beforeWriteCheck = null } = {}) {
+    return this.request("insert_selected_text", { pid, text, wid }, { timeoutMs: 1800, beforeWriteCheck });
   }
 
   async scroll(
     pid,
-    { snapshotId = null, elementIndex = null, elementMeta = null, direction = "down", pages = 1, beforeWriteCheck = null } = {}
+    {
+      snapshotId = null,
+      elementIndex = null,
+      elementMeta = null,
+      windowTitle = "",
+      wid = null,
+      direction = "down",
+      pages = 1,
+      beforeWriteCheck = null,
+    } = {}
   ) {
     return this.request(
       "scroll",
-      { pid, snapshotId, elementIndex, elementMeta, direction, pages },
+      { pid, snapshotId, elementIndex, elementMeta, windowTitle, wid, direction, pages },
       { timeoutMs: 2200, beforeWriteCheck }
     );
   }
 
   async triggerContextMenu(
     pid,
-    { snapshotId = null, elementIndex = null, elementMeta = null, beforeWriteCheck = null } = {}
+    {
+      snapshotId = null,
+      elementIndex = null,
+      elementMeta = null,
+      windowTitle = "",
+      wid = null,
+      beforeWriteCheck = null,
+    } = {}
   ) {
     return this.request(
       "context_menu",
-      { pid, snapshotId, elementIndex, elementMeta },
+      { pid, snapshotId, elementIndex, elementMeta, windowTitle, wid },
       { timeoutMs: 1800, beforeWriteCheck }
     );
   }

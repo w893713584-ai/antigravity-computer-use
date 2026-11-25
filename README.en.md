@@ -54,7 +54,7 @@ The system is built across **4 coordinated layers** centered around a single sha
 4. **Low Latency & High Maintainability**: `PersistentAxBridge` removes repeated `osascript` cold starts, hardware H.264 cuts capture overhead, and deep modules allow fast, TCC-free CI testing.
 
 ### Cons & Limitations
-1. **Platform & Host Lock-In**: Built exclusively for **macOS 14.0+** and **Google Antigravity** (requires Antigravity MCP wiring and Aux Pane `sidecar://` support); no Windows or Linux support.
+1. **Platform & Host Coupling**: Built exclusively for **macOS 14.0+** and **Google Antigravity / T3 Code (Antigravity Provider)**; no Windows or Linux support. When running inside T3 Code standalone (without Antigravity Desktop open), the live mini-window opens via its local `http://127.0.0.1:<port>/?token=...` preview URL instead of `sidecar://`.
 2. **TCC Permissions & Ad-Hoc Signature Friction**: Full capabilities require Accessibility, Screen Recording, and Input Monitoring approvals. Because local builds of `CUADesktopHelper.app` use ad-hoc signing, reinstalling/upgrading can leave macOS holding a stale TCC entry — requiring you to remove (`−`) and re-add (`+`) the app in System Settings if permission prompts persist.
 3. **App-Specific Responder Chains & Fullscreen Spaces**: Custom-drawn apps, games, fullscreen Space windows, or freshly opened sub-windows in certain Qt/Electron apps may ignore synthetic background events until the user clicks inside that window once to initialize its internal responder chain.
 4. **OS Coupling & Resident Resource Overhead**: Uses low-level SkyLight, `CGEvent`, and `ScreenCaptureKit` APIs that can require updates across future major macOS releases, alongside modest background memory/power usage for the broker, JXA bridge, and video stream.
@@ -67,7 +67,7 @@ The system is built across **4 coordinated layers** centered around a single sha
 ### Requirements
 - **OS**: macOS 14.0 (Sonoma) or later
 - **Node.js**: >= 18 (Node.js 22 recommended)
-- **Host App**: Google Antigravity
+- **Host App**: Google Antigravity or T3 Code (Antigravity Provider)
 - **From Source Only**: Xcode Command Line Tools (`swiftc`, `clang`, `codesign`)
 
 ### Installation
@@ -97,8 +97,8 @@ bash /path/to/Codex风格ComputerUse一键安装包/双击安装.command
 
 ### First-Time macOS Permissions (System Settings → Privacy & Security)
 Grant permissions as needed (missing permissions degrade individual features gracefully):
-1. **Accessibility**: `Antigravity.app`, `Open Computer Use.app`, `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
-2. **Screen Recording**: `Open Computer Use.app`, `CUADesktopHelper.app` (enables live H.264 streaming and window capture)
+1. **Accessibility**: `Antigravity.app` (plus `T3 Code (Beta).app` / `T3 Code.app` when running inside T3 Code), `Open Computer Use.app`, `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`
+2. **Screen Recording**: `Open Computer Use.app`, `CUADesktopHelper.app` (plus `T3 Code (Beta).app` / `T3 Code.app` when using T3 Code; enables live H.264 streaming and window capture)
 3. **Input Monitoring**: `CUADesktopHelper.app` (enables hardware takeover detection and global emergency hotkey)
 
 > Tip: When clicking `+` in System Settings, press `Command + Shift + G` and paste `~/.gemini/codex-style-computer-use/native-runtime/CUADesktopHelper.app`.

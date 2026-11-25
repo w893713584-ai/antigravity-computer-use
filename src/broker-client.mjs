@@ -1,16 +1,40 @@
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeSync } from "node:fs";
 import net from "node:net";
-import { BROKER_SOCKET_PATH, MAX_LINE_BUFFER_BYTES } from "./constants.mjs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  BROKER_SOCKET_PATH,
+  BROKER_SPAWN_LOCK_PATH,
+  MAX_LINE_BUFFER_BYTES,
+  sanitizeHostEnv,
+} from "./constants.mjs";
 import { ComputerUseBrokerServer } from "./broker-sidecar.mjs";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_BROKER_SCRIPT_PATH = path.join(__dirname, "broker-sidecar.mjs");
 const DEFAULT_TIMEOUT_MS = 45_000;
 const READ_ONLY_TOOLS = new Set(["list_apps", "get_app_state", "query"]);
 const RECONNECTABLE_ERR_RE = /ENOENT|ECONNREFUSED|EACCES|EPIPE|ECONNRESET|socket closed/i;
+const MISSING_DAEMON_ERR_RE = /ENOENT|ECONNREFUSED/i;
 
 function isMutatingRpc(method, params) {
   if (method === "repl/run" || method === "repl/reset") return true;
   if (method !== "tools/call") return false;
   if (params?.name === "get_app_state" && params?.arguments?.allow_launch === true) return true;
   return !READ_ONLY_TOOLS.has(params?.name);
+}
+
+function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
 }
 
 function createAbortError(message = "Broker RPC aborted") {
@@ -39,18 +63,33 @@ async function sleepWithAbortSignal(ms, signal = null) {
 
 /**
  * Connects MCP servers (`computer-use` and `computer-use-js`) to the running
- * Antigravity Sidecar Broker over Unix Domain Socket so every AI tool call
- * automatically streams into the Side-Pane Mini-Window without raising windows.
+ * Antigravity Sidecar Broker (or on-demand standalone Broker in T3 Code) over
+ * Unix Domain Socket so every AI tool call streams into the Mini-Window without raising windows.
  */
 export class BrokerRpcClient {
-  constructor({ socketPath = BROKER_SOCKET_PATH, enableFallback = false } = {}) {
+  constructor({
+    socketPath = BROKER_SOCKET_PATH,
+    enableFallback = false,
+    autoSpawn = socketPath === BROKER_SOCKET_PATH && !process.env.AGY_CUA_BROKER_SOCK,
+    spawnFn = spawn,
+    brokerScriptPath = DEFAULT_BROKER_SCRIPT_PATH,
+    lockPath = BROKER_SPAWN_LOCK_PATH,
+    clientSessionId = crypto.randomUUID(),
+  } = {}) {
     this.socketPath = socketPath;
     this.enableFallback = enableFallback;
+    this.autoSpawn = Boolean(autoSpawn);
+    this.spawnFn = spawnFn;
+    this.brokerScriptPath = brokerScriptPath;
+    this.lockPath = lockPath;
+    this.clientSessionId = clientSessionId;
     this.conn = null;
     this.connecting = null;
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = "";
+    this.bufBytes = 0;
+    this.scanOffset = 0;
     this.fallbackBroker = null;
   }
 
@@ -62,6 +101,101 @@ export class BrokerRpcClient {
         () => {}
       );
     } catch {}
+  }
+
+  async #probeSocketReady() {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        try {
+          s.destroy();
+        } catch {}
+        resolve(ok);
+      };
+      const s = net.createConnection(this.socketPath);
+      const t = setTimeout(() => done(false), 250);
+      t.unref?.();
+      s.once("connect", () => {
+        clearTimeout(t);
+        done(true);
+      });
+      s.once("error", () => {
+        clearTimeout(t);
+        done(false);
+      });
+    });
+  }
+
+  #tryAcquireSpawnLock() {
+    if (!this.lockPath) return true;
+    try {
+      mkdirSync(path.dirname(this.lockPath), { recursive: true, mode: 0o700 });
+    } catch {}
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const fd = openSync(this.lockPath, "wx", 0o600);
+        try {
+          writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        } catch {}
+        try {
+          closeSync(fd);
+        } catch {}
+        return true;
+      } catch (err) {
+        if (err?.code !== "EEXIST" || attempt > 0) return false;
+        try {
+          const st = statSync(this.lockPath);
+          let lockPid = 0;
+          try {
+            const parsed = JSON.parse(readFileSync(this.lockPath, "utf8"));
+            lockPid = Number(parsed?.pid || 0);
+          } catch {}
+          const isStale =
+            Date.now() - st.mtimeMs > 10_000 || (lockPid > 0 && !isPidAlive(lockPid));
+          if (!isStale) return false;
+          rmSync(this.lockPath, { force: true });
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+
+  async #ensureDaemonBroker(signal = null) {
+    if (!this.autoSpawn || signal?.aborted) return false;
+    if (await this.#probeSocketReady()) return true;
+
+    const ownsLock = this.#tryAcquireSpawnLock();
+    try {
+      if (ownsLock && typeof this.spawnFn === "function") {
+        const child = this.spawnFn(process.execPath, [this.brokerScriptPath], {
+          detached: true,
+          stdio: "ignore",
+          env: sanitizeHostEnv(process.env),
+        });
+        child?.on?.("error", () => {});
+        child?.unref?.();
+      }
+
+      const deadline = Date.now() + 6000;
+      while (Date.now() < deadline) {
+        if (signal?.aborted) throw createAbortError();
+        if (await this.#probeSocketReady()) {
+          return true;
+        }
+        await sleepWithAbortSignal(100, signal);
+      }
+      return await this.#probeSocketReady();
+    } finally {
+      if (ownsLock && this.lockPath && existsSync(this.lockPath)) {
+        try {
+          rmSync(this.lockPath, { force: true });
+        } catch {}
+      }
+    }
   }
 
   async #connectSocket() {
@@ -82,9 +216,20 @@ export class BrokerRpcClient {
         socket.removeListener("error", onError);
         this.conn = socket;
         this.buffer = "";
-        socket.on("data", (chunk) => this.#onData(chunk));
-        socket.on("error", (err) => this.#teardown(err));
-        socket.on("close", () => this.#teardown(new Error("broker socket closed")));
+        this.bufBytes = 0;
+        this.scanOffset = 0;
+        socket.on("data", (chunk) => {
+          if (this.conn !== socket) return;
+          this.#onData(chunk);
+        });
+        socket.on("error", (err) => {
+          if (this.conn !== socket) return;
+          this.#teardown(err, socket);
+        });
+        socket.on("close", () => {
+          if (this.conn !== socket) return;
+          this.#teardown(new Error("broker socket closed"), socket);
+        });
         // Reclaim fallback broker resources once primary sidecar is back online
         if (this.fallbackBroker) {
           const fb = this.fallbackBroker;
@@ -101,15 +246,23 @@ export class BrokerRpcClient {
   }
 
   #onData(chunk) {
-    this.buffer += chunk;
-    if (Buffer.byteLength(this.buffer, "utf8") > MAX_LINE_BUFFER_BYTES) {
+    const strChunk = String(chunk);
+    this.buffer += strChunk;
+    this.bufBytes += Buffer.byteLength(strChunk, "utf8");
+    if (this.bufBytes > MAX_LINE_BUFFER_BYTES) {
       this.#teardown(new Error("Broker RPC response exceeded 32MB limit"));
       return;
     }
-    let nl;
-    while ((nl = this.buffer.indexOf("\n")) >= 0) {
+    for (;;) {
+      const nl = this.buffer.indexOf("\n", this.scanOffset);
+      if (nl < 0) {
+        this.scanOffset = this.buffer.length;
+        break;
+      }
       const line = this.buffer.slice(0, nl).trim();
       this.buffer = this.buffer.slice(nl + 1);
+      this.scanOffset = 0;
+      this.bufBytes = this.buffer.length ? Buffer.byteLength(this.buffer, "utf8") : 0;
       if (!line) continue;
       let msg;
       try {
@@ -132,13 +285,22 @@ export class BrokerRpcClient {
     }
   }
 
-  #teardown(err) {
+  #teardown(err, targetSocket = null) {
+    if (targetSocket && this.conn && this.conn !== targetSocket) {
+      try {
+        targetSocket.destroy();
+      } catch {}
+      return;
+    }
     if (this.conn) {
       try {
         this.conn.destroy();
       } catch {}
       this.conn = null;
     }
+    this.buffer = "";
+    this.bufBytes = 0;
+    this.scanOffset = 0;
     for (const entry of this.pending.values()) {
       if (entry.timer) clearTimeout(entry.timer);
       const entryErr = new Error(err?.message || "broker socket closed", { cause: err });
@@ -164,7 +326,7 @@ export class BrokerRpcClient {
     if (conn.destroyed || !conn.writable) {
       const deadErr = new Error("broker socket closed");
       deadErr.dispatched = false;
-      this.#teardown(deadErr);
+      this.#teardown(deadErr, conn);
       throw deadErr;
     }
     const id = this.nextId++;
@@ -223,7 +385,7 @@ export class BrokerRpcClient {
             const localErr = new Error(writeErr?.message || "socket write failed", { cause: writeErr });
             if (writeErr?.code) localErr.code = writeErr.code;
             localErr.dispatched = true;
-            this.#teardown(writeErr);
+            this.#teardown(writeErr, conn);
             entry.reject(localErr);
           }
         });
@@ -232,7 +394,7 @@ export class BrokerRpcClient {
         const localErr = new Error(syncErr?.message || "socket write failed", { cause: syncErr });
         if (syncErr?.code) localErr.code = syncErr.code;
         localErr.dispatched = Boolean(entry.dispatched);
-        this.#teardown(syncErr);
+        this.#teardown(syncErr, conn);
         entry.reject(localErr);
       }
     });
@@ -262,9 +424,17 @@ export class BrokerRpcClient {
       throw createAbortError();
     }
 
-    const mutating = isMutatingRpc(method, params);
+    const effectiveParams =
+      (method === "repl/run" || method === "repl/reset") &&
+      params &&
+      typeof params === "object" &&
+      !params.clientSessionId
+        ? { ...params, clientSessionId: this.clientSessionId }
+        : params;
+
+    const mutating = isMutatingRpc(method, effectiveParams);
     try {
-      return await this.#sendOnce(method, params, timeoutMs, signal);
+      return await this.#sendOnce(method, effectiveParams, timeoutMs, signal);
     } catch (err) {
       if (err?.aborted || signal?.aborted) {
         throw err?.aborted ? err : createAbortError();
@@ -279,10 +449,14 @@ export class BrokerRpcClient {
         throw err;
       }
 
-      // Brief backoff + single reconnect attempt (abortable immediately if signal cancels)
-      await sleepWithAbortSignal(150, signal);
+      if (this.autoSpawn && MISSING_DAEMON_ERR_RE.test(errSig)) {
+        await this.#ensureDaemonBroker(signal);
+      } else {
+        await sleepWithAbortSignal(150, signal);
+      }
+
       try {
-        return await this.#sendOnce(method, params, timeoutMs, signal);
+        return await this.#sendOnce(method, effectiveParams, timeoutMs, signal);
       } catch (retryErr) {
         if (retryErr?.aborted || signal?.aborted) {
           throw retryErr?.aborted ? retryErr : createAbortError();
@@ -299,8 +473,8 @@ export class BrokerRpcClient {
           if (signal?.aborted) throw createAbortError();
           if (method === "tools/list") return fb.getToolsList();
           if (method === "tools/call") {
-            return fb.executeToolCall(params?.name, params?.arguments || {}, {
-              source: params?.source === "ai-repl" ? "ai-repl" : "ai",
+            return fb.executeToolCall(effectiveParams?.name, effectiveParams?.arguments || {}, {
+              source: effectiveParams?.source === "ai-repl" ? "ai-repl" : "ai",
               signal,
             });
           }

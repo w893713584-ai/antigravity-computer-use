@@ -350,6 +350,15 @@ export class PreviewStreamManager {
   #ensureView(viewId) {
     let view = this.#views.get(viewId);
     if (!view) {
+      while (this.#views.size >= 16) {
+        const evictCandidate = Array.from(this.#views.values())
+          .filter((v) => v.mode === "jpeg" && !v.firstFrameTimer && !v.recoveryTimer)
+          .sort((a, b) => (a.lastActiveAt || 0) - (b.lastActiveAt || 0))[0];
+        if (!evictCandidate) break;
+        this.#clearViewTimers(evictCandidate);
+        this.#detachViewFromTarget(evictCandidate);
+        this.#views.delete(evictCandidate.viewId);
+      }
       view = {
         viewId,
         targetKey: null,
@@ -361,8 +370,11 @@ export class PreviewStreamManager {
         firstFrameTimer: null,
         recoveryTimer: null,
         lastRenderedSeq: 0,
+        lastActiveAt: Date.now(),
       };
       this.#views.set(viewId, view);
+    } else {
+      view.lastActiveAt = Date.now();
     }
     return view;
   }

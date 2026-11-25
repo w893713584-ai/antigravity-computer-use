@@ -43,6 +43,9 @@ async function main() {
       ? "[完成] 已实时连接正在运行的 Antigravity，自动启用「Computer Use 小窗」并热刷新 MCP！"
       : "[完成] 已写入 Antigravity 配置（打开或重启一次 Antigravity 即可生效）"
   );
+  if (result.t3SyncedCount > 0) {
+    console.log(`[完成] 已同步更新 ${result.t3SyncedCount} 个 T3 Code (Antigravity Provider) 配置实例！`);
+  }
 
   if (result.doctorOutput) {
     console.log("\n[macOS 权限状态检查]");
@@ -51,8 +54,8 @@ async function main() {
 
   const helperRuntimePath = path.join(result.installDir, "native-runtime", "CUADesktopHelper.app");
   console.log("\n[系统权限配置清单（系统设置 → 隐私与安全性）]");
-  console.log("  • 辅助功能 (Accessibility)：Antigravity.app + Open Computer Use.app + CUADesktopHelper.app");
-  console.log("  • 录屏与系统录音 (Screen Recording)：Open Computer Use.app + CUADesktopHelper.app");
+  console.log("  • 辅助功能 (Accessibility)：Antigravity.app（若在 T3 Code 中使用还需勾选 T3 Code (Beta).app / T3 Code.app）+ Open Computer Use.app + CUADesktopHelper.app");
+  console.log("  • 录屏与系统录音 (Screen Recording)：Open Computer Use.app + CUADesktopHelper.app（在 T3 Code 中使用建议同时勾选 T3 Code (Beta).app / T3 Code.app）");
   console.log("  • 输入监控 (Input Monitoring)：CUADesktopHelper.app");
   console.log(`  • CUADesktopHelper 路径（选「+」后按 ⌘⇧G 粘贴）：${helperRuntimePath}`);
   console.log("  * 若新版升级后某项权限开关看似已开但仍提示未授权，请先选中 CUADesktopHelper 点「−」移出后再点「+」重加一次。");
