@@ -21,6 +21,7 @@ import {
   installCodexComputerUse,
   uninstallCodexComputerUse,
 } from "../scripts/installer-lib.mjs";
+import { buildNativeBundles } from "../scripts/build-native.mjs";
 import { buildShareZip } from "../scripts/pack-share.mjs";
 
 test("One-click installer stages files to ~/.gemini/codex-style-computer-use, merges mcp_config idempotently, and uninstalls cleanly", async () => {
@@ -502,6 +503,60 @@ test("Codex 6.2 regressions: installer enforces expectedArchs/signingMode and le
     });
     assert.equal(wrongSign.ok, false);
     assert.equal(wrongSign.reason, "expected_signed_not_adhoc");
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("buildNativeBundles reuses unchanged native bundles across package.json version bumps to preserve CDHash/TCC", async () => {
+  if (process.platform !== "darwin") return;
+  const tempRoot = mkdtempSync(path.join(tmpdir(), "agy-cua-build-reuse-"));
+  const fakeSource = path.join(tempRoot, "repo");
+  const runtimeDir = path.join(fakeSource, "native-runtime");
+  const payloadsDir = path.join(fakeSource, "native-payloads");
+  mkdirSync(fakeSource, { recursive: true });
+
+  try {
+    for (const rel of ["package.json", "native", "native-runtime", "native-payloads"]) {
+      cpSync(path.join(PROJECT_ROOT, rel), path.join(fakeSource, rel), { recursive: true });
+    }
+
+    const helperBin = path.join(runtimeDir, "CUADesktopHelper.app", "Contents", "MacOS", "CUADesktopHelper");
+    const inoBefore = statSync(helperBin).ino;
+    const shaBefore = sha256File(helperBin);
+
+    // 1. Bump package.json version (even from a legacy pkgVersion-hashed manifest) -> must reuse & migrate sourceSha256
+    const pkgPath = path.join(fakeSource, "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+    writeFileSync(pkgPath, `${JSON.stringify({ ...pkg, version: "9.9.9" }, null, 2)}\n`);
+
+    const first = await buildNativeBundles({
+      sourceRoot: fakeSource,
+      runtimeDir,
+      payloadsDir,
+      skipLiveSelfCheck: true,
+    });
+    assert.equal(first.skipped, false);
+    assert.equal(first.reused.desktopHelper, true, "CUADesktopHelper must be reused across package.json version bump");
+    assert.equal(first.reused.scriptRunner, true, "CUAScriptRunner must be reused across package.json version bump");
+    assert.equal(statSync(helperBin).ino, inoBefore);
+    assert.equal(sha256File(helperBin), shaBefore);
+
+    const migratedSourceSha = first.manifest.components.desktopHelper.sourceSha256;
+
+    // 2. Bump package.json version a second time -> must still reuse with identical version-independent sourceSha256
+    writeFileSync(pkgPath, `${JSON.stringify({ ...pkg, version: "9.9.10" }, null, 2)}\n`);
+    const second = await buildNativeBundles({
+      sourceRoot: fakeSource,
+      runtimeDir,
+      payloadsDir,
+      skipLiveSelfCheck: true,
+    });
+    assert.equal(second.reused.desktopHelper, true);
+    assert.equal(second.reused.scriptRunner, true);
+    assert.equal(second.manifest.components.desktopHelper.sourceSha256, migratedSourceSha);
+    assert.equal(statSync(helperBin).ino, inoBefore);
+    assert.equal(sha256File(helperBin), shaBefore);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

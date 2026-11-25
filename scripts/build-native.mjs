@@ -78,6 +78,19 @@ function isGitSubpathClean(sourceRoot, relDir) {
   }
 }
 
+function extractLegacyPkgVersions(existingEntry, currentPkgVersion) {
+  const versions = new Set();
+  if (typeof currentPkgVersion === "string" && currentPkgVersion.trim()) {
+    versions.add(currentPkgVersion.trim());
+  }
+  const entryVersion = typeof existingEntry?.version === "string" ? existingEntry.version.trim() : "";
+  const stripped = entryVersion.replace(/\.\d+$/u, "");
+  if (stripped && stripped !== entryVersion) {
+    versions.add(stripped);
+  }
+  return [...versions];
+}
+
 async function canReuseBuiltComponent({
   role,
   appOut,
@@ -86,6 +99,7 @@ async function canReuseBuiltComponent({
   existingEntry,
   expectedSigningMode,
   expectedSourceSha,
+  legacySourceShas = [],
   sourceRoot,
   relSrcDir,
 }) {
@@ -95,6 +109,7 @@ async function canReuseBuiltComponent({
   if (existingEntry.zipSha256 !== sha256File(zipOut)) return false;
   const sourceMatches =
     existingEntry.sourceSha256 === expectedSourceSha ||
+    (Array.isArray(legacySourceShas) && legacySourceShas.includes(existingEntry.sourceSha256)) ||
     (!existingEntry.sourceSha256 && isGitSubpathClean(sourceRoot, relSrcDir));
   if (!sourceMatches) return false;
   const verify = await verifyNativeAppBundle(appOut, {
@@ -406,12 +421,14 @@ export async function buildNativeBundles({
   const desktopHelperSrcDir = path.join(sourceRoot, "native", "DesktopHelper");
   const scriptRunnerSrcDir = path.join(sourceRoot, "native", "ScriptRunner");
 
+  // Intentionally omit pkgVersion from sourceSha256 so JS-only version bumps reuse
+  // unchanged native .app bundles and keep their ad-hoc CDHash / macOS TCC grants intact.
   const helperSourceSha = computeComponentSourceSha256(desktopHelperSrcDir, {
-    extraMeta: { role: "desktopHelper", codesignIdentity, desiredArchs, pkgVersion },
+    extraMeta: { role: "desktopHelper", codesignIdentity, desiredArchs },
   });
   const runnerSourceSha = computeComponentSourceSha256(scriptRunnerSrcDir, {
     excludeNames: ["GeneratedEmbeddedAssets.swift"],
-    extraMeta: { role: "scriptRunner", codesignIdentity, desiredArchs, pkgVersion },
+    extraMeta: { role: "scriptRunner", codesignIdentity, desiredArchs },
   });
 
   const manifestPath = path.join(payloadsDir, "manifest.json");
@@ -448,6 +465,13 @@ export async function buildNativeBundles({
 
   try {
     const existingHelper = existingManifest?.components?.desktopHelper || null;
+    const helperLegacySourceShas = existingHelper
+      ? extractLegacyPkgVersions(existingHelper, pkgVersion).map((legacyVersion) =>
+          computeComponentSourceSha256(desktopHelperSrcDir, {
+            extraMeta: { role: "desktopHelper", codesignIdentity, desiredArchs, pkgVersion: legacyVersion },
+          })
+        )
+      : [];
     const helperReused =
       !force &&
       (await canReuseBuiltComponent({
@@ -458,11 +482,20 @@ export async function buildNativeBundles({
         existingEntry: existingHelper,
         expectedSigningMode,
         expectedSourceSha: helperSourceSha,
+        legacySourceShas: helperLegacySourceShas,
         sourceRoot,
         relSrcDir: "native/DesktopHelper",
       }));
 
     const existingRunner = existingManifest?.components?.scriptRunner || null;
+    const runnerLegacySourceShas = existingRunner
+      ? extractLegacyPkgVersions(existingRunner, pkgVersion).map((legacyVersion) =>
+          computeComponentSourceSha256(scriptRunnerSrcDir, {
+            excludeNames: ["GeneratedEmbeddedAssets.swift"],
+            extraMeta: { role: "scriptRunner", codesignIdentity, desiredArchs, pkgVersion: legacyVersion },
+          })
+        )
+      : [];
     const runnerReused =
       !force &&
       (await canReuseBuiltComponent({
@@ -473,6 +506,7 @@ export async function buildNativeBundles({
         existingEntry: existingRunner,
         expectedSigningMode,
         expectedSourceSha: runnerSourceSha,
+        legacySourceShas: runnerLegacySourceShas,
         sourceRoot,
         relSrcDir: "native/ScriptRunner",
       }));
