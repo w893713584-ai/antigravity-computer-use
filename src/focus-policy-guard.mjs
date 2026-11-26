@@ -195,6 +195,14 @@ export class SelfActivationTracker {
   }
 }
 
+const CHROMIUM_BROWSER_APP_RE =
+  /^(?:com\.microsoft\.edgemac(?:\.(?:beta|dev|canary))?|com\.google\.chrome(?:\.(?:beta|dev|canary))?|org\.chromium\.chromium|com\.brave\.browser(?:\.(?:beta|nightly))?|company\.thebrowser\.browser|com\.vivaldi\.vivaldi|com\.operasoftware\.opera|microsoft\s+edge|google\s+chrome|chromium|brave\s+browser|arc|vivaldi|opera)$/iu;
+
+export function isChromiumBrowserApp(aliases = []) {
+  const list = Array.isArray(aliases) ? aliases : [aliases];
+  return list.some((a) => typeof a === "string" && CHROMIUM_BROWSER_APP_RE.test(normalizeAppIdentityToken(a)));
+}
+
 export function planBackgroundClickMethods(
   args = {},
   {
@@ -202,6 +210,7 @@ export function planBackgroundClickMethods(
     blockedMethods = [],
     avoidSkyFocus = false,
     windowPostAvailable = true,
+    preferAccessibility = false,
   } = {}
 ) {
   const blocked = new Set(
@@ -218,6 +227,12 @@ export function planBackgroundClickMethods(
 
   const button = (args.mouse_button || "left").toLowerCase();
   const count = args.click_count ?? 1;
+  const rawIdx = args.element_index;
+  const hasNonZeroElementRef =
+    rawIdx !== undefined &&
+    rawIdx !== null &&
+    String(rawIdx).trim() !== "" &&
+    String(rawIdx).trim() !== "0";
 
   const filterNonActivating = (candidates) => {
     const filtered = candidates.filter(
@@ -238,6 +253,9 @@ export function planBackgroundClickMethods(
     const base = skyBlocked ? ["window_post", "app_post"] : nonFloorBase;
     const chain = filterNonActivating(base);
     if (!blocked.has("accessibility")) {
+      if (hasNonZeroElementRef && preferAccessibility) {
+        return Array.from(new Set(["accessibility", ...chain]));
+      }
       chain.push("accessibility");
     }
     return chain;
@@ -261,6 +279,15 @@ export function planBackgroundClickMethods(
     const base = skyBlocked ? ["window_post", "app_post"] : ["sky_click", "app_post"];
     const fallbacks = filterNonActivating(base);
     if (
+      skyBlocked &&
+      preferAccessibility &&
+      count === 1 &&
+      hasNonZeroElementRef &&
+      !blocked.has("accessibility")
+    ) {
+      return Array.from(new Set(["accessibility", ...fallbacks]));
+    }
+    if (
       allowAccessibilityFallback &&
       !blocked.has("accessibility") &&
       args.element_index !== undefined &&
@@ -273,6 +300,40 @@ export function planBackgroundClickMethods(
 
   const nonLeftBase = skyBlocked ? ["window_post", "app_post"] : ["app_post"];
   return filterNonActivating(nonLeftBase);
+}
+
+export function planActClickMethods(
+  { mouseButton = "left", clickCount = 1, hasAxPress = false } = {},
+  { blockedMethods = [], windowPostAvailable = true, preferAccessibility = false } = {}
+) {
+  const blocked = new Set(
+    Array.from(blockedMethods || []).map((m) => String(m || "").trim().toLowerCase())
+  );
+  for (const floorMethod of WINDOW_LOCAL_DELIVERY_FLOOR) {
+    blocked.delete(floorMethod);
+  }
+  const button = String(mouseButton || "left").toLowerCase();
+  const count = clickCount ?? 1;
+  const ocuMethods = planBackgroundClickMethods(
+    { click_method: "auto", mouse_button: button, click_count: count },
+    { blockedMethods, windowPostAvailable, preferAccessibility }
+  ).filter((m) => m === "sky_click" || m === "app_post");
+
+  const methods = [];
+  if (
+    preferAccessibility &&
+    button === "left" &&
+    count === 1 &&
+    Boolean(hasAxPress) &&
+    !blocked.has("accessibility")
+  ) {
+    methods.push("accessibility");
+  }
+  if (windowPostAvailable !== false) {
+    methods.push("window_post");
+  }
+  methods.push(...ocuMethods);
+  return Array.from(new Set(methods));
 }
 
 export function planBackgroundKeyMethods(
@@ -734,7 +795,24 @@ export class FocusPolicyGuard {
       blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, "click", { routeScope }),
       avoidSkyFocus: false,
       windowPostAvailable,
+      preferAccessibility: isChromiumBrowserApp(list),
     });
+  }
+
+  planActClick(args = {}, aliases = [], { routeScope = null, windowPostAvailable = true } = {}) {
+    const list = uniqueAliases(aliases.length ? aliases : this.#aliasesFor(args?.app));
+    return planActClickMethods(
+      {
+        mouseButton: args?.mouse_button ?? args?.mouseButton ?? "left",
+        clickCount: args?.click_count ?? args?.clickCount ?? 1,
+        hasAxPress: Boolean(args?.hasAxPress),
+      },
+      {
+        blockedMethods: this.#tracker.getBlockedMethodsForAliases(list, "click", { routeScope }),
+        windowPostAvailable,
+        preferAccessibility: isChromiumBrowserApp(list),
+      }
+    );
   }
 
   planKey(toolName, args = {}, aliases = [], { routeScope = null, windowKeyAvailable = true } = {}) {

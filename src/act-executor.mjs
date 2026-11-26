@@ -1224,6 +1224,7 @@ export class AtomicActExecutor {
         meta: curMeta,
         snapshotId: selectedMerged?.snapshotId || null,
         match: selectedMatch,
+        elementMeta: selectedMerged?.snapshot?.elements?.get(String(selectedMatch.index)) || null,
         resolvedTarget,
         explicitWindowId: callerExplicitWindowId,
         targetWindowId: selectedWindowId,

@@ -1,3 +1,4 @@
+import { BROWSER_TITLE_SUFFIX_RE } from "./constants.mjs";
 import { parseQualifiedElementRef, SnapshotLedger } from "./headless-engine.mjs";
 
 export const SECURE_ROLE_RE =
@@ -52,6 +53,37 @@ export function hasMatchingAspectRatio(w1, h1, w2, h2, maxDelta = 0.03) {
   const r1 = aW / aH;
   const r2 = bW / bH;
   return Math.abs(r2 - r1) / Math.max(r1, 0.001) <= maxDelta;
+}
+
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/**
+ * Compare AX `AXTitle` and CG `kCGWindowName`, allowing a trailing browser/app suffix
+ * (e.g. Edge/Chrome appending ` - Microsoft Edge` to `AXTitle` but omitting it from `kCGWindowName`)
+ * while rejecting different tabs or distinct profile-suffixed windows.
+ */
+export function areWindowTitlesConsistent(expectedTitle, observedTitle, appDisplayName = "") {
+  const a = String(expectedTitle || "").trim();
+  const b = String(observedTitle || "").trim();
+  if (!a || !b || a === b) return true;
+
+  const cleanApp = String(appDisplayName || "").trim();
+  if (cleanApp) {
+    const appSuffixRe = new RegExp(`\\s+[-–—]\\s+${escapeRegExp(cleanApp)}$`, "iu");
+    const aAppStripped = a.replace(appSuffixRe, "").trim();
+    const bAppStripped = b.replace(appSuffixRe, "").trim();
+    if (aAppStripped === bAppStripped) return true;
+  }
+
+  const aHasBrowserSuffix = BROWSER_TITLE_SUFFIX_RE.test(a);
+  const bHasBrowserSuffix = BROWSER_TITLE_SUFFIX_RE.test(b);
+  const aStripped = a.replace(BROWSER_TITLE_SUFFIX_RE, "").trim();
+  const bStripped = b.replace(BROWSER_TITLE_SUFFIX_RE, "").trim();
+  if (aHasBrowserSuffix && !bHasBrowserSuffix && aStripped === b) return true;
+  if (bHasBrowserSuffix && !aHasBrowserSuffix && bStripped === a) return true;
+  return aHasBrowserSuffix && bHasBrowserSuffix && aStripped === bStripped;
 }
 
 /**
@@ -286,7 +318,7 @@ export function evaluateScreenshotMetaProof(
         liveWindowIds?.length === 1 &&
         liveWindowObs?.title &&
         shot?.windowTitle &&
-        String(liveWindowObs.title).trim() !== String(shot.windowTitle).trim())
+        !areWindowTitlesConsistent(shot.windowTitle, liveWindowObs.title, meta?.appDisplayName || ""))
   );
   const liveMultiWindow = Boolean(
     liveFocusedExcluded ||
@@ -1211,6 +1243,7 @@ export class AppSnapshotRegistry {
       pid = null,
       imgDims = null,
       windowTitle = "",
+      appDisplayName = "",
       parsedWindowId = null,
       preObs = null,
       hadPrePid = false,
@@ -1261,10 +1294,12 @@ export class AppSnapshotRegistry {
         )
     );
     const parsedWidMatches = !(parsedWid > 0 && candidateWid > 0 && parsedWid !== candidateWid);
-    const cleanExpectedTitle = String(windowTitle || "").trim();
-    const cleanObservedTitle = String(obs?.title || "").trim();
-    const titleConsistent =
-      !cleanExpectedTitle || !cleanObservedTitle || cleanExpectedTitle === cleanObservedTitle;
+    const effectiveAppDisplayName = appDisplayName || this.getMeta(app)?.appDisplayName || "";
+    const titleConsistent = areWindowTitlesConsistent(
+      windowTitle,
+      obs?.title || "",
+      effectiveAppDisplayName
+    );
     if (candidateWid > 0 && obs?.windowBounds) {
       const obW = Number(obs.windowBounds.width ?? obs.windowBounds.w ?? 0);
       const obH = Number(obs.windowBounds.height ?? obs.windowBounds.h ?? 0);

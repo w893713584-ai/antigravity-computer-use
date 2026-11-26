@@ -465,17 +465,21 @@ function mergeMcpConfigFile({ mcpPath, snapshotPath, installDir, nodeExecPath })
   let mcpData = { mcpServers: {} };
   if (existsSync(mcpPath)) {
     const rawMcp = readFileSync(mcpPath, "utf8");
-    try {
-      const parsed = JSON.parse(rawMcp);
-      if (parsed && typeof parsed === "object") {
-        mcpData = {
-          ...parsed,
-          mcpServers:
-            parsed.mcpServers && typeof parsed.mcpServers === "object" ? { ...parsed.mcpServers } : {},
-        };
+    if (rawMcp.trim()) {
+      try {
+        const parsed = JSON.parse(rawMcp);
+        if (parsed && typeof parsed === "object") {
+          mcpData = {
+            ...parsed,
+            mcpServers:
+              parsed.mcpServers && typeof parsed.mcpServers === "object"
+                ? { ...parsed.mcpServers }
+                : {},
+          };
+        }
+      } catch {
+        throw new Error(`现有的 ${mcpPath} 不是合法 JSON，已中止修改以免损坏配置。`);
       }
-    } catch {
-      throw new Error(`现有的 ${mcpPath} 不是合法 JSON，已中止修改以免损坏配置。`);
     }
 
     let existingSnap = null;
@@ -543,9 +547,11 @@ function mergeMcpConfigFile({ mcpPath, snapshotPath, installDir, nodeExecPath })
 function restoreMcpConfigFile({ mcpPath, snapshotPath, installDir }) {
   if (!existsSync(mcpPath)) return;
   const existingMcpMode = statSync(mcpPath).mode & 0o777;
+  const rawMcp = readFileSync(mcpPath, "utf8");
+  if (!rawMcp.trim()) return;
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync(mcpPath, "utf8"));
+    parsed = JSON.parse(rawMcp);
   } catch (err) {
     throw new Error(`无法解析 ${mcpPath}，已保留安装目录与备份文件以免丢失配置：${err.message}`);
   }

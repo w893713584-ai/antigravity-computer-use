@@ -1336,6 +1336,7 @@ export class ComputerUseBrokerServer {
           pid: targetPid,
           imgDims,
           windowTitle: meta.windowTitle || "",
+          appDisplayName: meta.appDisplayName || "",
           parsedWindowId: meta.windowId || null,
           preObs: preObsRes?.obs || null,
           hadPrePid: Boolean(preObsRes?.hadPrePid),

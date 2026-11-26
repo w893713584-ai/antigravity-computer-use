@@ -903,3 +903,98 @@ test("B19, B20, B21, B22 & UI hygiene: proxy WS Host/Origin, recovery IDR on seq
     await adapter.close();
   }
 });
+
+test("Installer tolerates 0-byte or whitespace-only T3 mcp_config.json while rejecting non-empty invalid JSON", async () => {
+  const fakeHome = makeShortTmpDir("cua-t3-empty-mcp-");
+  const configDir = path.join(fakeHome, ".gemini", "config");
+  const installDir = path.join(fakeHome, ".gemini", "codex-style-computer-use");
+  const fakeOcuAppBin = path.join(
+    configDir,
+    "computer-use-1.2.0",
+    "node_modules",
+    "open-computer-use",
+    "dist",
+    "Open Computer Use.app",
+    "Contents",
+    "MacOS"
+  );
+  const t3DirEmpty = path.join(fakeHome, ".t3", "userdata", "providers", "antigravity", "provider-empty", "config");
+  const t3DirWhitespace = path.join(
+    fakeHome,
+    ".t3",
+    "userdata",
+    "providers",
+    "antigravity",
+    "provider-whitespace",
+    "config"
+  );
+  const t3McpEmpty = path.join(t3DirEmpty, "mcp_config.json");
+  const t3McpWhitespace = path.join(t3DirWhitespace, "mcp_config.json");
+
+  mkdirSync(fakeOcuAppBin, { recursive: true });
+  mkdirSync(t3DirEmpty, { recursive: true });
+  mkdirSync(t3DirWhitespace, { recursive: true });
+  writeFileSync(path.join(fakeOcuAppBin, "OpenComputerUse"), "#!/bin/sh\n", { mode: 0o755 });
+  writeFileSync(path.join(configDir, "mcp_config.json"), JSON.stringify({ mcpServers: {} }, null, 2));
+  writeFileSync(t3McpEmpty, "");
+  writeFileSync(t3McpWhitespace, "  \n");
+
+  try {
+    const installRes = await installCodexComputerUse({
+      sourceRoot: PROJECT_ROOT,
+      homeDir: fakeHome,
+      installDir,
+      nodeExecPath: "/custom/bin/node",
+      skipDoctor: true,
+      skipProcessKill: true,
+      skipNativeSelfTest: true,
+      liveRpcFn: async () => false,
+      log: () => {},
+    });
+    assert.equal(installRes.t3SyncedCount, 2);
+
+    for (const mcpFile of [t3McpEmpty, t3McpWhitespace]) {
+      const parsed = JSON.parse(readFileSync(mcpFile, "utf8"));
+      assert.equal(parsed.mcpServers["computer-use"].command, "/custom/bin/node");
+      assert.equal(parsed.mcpServers["computer-use"].args[0], path.join(installDir, "src", "mcp-server.mjs"));
+      assert.equal(parsed.mcpServers["computer-use-js"].command, "/custom/bin/node");
+      assert.equal(
+        parsed.mcpServers["computer-use-js"].args[0],
+        path.join(installDir, "src", "mcp-repl-server.mjs")
+      );
+    }
+
+    // Non-empty malformed JSON must still fail loudly instead of clobbering user config
+    writeFileSync(t3McpEmpty, "{broken");
+    await assert.rejects(
+      () =>
+        installCodexComputerUse({
+          sourceRoot: PROJECT_ROOT,
+          homeDir: fakeHome,
+          installDir,
+          nodeExecPath: "/custom/bin/node",
+          skipDoctor: true,
+          skipProcessKill: true,
+          skipNativeSelfTest: true,
+          liveRpcFn: async () => false,
+          log: () => {},
+        }),
+      /不是合法 JSON/
+    );
+
+    // Uninstall must also tolerate an empty/whitespace mcp_config.json without throwing
+    writeFileSync(t3McpEmpty, "");
+    await uninstallCodexComputerUse({
+      homeDir: fakeHome,
+      installDir,
+      skipProcessKill: true,
+      liveRpcFn: async () => false,
+    });
+    assert.equal(readFileSync(t3McpEmpty, "utf8"), "");
+    const restoredWhitespace = JSON.parse(readFileSync(t3McpWhitespace, "utf8"));
+    assert.equal(restoredWhitespace.mcpServers["computer-use"], undefined);
+    assert.equal(restoredWhitespace.mcpServers["computer-use-js"], undefined);
+  } finally {
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});

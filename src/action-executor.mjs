@@ -2602,6 +2602,7 @@ export class BackgroundActionExecutor {
     meta,
     snapshotId = null,
     match,
+    elementMeta = null,
     resolvedTarget = null,
     explicitWindowId = null,
     targetWindowId = null,
@@ -2701,11 +2702,22 @@ export class BackgroundActionExecutor {
     const singleWindowOk = Boolean(auth.sameWindowProven && isSingleWindowProven(auth));
 
     const jxaTrusted = await this.#isJxaPostTrusted();
-    const methods = this.focusPolicyGuard.planClick(
-      { click_method: "auto", mouse_button: mouseButton, click_count: clickCount },
-      aliases,
-      { routeScope, windowPostAvailable: jxaTrusted }
-    );
+    const actMethods =
+      typeof this.focusPolicyGuard.planActClick === "function"
+        ? this.focusPolicyGuard.planActClick(
+            {
+              mouse_button: mouseButton,
+              click_count: clickCount,
+              hasAxPress: resolvedTarget?.hasAxPress === true,
+            },
+            aliases,
+            { routeScope, windowPostAvailable: jxaTrusted }
+          )
+        : this.focusPolicyGuard.planClick(
+            { click_method: "auto", mouse_button: mouseButton, click_count: clickCount },
+            aliases,
+            { routeScope, windowPostAvailable: jxaTrusted }
+          );
     const allowWindowPost = !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "window_post", {
       routeScope,
     });
@@ -2714,6 +2726,80 @@ export class BackgroundActionExecutor {
       !this.focusPolicyGuard.isMethodBlocked(aliases, "click", "app_post", { routeScope });
 
     let failureReason = null;
+    const elemMeta =
+      elementMeta || (match?.index !== undefined ? meta?.elements?.get(String(match.index)) || null : null);
+
+    if (
+      actMethods.includes("accessibility") &&
+      jxaTrusted &&
+      pid > 0 &&
+      typeof this.axBridge?.pressActionTarget === "function"
+    ) {
+      if (signal?.aborted) {
+        return { delivered: false, clicksSent: 0, aborted: true, routeKey: null, routeScope, failureReason: "cancelled" };
+      }
+      beforeWriteCheck();
+      const pressRes = await this.#trackWrite(
+        operation,
+        this.axBridge.pressActionTarget(pid, {
+          pressTargetId: resolvedTarget?.pressTargetId || null,
+          snapshotId,
+          elementIndex: match?.index !== undefined ? String(match.index) : null,
+          elementMeta: elemMeta,
+          localPoint: finalLocalPoint,
+          wid: effectiveWid,
+          windowTitle: windowTitle || meta?.windowTitle || "",
+          windowBounds: logicalWinBounds
+            ? {
+                x: logicalWinBounds.x,
+                y: logicalWinBounds.y,
+                width: logicalWinBounds.w,
+                height: logicalWinBounds.h,
+              }
+            : null,
+          beforeWriteCheck,
+        }),
+        "click:accessibility"
+      ).catch((err) => {
+        this.#rethrowIfAborted(err);
+        return { delivered: false, reason: err?.message || "ax_press_error" };
+      });
+      if (pressRes?.delivered) {
+        return {
+          delivered: true,
+          clicksSent: 1,
+          aborted: false,
+          routeKey: formatDeliveryRoute("click", "accessibility"),
+          routeScope,
+          failureReason: null,
+          localPoint: finalLocalPoint,
+        };
+      }
+      failureReason = pressRes?.reason || "ax_press_unavailable";
+      if (isWriteOutcomeUnknown(pressRes)) {
+        return {
+          delivered: false,
+          clicksSent: 1,
+          aborted: false,
+          code: "WRITE_OUTCOME_UNKNOWN",
+          deliveryState: "sent_unknown",
+          fatal: true,
+          routeKey: formatDeliveryRoute("click", "accessibility"),
+          routeScope,
+          failureReason: pressRes?.reason || "write_outcome_unknown",
+        };
+      }
+      if (
+        pressRes?.reason === "window_resized" ||
+        pressRes?.reason === "out_of_bounds" ||
+        pressRes?.reason === "element_window_mismatch" ||
+        /^(?:element|window)_(?:destroyed|mutated|hidden|moved|changed)_in_background$|^modal_sheet_appeared$/u.test(
+          String(pressRes?.reason || "")
+        )
+      ) {
+        return { delivered: false, clicksSent: 0, aborted: false, routeKey: null, routeScope, failureReason };
+      }
+    }
 
     if (
       jxaTrusted &&
@@ -2726,8 +2812,6 @@ export class BackgroundActionExecutor {
         return { delivered: false, clicksSent: 0, aborted: true, routeKey: null, routeScope, failureReason: "cancelled" };
       }
       beforeWriteCheck();
-      const elemMeta =
-        match?.index !== undefined ? meta?.elements?.get(String(match.index)) || null : null;
       const winRes = await this.#trackWrite(
         operation,
         this.windowClickFn(pid, {
@@ -2800,7 +2884,7 @@ export class BackgroundActionExecutor {
       return { delivered: false, clicksSent: 0, aborted: true, routeKey: null, routeScope, failureReason: "cancelled" };
     }
 
-    const ocuMethods = methods.filter((m) => m === "sky_click" || m === "app_post");
+    const ocuMethods = actMethods.filter((m) => m === "sky_click" || m === "app_post");
     for (const ocuMethod of ocuMethods) {
       const built = buildActNativeClickArgs({
         app,

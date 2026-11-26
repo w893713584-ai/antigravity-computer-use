@@ -252,6 +252,10 @@ export function buildT3OneTimePillHint(webPort, uiToken = "") {
 export const MAX_LINE_BUFFER_BYTES = 32 * 1024 * 1024;
 export const MAX_HTTP_BODY_BYTES = 1024 * 1024;
 
+export const BROWSER_TITLE_SUFFIX_PATTERN =
+  "\\s+[-–—]\\s+(?:Microsoft Edge(?:\\s+(?:Beta|Dev|Canary))?|Google Chrome(?:\\s+(?:Beta|Dev|Canary))?|Chromium|Brave Browser|Arc|Vivaldi|Opera|Mozilla Firefox|Firefox|Safari)$";
+export const BROWSER_TITLE_SUFFIX_RE = new RegExp(BROWSER_TITLE_SUFFIX_PATTERN, "iu");
+
 export function isMainModule(importMetaUrl) {
   if (!process.argv[1]) return false;
   try {

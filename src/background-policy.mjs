@@ -240,9 +240,13 @@ export function parseSnapshotMetadata(text) {
       const index = elMatch[1];
       const role = elMatch[2];
       const tail = elMatch[3] || "";
-      const secMatch = /\bSecondary Actions:\s*(.+?)(?=\s+(?:Help|ID):|$)/u.exec(tail);
-      const helpMatch = /\bHelp:\s*(.+?)(?=\s+(?:Secondary Actions|ID):|$)/u.exec(tail);
-      const idMatch = /\bID:\s*(.+?)(?=\s+(?:Secondary Actions|Help):|$)/u.exec(tail);
+      const frameMatch =
+        /\bFrame:\s*x=(-?\d+(?:\.\d+)?),\s*y=(-?\d+(?:\.\d+)?),\s*w=(-?\d+(?:\.\d+)?),\s*h=(-?\d+(?:\.\d+)?)/u.exec(
+          tail
+        );
+      const secMatch = /\bSecondary Actions:\s*(.+?)(?=\s+(?:Frame:\s*x=-?\d|Help:|ID:)|$)/u.exec(tail);
+      const helpMatch = /\bHelp:\s*(.+?)(?=\s+(?:Frame:\s*x=-?\d|Secondary Actions:|ID:)|$)/u.exec(tail);
+      const idMatch = /\bID:\s*(.+?)(?=\s+(?:Frame:\s*x=-?\d|Secondary Actions:|Help:)|$)/u.exec(tail);
 
       const secondaryActions = secMatch
         ? secMatch[1]
@@ -252,11 +256,29 @@ export function parseSnapshotMetadata(text) {
         : [];
       const help = helpMatch ? helpMatch[1].trim() : null;
       const identifier = idMatch ? idMatch[1].trim() : null;
+      const bounds = frameMatch
+        ? (() => {
+            const w = Number(frameMatch[3]);
+            const h = Number(frameMatch[4]);
+            return Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0
+              ? {
+                  x: Number(frameMatch[1]),
+                  y: Number(frameMatch[2]),
+                  w,
+                  h,
+                }
+              : null;
+          })()
+        : null;
 
       const rest = tail
         .replace(/,?\s*\bSecondary Actions:.*$/u, "")
         .replace(/\s+\bHelp:.*$/u, "")
         .replace(/\s+\bID:.*$/u, "")
+        .replace(
+          /(?:^|\s+)\bFrame:\s*x=-?\d+(?:\.\d+)?,\s*y=-?\d+(?:\.\d+)?,\s*w=-?\d+(?:\.\d+)?,\s*h=-?\d+(?:\.\d+)?/gu,
+          ""
+        )
         .trim();
 
       meta.elements.set(
@@ -268,6 +290,7 @@ export function parseSnapshotMetadata(text) {
           identifier,
           help,
           secondaryActions,
+          bounds,
         })
       );
     }

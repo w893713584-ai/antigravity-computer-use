@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import { MAX_LINE_BUFFER_BYTES } from "./constants.mjs";
+import { BROWSER_TITLE_SUFFIX_PATTERN, MAX_LINE_BUFFER_BYTES } from "./constants.mjs";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CALL_TIMEOUT_MS = 2500;
@@ -187,6 +187,16 @@ var SAFE_INSERT_ROLES = ["AXTextField", "AXTextArea", "AXSearchField", "AXComboB
 
 var retainedOrder = [];
 var retainedSnapshots = {};
+var retainedResolvedTargets = {};
+var retainedResolvedOrder = [];
+var nextResolvedTargetSeq = 1;
+var MAX_RETAINED_RESOLVED_TARGETS = 24;
+var RESOLVED_TARGET_TTL_SEC = 15;
+var BROWSER_TITLE_SUFFIX_RE = new RegExp(${JSON.stringify(BROWSER_TITLE_SUFFIX_PATTERN)}, "iu");
+
+function stripBrowserTitleSuffix(title) {
+  return String(title || "").trim().replace(BROWSER_TITLE_SUFFIX_RE, "").trim();
+}
 
 function pumpRunLoop() {
   try {
@@ -316,6 +326,18 @@ function selectTargetWindow(appEl, preferredTitle, preferredWid) {
       var candidate = wins.objectAtIndex(i);
       if (readStr(candidate, "AXTitle") === preferredTitle) {
         return candidate;
+      }
+    }
+    var cleanPreferredTitle = stripBrowserTitleSuffix(preferredTitle);
+    if (cleanPreferredTitle) {
+      if (preferredWin && stripBrowserTitleSuffix(readStr(preferredWin, "AXTitle")) === cleanPreferredTitle) {
+        return preferredWin;
+      }
+      for (var si = 0; si < count; si++) {
+        var sCand = wins.objectAtIndex(si);
+        if (stripBrowserTitleSuffix(readStr(sCand, "AXTitle")) === cleanPreferredTitle) {
+          return sCand;
+        }
       }
     }
   }
@@ -490,6 +512,12 @@ function roleMatches(metaRole, node) {
   var axCompact = normStr(node.axRole).replace(/^ax/, "").replace(/\s+/g, "");
   var descCompact = normStr(node.roleDesc).replace(/\s+/g, "");
   if (wantCompact && (wantCompact === axCompact || wantCompact === descCompact)) return true;
+  if (
+    (wantCompact === "button" || want === "按钮") &&
+    (axCompact === "button" || axCompact === "popupbutton" || axCompact === "menubutton")
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -671,7 +699,7 @@ function handleBindSnapshot(params) {
   var winBounds = readBounds(winEl);
   var hasModal = detectWindowModalState(appEl, winEl);
   var inputEls = Array.isArray(params.elements) ? params.elements : [];
-  var maxNodes = Math.min(1200, Math.max(1000, inputEls.length * 4));
+  var maxNodes = Math.min(2000, Math.max(1200, inputEls.length * 4));
   var bindStartUptime = Number($.NSProcessInfo.processInfo.systemUptime || 0);
   var budgetSec = Number(params.budgetSec) > 0 ? Number(params.budgetSec) : 1.2;
   var walked = walkWindowPreorder(winEl, maxNodes, budgetSec);
@@ -928,7 +956,124 @@ function handleVerifyLiveRef(params) {
   return { ok: true };
 }
 
-function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta, preferredTitle, preferredWid) {
+function probeElementByMetaBounds(pid, appEl, winEl, cgWin, effWid, preferredTitle, elementMeta, hint, expectedWindowSize) {
+  var b = elementMeta && elementMeta.bounds ? elementMeta.bounds : null;
+  if (
+    !b ||
+    !Number.isFinite(Number(b.x)) ||
+    !Number.isFinite(Number(b.y)) ||
+    !(Number(b.w) > 0) ||
+    !(Number(b.h) > 0) ||
+    typeof $.AXUIElementCopyElementAtPosition !== "function"
+  ) {
+    return null;
+  }
+  var metaWid = Number(elementMeta.windowId || 0);
+  if (metaWid > 0 && effWid > 0 && metaWid !== effWid) {
+    return null;
+  }
+
+  var probeWin = cgWin && cgWin.w > 0 && cgWin.h > 0 ? cgWin : null;
+  if (!probeWin) {
+    var wAxBounds = winEl ? readBounds(winEl) : null;
+    var cgCand = pid > 0
+      ? resolveTargetCgWindow(pid, preferredTitle || "", effWid || null, null, wAxBounds)
+      : null;
+    if (cgCand && cgCand.w > 0 && cgCand.h > 0) {
+      probeWin = cgCand;
+    } else if (wAxBounds && wAxBounds.w > 0 && wAxBounds.h > 0) {
+      probeWin = {
+        wid: effWid || (winEl ? getAxWindowId(winEl) : 0) || 0,
+        title: (winEl ? readStr(winEl, "AXTitle") : "") || preferredTitle || "",
+        x: wAxBounds.x,
+        y: wAxBounds.y,
+        w: wAxBounds.w,
+        h: wAxBounds.h
+      };
+    }
+  }
+  if (!probeWin || !(probeWin.w > 0) || !(probeWin.h > 0)) {
+    return null;
+  }
+  if (expectedWindowSize && typeof expectedWindowSize === "object") {
+    var expW = Number(expectedWindowSize.width || expectedWindowSize.w || 0);
+    var expH = Number(expectedWindowSize.height || expectedWindowSize.h || 0);
+    if ((expW > 0 && Math.abs(probeWin.w - expW) > 4) || (expH > 0 && Math.abs(probeWin.h - expH) > 4)) {
+      return null;
+    }
+  }
+
+  var targetLocal = { x: Number(b.x) + Number(b.w) / 2, y: Number(b.y) + Number(b.h) / 2 };
+  if (targetLocal.x < 0 || targetLocal.y < 0 || targetLocal.x > probeWin.w + 1 || targetLocal.y > probeWin.h + 1) {
+    return null;
+  }
+
+  var targetWid = effWid || probeWin.wid || 0;
+  var probedRes = probeElementAtWindowLocalPoint(
+    appEl,
+    probeWin,
+    winEl,
+    targetLocal,
+    Boolean(targetWid > 0 && hasAxGetWindowFn)
+  );
+  if (!probedRes.hitEl) {
+    return null;
+  }
+
+  var originX = probedRes.matchedOrigin
+    ? probedRes.matchedOrigin.x
+    : (probedRes.xform && probedRes.xform.verified ? probedRes.xform.axWinBounds.x : probeWin.x);
+  var originY = probedRes.matchedOrigin
+    ? probedRes.matchedOrigin.y
+    : (probedRes.xform && probedRes.xform.verified ? probedRes.xform.axWinBounds.y : probeWin.y);
+
+  var cur = probedRes.hitEl;
+  for (var hops = 0; cur && hops <= 3; hops++) {
+    var role = readStr(cur, "AXRole");
+    if (role === "AXWindow" || role === "AXApplication" || role === "AXScrollArea" || role === "AXWebArea") {
+      break;
+    }
+    var cOwned = verifyElementWindowOwnership(cur, probedRes.hitAxWinEl || winEl, targetWid);
+    var widOk = cOwned.ok && (!(targetWid > 0 && hasAxGetWindowFn) || cOwned.effectiveWid === targetWid);
+    if (!widOk) {
+      break;
+    }
+    var curInfo = {
+      axRole: role,
+      roleDesc: readStr(cur, "AXRoleDescription"),
+      id: readStr(cur, "AXIdentifier") || readStr(cur, "AXDOMIdentifier"),
+      title: readStr(cur, "AXTitle"),
+      desc: readStr(cur, "AXDescription"),
+      help: readStr(cur, "AXHelp")
+    };
+    var idOk = !elementMeta.identifier || curInfo.id === elementMeta.identifier;
+    var lblOk = (!hint && !elementMeta.help) || labelMatches(hint, elementMeta.help, curInfo);
+    if (roleMatches(elementMeta.role, curInfo) && idOk && lblOk) {
+      var cb = readBounds(cur);
+      if (
+        cb &&
+        cb.w > 0 &&
+        cb.h > 0 &&
+        !(cb.w > probeWin.w * 0.85 && cb.h > probeWin.h * 0.85) &&
+        cb.w <= Math.max(Number(b.w) * 3, Number(b.w) + 40) &&
+        cb.h <= Math.max(Number(b.h) * 3, Number(b.h) + 40)
+      ) {
+        var liveCx = cb.x + cb.w / 2 - originX;
+        var liveCy = cb.y + cb.h / 2 - originY;
+        var tolX = Math.max(24, Number(b.w) * 0.75);
+        var tolY = Math.max(24, Number(b.h) * 0.75);
+        if (Math.abs(liveCx - targetLocal.x) <= tolX && Math.abs(liveCy - targetLocal.y) <= tolY) {
+          return { el: cur, winEl: cOwned.ownerWin || winEl };
+        }
+      }
+    }
+    cur = readAttr(cur, "AXParent");
+  }
+  return null;
+}
+
+function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta, preferredTitle, preferredWid, opts) {
+  var cfg = opts || {};
   var effWid = Number(preferredWid || (elementMeta && elementMeta.windowId) || 0);
   if (snapshotId && elementIndex !== undefined && elementIndex !== null) {
     var snap = retainedSnapshots[String(snapshotId)];
@@ -937,7 +1082,8 @@ function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta, prefer
       return { appEl: snap.appEl, winEl: snap.windowEl, el: bound.el };
     }
   }
-  var appEl = createAppElement(pid, 0.75);
+  var appTimeout = Number(cfg.appTimeoutSec) > 0 ? Number(cfg.appTimeoutSec) : 0.5;
+  var appEl = createAppElement(pid, appTimeout);
   var winEl = selectTargetWindow(appEl, preferredTitle || "", effWid);
   if (!winEl) return { appEl: appEl, winEl: null, el: null };
   if (effWid > 0 && hasAxGetWindowFn) {
@@ -948,7 +1094,29 @@ function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta, prefer
   }
   if (!elementMeta) return { appEl: appEl, winEl: winEl, el: null };
 
-  var walkedRes = walkWindowPreorder(winEl, 400, 0.45);
+  var hint = extractPrimaryHint(elementMeta.rawText);
+  var probedHit = probeElementByMetaBounds(
+    pid,
+    appEl,
+    winEl,
+    cfg.cgWin || null,
+    effWid,
+    preferredTitle,
+    elementMeta,
+    hint,
+    cfg.expectedWindowSize || null
+  );
+  if (probedHit && probedHit.el) {
+    return { appEl: appEl, winEl: probedHit.winEl || winEl, el: probedHit.el };
+  }
+
+  if (cfg.skipWalk === true || (!elementMeta.identifier && !hint && !elementMeta.help)) {
+    return { appEl: appEl, winEl: winEl, el: null };
+  }
+
+  var maxWalkNodes = Number(cfg.maxWalkNodes) > 0 ? Number(cfg.maxWalkNodes) : 400;
+  var walkBudgetSec = Number(cfg.walkBudgetSec) > 0 ? Number(cfg.walkBudgetSec) : 0.35;
+  var walkedRes = walkWindowPreorder(winEl, maxWalkNodes, walkBudgetSec);
   var nodes = walkedRes.nodes;
   if (elementMeta.identifier) {
     for (var i = 0; i < nodes.length; i++) {
@@ -957,10 +1125,11 @@ function resolveElementHandle(pid, snapshotId, elementIndex, elementMeta, prefer
       }
     }
   }
-  var hint = extractPrimaryHint(elementMeta.rawText);
-  for (var j = 0; j < nodes.length; j++) {
-    if (roleMatches(elementMeta.role, nodes[j]) && labelMatches(hint, elementMeta.help, nodes[j])) {
-      return { appEl: appEl, winEl: winEl, el: nodes[j].el };
+  if (hint || elementMeta.help) {
+    for (var j = 0; j < nodes.length; j++) {
+      if (roleMatches(elementMeta.role, nodes[j]) && labelMatches(hint, elementMeta.help, nodes[j])) {
+        return { appEl: appEl, winEl: winEl, el: nodes[j].el };
+      }
     }
   }
   return { appEl: appEl, winEl: winEl, el: null };
@@ -1269,7 +1438,9 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
     }
   }
 
-  var titleMatch = null;
+  var exactTitleMatch = null;
+  var suffixTitleMatch = null;
+  var cleanAxTitle = stripBrowserTitleSuffix(axTitle);
   var bestLarge = null;
   var bestArea = 0;
   var firstValid = null;
@@ -1286,8 +1457,11 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
     ) {
       return candidate;
     }
-    if (!titleMatch && axTitle && candidate.title === axTitle) {
-      titleMatch = candidate;
+    if (!exactTitleMatch && axTitle && candidate.title === axTitle) {
+      exactTitleMatch = candidate;
+    }
+    if (!suffixTitleMatch && cleanAxTitle && stripBrowserTitleSuffix(candidate.title) === cleanAxTitle) {
+      suffixTitleMatch = candidate;
     }
     if (candidate.w >= 300 && candidate.h >= 200) {
       var area = candidate.w * candidate.h;
@@ -1298,7 +1472,8 @@ function resolveTargetCgWindow(pid, preferredTitle, explicitWid, explicitBounds,
     }
   }
 
-  if (titleMatch) return titleMatch;
+  if (exactTitleMatch) return exactTitleMatch;
+  if (suffixTitleMatch) return suffixTitleMatch;
   if (bestLarge) return bestLarge;
   if (firstValid) return firstValid;
   if (axBounds && axBounds.w > 0 && axBounds.h > 0) {
@@ -1670,6 +1845,183 @@ function resolveVerifiedAxToCgTransform(axWinEl, cgWin) {
   return { verified: true, axWid: axWid, axWinBounds: axBounds, dx: dx, dy: dy, axOriginMismatch: mismatch };
 }
 
+function probeElementAtWindowLocalPoint(appEl, win, baseAxWin, targetLocal, requireExactWid) {
+  var xform = resolveVerifiedAxToCgTransform(baseAxWin, win);
+  var hitEl = null;
+  var hitAxWinEl = null;
+  var matchedOrigin = null;
+  if (!targetLocal || typeof $.AXUIElementCopyElementAtPosition !== "function") {
+    return { hitEl: null, hitAxWinEl: null, xform: xform, matchedOrigin: null };
+  }
+  try {
+    var probeCandidates = [];
+    var hasOriginDisambiguation = Boolean(xform.verified && xform.axOriginMismatch);
+    if (hasOriginDisambiguation) {
+      probeCandidates.push({
+        screenX: xform.axWinBounds.x + targetLocal.x,
+        screenY: xform.axWinBounds.y + targetLocal.y,
+        originX: xform.axWinBounds.x,
+        originY: xform.axWinBounds.y,
+        requireExactWid: true,
+        checkBounds: true
+      });
+    }
+    probeCandidates.push({
+      screenX: win.x + targetLocal.x,
+      screenY: win.y + targetLocal.y,
+      originX: win.x,
+      originY: win.y,
+      requireExactWid: Boolean(requireExactWid),
+      checkBounds: hasOriginDisambiguation
+    });
+
+    for (var ci = 0; ci < probeCandidates.length; ci++) {
+      var cand = probeCandidates[ci];
+      var out = Ref();
+      if (Number($.AXUIElementCopyElementAtPosition(appEl, cand.screenX, cand.screenY, out)) === 0 && out[0]) {
+        var probed = castOutRefAndRelease(out[0]);
+        if (probed) {
+          var pOwned = verifyElementWindowOwnership(probed, null, win.wid);
+          var widOk = pOwned.ok && (!cand.requireExactWid || !(win.wid > 0) || pOwned.effectiveWid === win.wid);
+          if (widOk) {
+            var pb = cand.checkBounds ? readBounds(probed) : null;
+            var boundsMatch = true;
+            if (cand.checkBounds && pb && pb.w > 0 && pb.h > 0) {
+              var relLeft = pb.x - cand.originX;
+              var relTop = pb.y - cand.originY;
+              boundsMatch =
+                targetLocal.x >= relLeft - 4 &&
+                targetLocal.x <= relLeft + pb.w + 4 &&
+                targetLocal.y >= relTop - 4 &&
+                targetLocal.y <= relTop + pb.h + 4;
+            }
+            if (boundsMatch) {
+              hitEl = probed;
+              matchedOrigin = { x: cand.originX, y: cand.originY };
+              if (pOwned.ownerWin) {
+                hitAxWinEl = pOwned.ownerWin;
+                xform = resolveVerifiedAxToCgTransform(pOwned.ownerWin, win);
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  return { hitEl: hitEl, hitAxWinEl: hitAxWinEl, xform: xform, matchedOrigin: matchedOrigin };
+}
+
+var AX_PRESS_CARD_ROLES = {
+  AXButton: true,
+  AXPopUpButton: true,
+  AXMenuButton: true,
+  AXCell: true,
+  AXRow: true,
+  AXLink: true,
+  AXRadioButton: true,
+  AXCheckBox: true,
+  AXMenuItem: true
+};
+
+var AX_PERFORM_ACTION_DEFINITE_NOT_SENT = {
+  "-25201": "ax_error",
+  "-25202": "element_destroyed_in_background",
+  "-25206": "ax_action_unsupported",
+  "-25208": "ax_error",
+  "-25211": "jxa_accessibility_untrusted"
+};
+
+function isReasonablePressTargetBounds(bounds, win, hops) {
+  if (!bounds || !(bounds.w > 4) || !(bounds.h > 4)) return false;
+  if (win && win.w > 0 && win.h > 0) {
+    if (bounds.w > win.w * 0.85 && bounds.h > win.h * 0.85) return false;
+    if (hops > 0 && (bounds.w * bounds.h) > (win.w * win.h * 0.50)) return false;
+  }
+  return true;
+}
+
+function retainResolvedTarget(pid, wid, el, ownerWin, role) {
+  var id = "rt_" + String(nextResolvedTargetSeq++);
+  retainedResolvedOrder.push(id);
+  while (retainedResolvedOrder.length > MAX_RETAINED_RESOLVED_TARGETS) {
+    var oldId = retainedResolvedOrder.shift();
+    delete retainedResolvedTargets[oldId];
+  }
+  retainedResolvedTargets[id] = {
+    pid: pid,
+    wid: Number(wid || 0),
+    el: el,
+    ownerWin: ownerWin || null,
+    role: role || null,
+    createdAtUptime: Number($.NSProcessInfo.processInfo.systemUptime || 0)
+  };
+  return id;
+}
+
+function findActionTargetInAncestors(hitEl, hitAxWinEl, win, originX, originY) {
+  var cardCandidate = null;
+  var ownerMismatch = false;
+  var oversizedPressRejected = false;
+  if (!hitEl) {
+    return {
+      cardCandidate: null,
+      ownerMismatch: false,
+      oversizedPressRejected: false
+    };
+  }
+  var cur = hitEl;
+  for (var hops = 0; cur && hops <= 6; hops++) {
+    var role = readStr(cur, "AXRole");
+    if (role === "AXWindow" || role === "AXApplication" || role === "AXScrollArea" || role === "AXWebArea") {
+      if (role === "AXWebArea" && getActionNames(cur).indexOf("AXPress") >= 0) {
+        oversizedPressRejected = true;
+      }
+      break;
+    }
+    var curOwned = verifyElementWindowOwnership(cur, hitAxWinEl || null, win.wid);
+    if (!curOwned.ok) {
+      ownerMismatch = true;
+      break;
+    }
+    var bounds = readBounds(cur);
+    var actions = getActionNames(cur);
+    var hasPress = actions.indexOf("AXPress") >= 0;
+    var withinWindow = isReasonablePressTargetBounds(bounds, win, hops);
+    if (hasPress && !withinWindow) {
+      oversizedPressRejected = true;
+    }
+    var looksCard =
+      withinWindow &&
+      (hasPress ||
+        AX_PRESS_CARD_ROLES[role] ||
+        (role === "AXGroup" && bounds.w >= 40 && bounds.h >= 24 && bounds.w <= win.w * 0.65 && bounds.h <= win.h * 0.55));
+    if (looksCard) {
+      if (cardCandidate && cardCandidate.hasAxPress && !hasPress) {
+        break;
+      }
+      var lx = bounds.x - originX;
+      var ly = bounds.y - originY;
+      cardCandidate = {
+        el: cur,
+        ownerWin: curOwned.ownerWin || hitAxWinEl || null,
+        role: role,
+        hasAxPress: hasPress,
+        hops: hops,
+        localBounds: { x: lx, y: ly, w: bounds.w, h: bounds.h },
+        centerLocalPoint: { x: lx + bounds.w / 2, y: ly + bounds.h / 2 }
+      };
+      if (hasPress && (hops > 0 || AX_PRESS_CARD_ROLES[role])) break;
+    }
+    cur = readAttr(cur, "AXParent");
+  }
+  return {
+    cardCandidate: cardCandidate,
+    ownerMismatch: ownerMismatch,
+    oversizedPressRejected: oversizedPressRejected
+  };
+}
+
 function handleResolveActionTarget(params) {
   var pid = Number(params.pid || 0);
   if (!pid || pid <= 0) return { resolved: false, reason: "invalid_pid" };
@@ -1705,7 +2057,8 @@ function handleResolveActionTarget(params) {
       String(params.elementIndex),
       params.elementMeta || null,
       params.windowTitle || win.title || "",
-      win.wid || params.wid || 0
+      win.wid || params.wid || 0,
+      { cgWin: win, maxWalkNodes: 800, walkBudgetSec: 0.45, appTimeoutSec: 0.45 }
     );
     if (byRef && byRef.el) {
       var refOwned = verifyElementWindowOwnership(byRef.el, byRef.winEl, win.wid);
@@ -1720,63 +2073,22 @@ function handleResolveActionTarget(params) {
   var xform = resolveVerifiedAxToCgTransform(baseAxWin, win);
   var matchedOrigin = null;
 
-  if (!hitEl && targetLocal && typeof $.AXUIElementCopyElementAtPosition === "function") {
-    try {
-      var probeCandidates = [];
-      var hasOriginDisambiguation = Boolean(xform.verified && xform.axOriginMismatch);
-      if (hasOriginDisambiguation) {
-        probeCandidates.push({
-          screenX: xform.axWinBounds.x + targetLocal.x,
-          screenY: xform.axWinBounds.y + targetLocal.y,
-          originX: xform.axWinBounds.x,
-          originY: xform.axWinBounds.y,
-          requireExactWid: true,
-          checkBounds: true
-        });
+  if (!hitEl && targetLocal) {
+    var probedRes = probeElementAtWindowLocalPoint(
+      appEl,
+      win,
+      baseAxWin,
+      targetLocal,
+      Boolean(Number(params.wid || 0) > 0 && hasAxGetWindowFn)
+    );
+    if (probedRes.hitEl) {
+      hitEl = probedRes.hitEl;
+      matchedOrigin = probedRes.matchedOrigin;
+      if (probedRes.hitAxWinEl) {
+        hitAxWinEl = probedRes.hitAxWinEl;
       }
-      probeCandidates.push({
-        screenX: win.x + targetLocal.x,
-        screenY: win.y + targetLocal.y,
-        originX: win.x,
-        originY: win.y,
-        requireExactWid: Boolean(Number(params.wid || 0) > 0 && hasAxGetWindowFn),
-        checkBounds: hasOriginDisambiguation
-      });
-
-      for (var ci = 0; ci < probeCandidates.length; ci++) {
-        var cand = probeCandidates[ci];
-        var out = Ref();
-        if (Number($.AXUIElementCopyElementAtPosition(appEl, cand.screenX, cand.screenY, out)) === 0 && out[0]) {
-          var probed = castOutRefAndRelease(out[0]);
-          if (probed) {
-            var pOwned = verifyElementWindowOwnership(probed, null, win.wid);
-            var widOk = pOwned.ok && (!cand.requireExactWid || !(win.wid > 0) || pOwned.effectiveWid === win.wid);
-            if (widOk) {
-              var pb = cand.checkBounds ? readBounds(probed) : null;
-              var boundsMatch = true;
-              if (cand.checkBounds && pb && pb.w > 0 && pb.h > 0) {
-                var relLeft = pb.x - cand.originX;
-                var relTop = pb.y - cand.originY;
-                boundsMatch =
-                  targetLocal.x >= relLeft - 4 &&
-                  targetLocal.x <= relLeft + pb.w + 4 &&
-                  targetLocal.y >= relTop - 4 &&
-                  targetLocal.y <= relTop + pb.h + 4;
-              }
-              if (boundsMatch) {
-                hitEl = probed;
-                matchedOrigin = { x: cand.originX, y: cand.originY };
-                if (pOwned.ownerWin) {
-                  hitAxWinEl = pOwned.ownerWin;
-                  xform = resolveVerifiedAxToCgTransform(pOwned.ownerWin, win);
-                }
-                break;
-              }
-            }
-          }
-        }
-      }
-    } catch (e) {}
+      xform = probedRes.xform;
+    }
   }
 
   var originX = matchedOrigin ? matchedOrigin.x : (xform.verified ? xform.axWinBounds.x : win.x);
@@ -1788,47 +2100,11 @@ function handleResolveActionTarget(params) {
     }
   }
 
-  var cardCandidate = null;
-  if (hitEl) {
-    var cur = hitEl;
-    var CARD_ROLES = {
-      AXButton: true,
-      AXCell: true,
-      AXRow: true,
-      AXLink: true,
-      AXRadioButton: true,
-      AXCheckBox: true,
-      AXMenuItem: true
-    };
-    for (var hops = 0; cur && hops <= 6; hops++) {
-      var role = readStr(cur, "AXRole");
-      if (role === "AXWindow" || role === "AXApplication" || role === "AXScrollArea") break;
-      var bounds = readBounds(cur);
-      var actions = getActionNames(cur);
-      var hasPress = actions.indexOf("AXPress") >= 0;
-      var withinWindow = bounds && bounds.w > 4 && bounds.h > 4 && !(bounds.w > win.w * 0.85 && bounds.h > win.h * 0.85);
-      var looksCard =
-        withinWindow &&
-        (hasPress ||
-          CARD_ROLES[role] ||
-          (role === "AXGroup" && bounds.w >= 40 && bounds.h >= 24 && bounds.w <= win.w * 0.65 && bounds.h <= win.h * 0.55));
-      if (looksCard) {
-        if (cardCandidate && cardCandidate.hasAxPress && !hasPress) {
-          break;
-        }
-        var lx = bounds.x - originX;
-        var ly = bounds.y - originY;
-        cardCandidate = {
-          role: role,
-          hasAxPress: hasPress,
-          hops: hops,
-          localBounds: { x: lx, y: ly, w: bounds.w, h: bounds.h },
-          centerLocalPoint: { x: lx + bounds.w / 2, y: ly + bounds.h / 2 }
-        };
-        if (hasPress && (hops > 0 || CARD_ROLES[role])) break;
-      }
-      cur = readAttr(cur, "AXParent");
-    }
+  var ancestorRes = findActionTargetInAncestors(hitEl, hitAxWinEl, win, originX, originY);
+  var cardCandidate = ancestorRes.cardCandidate;
+  var pressTargetId = null;
+  if (cardCandidate && cardCandidate.hasAxPress && cardCandidate.el) {
+    pressTargetId = retainResolvedTarget(pid, win.wid, cardCandidate.el, cardCandidate.ownerWin, cardCandidate.role);
   }
 
   return {
@@ -1839,6 +2115,7 @@ function handleResolveActionTarget(params) {
     axOriginMismatch: Boolean(xform.axOriginMismatch),
     role: cardCandidate ? cardCandidate.role : null,
     hasAxPress: cardCandidate ? cardCandidate.hasAxPress : false,
+    pressTargetId: pressTargetId,
     hops: cardCandidate ? cardCandidate.hops : 0,
     localBounds: cardCandidate ? cardCandidate.localBounds : null,
     centerLocalPoint: cardCandidate ? cardCandidate.centerLocalPoint : targetLocal,
@@ -1846,7 +2123,266 @@ function handleResolveActionTarget(params) {
   };
 }
 
+function handlePressActionTarget(params) {
+  var startUptime = Number($.NSProcessInfo.processInfo.systemUptime || 0);
+  var prepBudgetSec = Number(params.prepBudgetSec) > 0 ? Number(params.prepBudgetSec) : 0.9;
+  var pid = Number(params.pid || 0);
+  if (!pid || pid <= 0) {
+    return { delivered: false, verified: false, deliveryState: "not_sent", reason: "invalid_pid" };
+  }
+  if (!isJxaEventPostTrusted()) {
+    return {
+      delivered: false,
+      verified: false,
+      deliveryState: "not_sent",
+      reason: "jxa_accessibility_untrusted"
+    };
+  }
+
+  var win = resolveTargetCgWindow(
+    pid,
+    params.windowTitle || "",
+    params.wid || null,
+    params.windowBounds || null,
+    null
+  );
+  if (!win || win.w <= 0 || win.h <= 0) {
+    return { delivered: false, verified: false, deliveryState: "not_sent", reason: "window_not_found" };
+  }
+
+  var pressEl = null;
+  var pressRole = "";
+  var reqPressTargetId = params.pressTargetId ? String(params.pressTargetId) : "";
+  if (reqPressTargetId && retainedResolvedTargets[reqPressTargetId]) {
+    var cached = retainedResolvedTargets[reqPressTargetId];
+    if (cached.pid !== pid || (win.wid > 0 && cached.wid > 0 && cached.wid !== win.wid)) {
+      return {
+        delivered: false,
+        verified: false,
+        deliveryState: "not_sent",
+        reason: "element_window_mismatch",
+        wid: win.wid
+      };
+    }
+    var ageSec = Number($.NSProcessInfo.processInfo.systemUptime || 0) - Number(cached.createdAtUptime || 0);
+    if (ageSec <= RESOLVED_TARGET_TTL_SEC) {
+      var cachedRoleRes = readAttrWithCode(cached.el, "AXRole");
+      if (cachedRoleRes.code === -25202 || !cachedRoleRes.val) {
+        return {
+          delivered: false,
+          verified: false,
+          deliveryState: "not_sent",
+          reason: "element_destroyed_in_background",
+          wid: win.wid
+        };
+      }
+      var cachedOwned = verifyElementWindowOwnership(cached.el, cached.ownerWin, win.wid);
+      if (!cachedOwned.ok) {
+        return {
+          delivered: false,
+          verified: false,
+          deliveryState: "not_sent",
+          reason: "element_window_mismatch",
+          wid: win.wid
+        };
+      }
+      var liveBounds = readBounds(cached.el);
+      if (!liveBounds || liveBounds.w <= 0.5 || liveBounds.h <= 0.5) {
+        return {
+          delivered: false,
+          verified: false,
+          deliveryState: "not_sent",
+          reason: "element_hidden_in_background",
+          wid: win.wid
+        };
+      }
+      if (!isReasonablePressTargetBounds(liveBounds, win, 1)) {
+        return {
+          delivered: false,
+          verified: false,
+          deliveryState: "not_sent",
+          reason: "ax_press_target_oversized",
+          wid: win.wid
+        };
+      }
+      if (getActionNames(cached.el).indexOf("AXPress") < 0) {
+        return {
+          delivered: false,
+          verified: false,
+          deliveryState: "not_sent",
+          reason: "ax_press_not_advertised",
+          wid: win.wid
+        };
+      }
+      pressEl = cached.el;
+      pressRole = String(ObjC.unwrap(cachedRoleRes.val) || cached.role || "");
+    }
+  }
+
+  if (!pressEl) {
+    var targetLocal = null;
+    if (
+      params.localPoint &&
+      typeof params.localPoint === "object" &&
+      Number.isFinite(Number(params.localPoint.x)) &&
+      Number.isFinite(Number(params.localPoint.y))
+    ) {
+      targetLocal = { x: Number(params.localPoint.x), y: Number(params.localPoint.y) };
+    }
+
+    var appEl = createAppElement(pid, 0.35);
+    var hitEl = null;
+    var hitAxWinEl = null;
+    var hasElem = params.elementIndex !== null && params.elementIndex !== undefined && String(params.elementIndex) !== "";
+    if (hasElem) {
+      var byRef = resolveElementHandle(
+        pid,
+        params.snapshotId,
+        String(params.elementIndex),
+        params.elementMeta || null,
+        params.windowTitle || win.title || "",
+        win.wid || params.wid || 0,
+        { cgWin: win, maxWalkNodes: 400, walkBudgetSec: 0.30, skipWalk: Boolean(targetLocal), appTimeoutSec: 0.35 }
+      );
+      if (byRef && byRef.el) {
+        var refOwned = verifyElementWindowOwnership(byRef.el, byRef.winEl, win.wid);
+        if (!refOwned.ok) {
+          return {
+            delivered: false,
+            verified: false,
+            deliveryState: "not_sent",
+            reason: "element_window_mismatch",
+            wid: win.wid
+          };
+        }
+        hitEl = byRef.el;
+        hitAxWinEl = refOwned.ownerWin;
+      }
+    }
+
+    var matchedOrigin = null;
+    var xform = { verified: false, axWinBounds: null, axOriginMismatch: false };
+    var metaHasBounds = Boolean(params.elementMeta && params.elementMeta.bounds);
+    if (!hitEl && targetLocal && !(hasElem && String(params.elementIndex) !== "0" && metaHasBounds)) {
+      var baseAxWin = selectTargetWindow(appEl, params.windowTitle || win.title || "", win.wid);
+      var probedRes = probeElementAtWindowLocalPoint(
+        appEl,
+        win,
+        baseAxWin,
+        targetLocal,
+        Boolean(Number(params.wid || 0) > 0 && hasAxGetWindowFn)
+      );
+      if (probedRes.hitEl) {
+        hitEl = probedRes.hitEl;
+        hitAxWinEl = probedRes.hitAxWinEl;
+        matchedOrigin = probedRes.matchedOrigin;
+        xform = probedRes.xform;
+      }
+    } else if (hitEl && hitAxWinEl) {
+      xform = resolveVerifiedAxToCgTransform(hitAxWinEl, win);
+    }
+
+    if (!hitEl) {
+      return {
+        delivered: false,
+        verified: false,
+        deliveryState: "not_sent",
+        reason: "element_not_found",
+        wid: win.wid
+      };
+    }
+
+    var originX = matchedOrigin ? matchedOrigin.x : (xform.verified ? xform.axWinBounds.x : win.x);
+    var originY = matchedOrigin ? matchedOrigin.y : (xform.verified ? xform.axWinBounds.y : win.y);
+    var ancestorRes = findActionTargetInAncestors(hitEl, hitAxWinEl, win, originX, originY);
+    if (ancestorRes.ownerMismatch) {
+      return {
+        delivered: false,
+        verified: false,
+        deliveryState: "not_sent",
+        reason: "element_window_mismatch",
+        wid: win.wid
+      };
+    }
+    if (ancestorRes.cardCandidate && ancestorRes.cardCandidate.hasAxPress && ancestorRes.cardCandidate.el) {
+      pressEl = ancestorRes.cardCandidate.el;
+      pressRole = ancestorRes.cardCandidate.role || "";
+    } else if (ancestorRes.oversizedPressRejected) {
+      return {
+        delivered: false,
+        verified: false,
+        deliveryState: "not_sent",
+        reason: "ax_press_target_oversized",
+        wid: win.wid
+      };
+    } else {
+      return {
+        delivered: false,
+        verified: false,
+        deliveryState: "not_sent",
+        reason: "ax_press_not_advertised",
+        wid: win.wid
+      };
+    }
+  }
+
+  if ((Number($.NSProcessInfo.processInfo.systemUptime || 0) - startUptime) >= prepBudgetSec) {
+    return {
+      delivered: false,
+      verified: false,
+      deliveryState: "not_sent",
+      reason: "prep_budget_exceeded",
+      wid: win.wid
+    };
+  }
+
+  try {
+    if (typeof $.AXUIElementSetMessagingTimeout === "function") {
+      $.AXUIElementSetMessagingTimeout(pressEl, 0.8);
+    }
+  } catch (e) {}
+
+  var err = Number($.AXUIElementPerformAction(pressEl, $("AXPress")));
+  if (err === 0) {
+    return {
+      delivered: true,
+      verified: false,
+      deliveryState: "delivered",
+      method: "ax_press",
+      wid: win.wid,
+      role: pressRole || null,
+      reason: "ok",
+      code: 0
+    };
+  }
+  var notSentReason = AX_PERFORM_ACTION_DEFINITE_NOT_SENT[String(err)] || null;
+  if (notSentReason) {
+    return {
+      delivered: false,
+      verified: false,
+      deliveryState: "not_sent",
+      method: "ax_press",
+      wid: win.wid,
+      role: pressRole || null,
+      reason: notSentReason,
+      code: err
+    };
+  }
+  return {
+    delivered: false,
+    verified: false,
+    deliveryState: "sent_unknown",
+    method: "ax_press",
+    wid: win.wid,
+    role: pressRole || null,
+    reason: err === -25204 ? "ax_cannot_complete" : "ax_outcome_unknown",
+    code: err
+  };
+}
+
 function handleWindowClick(params) {
+  var startUptime = Number($.NSProcessInfo.processInfo.systemUptime || 0);
+  var prepBudgetSec = Number(params.prepBudgetSec) > 0 ? Number(params.prepBudgetSec) : 1.1;
   var pid = Number(params.pid || 0);
   if (!pid || pid <= 0) return { delivered: false, deliveryState: "not_sent", reason: "invalid_pid" };
 
@@ -1891,7 +2427,13 @@ function handleWindowClick(params) {
       elemIdxStr,
       params.elementMeta || null,
       params.windowTitle || "",
-      params.wid || 0
+      params.wid || 0,
+      {
+        maxWalkNodes: 400,
+        walkBudgetSec: 0.35,
+        expectedWindowSize: params.expectedWindowSize || null,
+        appTimeoutSec: 0.45
+      }
     );
     if (!resolved.el) {
       return { delivered: false, deliveryState: "not_sent", reason: "element_not_found" };
@@ -2036,6 +2578,15 @@ function handleWindowClick(params) {
       deliveryState: "not_sent",
       method: null,
       reason: "jxa_accessibility_untrusted",
+      wid: win.wid
+    };
+  }
+  if ((Number($.NSProcessInfo.processInfo.systemUptime || 0) - startUptime) >= prepBudgetSec) {
+    return {
+      delivered: false,
+      deliveryState: "not_sent",
+      method: null,
+      reason: "prep_budget_exceeded",
       wid: win.wid
     };
   }
@@ -2468,6 +3019,11 @@ function handleDropAppSnapshots(params) {
         delete retainedSnapshots[k];
       }
     }
+    for (var rk in retainedResolvedTargets) {
+      if (retainedResolvedTargets[rk] && retainedResolvedTargets[rk].pid === pid) {
+        delete retainedResolvedTargets[rk];
+      }
+    }
   }
   var nextOrder = [];
   for (var m = 0; m < retainedOrder.length; m++) {
@@ -2475,6 +3031,12 @@ function handleDropAppSnapshots(params) {
     if (retainedSnapshots[sid]) nextOrder.push(sid);
   }
   retainedOrder = nextOrder;
+  var nextResolvedOrder = [];
+  for (var rm = 0; rm < retainedResolvedOrder.length; rm++) {
+    var rtid = retainedResolvedOrder[rm];
+    if (retainedResolvedTargets[rtid]) nextResolvedOrder.push(rtid);
+  }
+  retainedResolvedOrder = nextResolvedOrder;
   return { ok: true };
 }
 
@@ -2531,6 +3093,7 @@ while (true) {
       else if (method === "window_click") res = handleWindowClick(p);
       else if (method === "window_scroll") res = handleWindowScroll(p);
       else if (method === "resolve_action_target") res = handleResolveActionTarget(p);
+      else if (method === "press_action_target") res = handlePressActionTarget(p);
       else if (method === "focused_window") res = handleFocusedWindow(p);
       else if (method === "window_key") res = handleWindowKey(p);
       else if (method === "window_text") res = handleWindowText(p);
@@ -2555,6 +3118,7 @@ const MUTATING_AX_BRIDGE_METHODS = new Set([
   "window_scroll",
   "scroll",
   "context_menu",
+  "press_action_target",
   "insert_selected_text",
   "ensure_manual_ax",
   "restore_frontmost",
@@ -3153,6 +3717,40 @@ export class PersistentAxBridge {
       { pid, snapshotId, elementIndex, elementMeta, localPoint, windowTitle, wid, windowBounds },
       { timeoutMs: 1400 }
     );
+  }
+
+  async pressActionTarget(
+    pid,
+    {
+      pressTargetId = null,
+      snapshotId = null,
+      elementIndex = null,
+      elementMeta = null,
+      localPoint = null,
+      windowTitle = "",
+      wid = null,
+      windowBounds = null,
+      prepBudgetSec = 0.9,
+      beforeWriteCheck = null,
+    } = {}
+  ) {
+    const res = await this.request(
+      "press_action_target",
+      {
+        pid,
+        pressTargetId,
+        snapshotId,
+        elementIndex,
+        elementMeta,
+        localPoint,
+        windowTitle,
+        wid,
+        windowBounds,
+        prepBudgetSec,
+      },
+      { timeoutMs: 2600, beforeWriteCheck }
+    );
+    return throwIfSentUnknown(res, "PersistentAxBridge partial press delivery");
   }
 
   async postWindowKey(pid, { key, windowTitle = "", wid = null, syntheticTag = null, beforeWriteCheck = null } = {}) {
